@@ -1,0 +1,5 @@
+id,email,name,cpf,role,daily_hours
+1,joao.silva@empresa.com,João Silva,12345678900,employee,8.0
+2,maria.santos@empresa.com,Maria Santos,98765432100,employee,8.0
+3,gerente@empresa.com,Carlos Gerente,11122233344,manager,8.0
+4,admin@empresa.com,Administrador Sistema,55566677788,admin,8.0

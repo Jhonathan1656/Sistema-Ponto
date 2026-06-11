@@ -1,0 +1,7 @@
+.idea/
+**/venv/
+**/.venv/
+**/__pycache__/
+*.pyc
+ponto-system/backend/ponto.db
+ponto-system/frontend/firebase.exe.exe

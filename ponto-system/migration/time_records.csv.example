@@ -1,0 +1,7 @@
+id,user_id,timestamp,type,location,notes
+1,1,2024-01-15T08:00:00,check_in,Escritório Central,
+2,1,2024-01-15T12:00:00,break_start,Escritório Central,Almoço
+3,1,2024-01-15T13:00:00,break_end,Escritório Central,
+4,1,2024-01-15T17:30:00,check_out,Escritório Central,
+5,2,2024-01-15T08:30:00,check_in,Home Office,Trabalho remoto
+6,2,2024-01-15T17:00:00,check_out,Home Office,

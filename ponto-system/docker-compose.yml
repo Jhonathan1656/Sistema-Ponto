@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - SECRET_KEY=sua-chave-secreta-super-segura-mude-isso
+      - DATABASE_URL=sqlite:///./ponto.db
+    volumes:
+      - ./backend/ponto.db:/app/ponto.db
+    restart: unless-stopped
+
+  # Opcional: Nginx para servir o app Flutter (web)
+  # frontend:
+  #   image: nginx:alpine
+  #   ports:
+  #     - "80:80"
+  #   volumes:
+  #     - ./frontend/build/web:/usr/share/nginx/html
+  #   restart: unless-stopped
