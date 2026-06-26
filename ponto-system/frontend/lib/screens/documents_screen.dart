@@ -1,9 +1,12 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:file_saver/file_saver.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 
 import '../services/api_service.dart';
@@ -25,6 +28,7 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
   List<Map<String, dynamic>> _notifications = [];
   bool _isAdmin = false;
   bool _loading = true;
+  bool _downloadingMonth = false;
   String _query = '';
   String _statusFilter = 'all';
   String _personFilter = 'all';
@@ -242,6 +246,143 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
     }
   }
 
+  Future<DateTime?> _pickDownloadMonth() async {
+    return showDialog<DateTime>(
+      context: context,
+      builder: (context) {
+        final year = DateTime.now().year;
+        const months = [
+          'Jan',
+          'Fev',
+          'Mar',
+          'Abr',
+          'Mai',
+          'Jun',
+          'Jul',
+          'Ago',
+          'Set',
+          'Out',
+          'Nov',
+          'Dez'
+        ];
+        return AlertDialog(
+          title: const Text('Escolha o mes para baixar'),
+          content: Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: List.generate(
+              12,
+              (index) => ChoiceChip(
+                label: Text(months[index]),
+                selected: false,
+                onSelected: (_) =>
+                    Navigator.pop(context, DateTime(year, index + 1)),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancelar'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  String _safeFileName(String value) {
+    final cleaned = value
+        .replaceAll(RegExp(r'[\\/:*?"<>|]+'), '_')
+        .replaceAll(RegExp(r'\s+'), '_')
+        .trim();
+    return cleaned.isEmpty ? 'documento' : cleaned;
+  }
+
+  Future<void> _downloadMonthDocuments() async {
+    final selectedMonth = await _pickDownloadMonth();
+    if (selectedMonth == null) return;
+
+    final documents = _documents.where((document) {
+      final status = document['status']?.toString() ?? '';
+      final signedUrl = document['signed_file_url']?.toString() ?? '';
+      if (status != 'signed' || signedUrl.isEmpty) return false;
+
+      final createdAt = DateTime.tryParse(
+        document['created_at']?.toString() ?? '',
+      )?.toLocal();
+      return createdAt != null &&
+          createdAt.year == selectedMonth.year &&
+          createdAt.month == selectedMonth.month;
+    }).toList();
+
+    if (documents.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content: Text('Nenhum PDF assinado encontrado nesse mes.')),
+        );
+      }
+      return;
+    }
+
+    setState(() => _downloadingMonth = true);
+    try {
+      final archive = Archive();
+      for (var index = 0; index < documents.length; index++) {
+        final document = documents[index];
+        final url = document['signed_file_url']?.toString() ?? '';
+        final response =
+            await http.get(Uri.parse(url)).timeout(const Duration(seconds: 40));
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          throw Exception(
+              'Falha ao baixar ${document['title'] ?? 'documento'} (${response.statusCode}).');
+        }
+
+        final title = _safeFileName(
+          document['title']?.toString() ?? 'documento_${index + 1}',
+        );
+        final userName = _safeFileName(
+          document['user_name']?.toString() ?? 'colaborador',
+        );
+        archive.addFile(
+          ArchiveFile(
+            '${(index + 1).toString().padLeft(2, '0')}_${userName}_$title.pdf',
+            response.bodyBytes.length,
+            response.bodyBytes,
+          ),
+        );
+      }
+
+      final zipBytes = ZipEncoder().encode(archive);
+      if (zipBytes == null) throw Exception('Nao foi possivel gerar o ZIP.');
+
+      final month = selectedMonth.month.toString().padLeft(2, '0');
+      final fileName = 'Documentos_Assinados_$month-${selectedMonth.year}';
+      await FileSaver.instance.saveFile(
+        name: fileName,
+        bytes: Uint8List.fromList(zipBytes),
+        ext: 'zip',
+        mimeType: MimeType.zip,
+      );
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+              content: Text('${documents.length} documento(s) baixado(s).')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Erro ao baixar documentos: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _downloadingMonth = false);
+    }
+  }
+
   String _statusFilterLabel() {
     switch (_statusFilter) {
       case 'pending':
@@ -327,6 +468,28 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
       appBar: AppBar(
         title: Text(_isAdmin ? 'Documentos da equipe' : 'Meus documentos'),
         actions: [
+          if (_isAdmin)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: TextButton.icon(
+                onPressed: _downloadingMonth || _loading
+                    ? null
+                    : _downloadMonthDocuments,
+                icon: _downloadingMonth
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.download),
+                label: const Text('Baixar'),
+                style: TextButton.styleFrom(
+                  foregroundColor: wineColor,
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  textStyle: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+              ),
+            ),
           if (false)
             IconButton(
               onPressed: _pickMonth,
