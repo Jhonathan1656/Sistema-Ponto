@@ -13,8 +13,8 @@ class AppConfig {
     if (kIsWeb) return ['${Uri.base.origin}/api'];
     if (defaultTargetPlatform == TargetPlatform.android) {
       return [
-        'http://192.168.1.2:8080/api',
-        'http://192.168.1.2:8000',
+        'https://ponto.vmacengenharia.com/api',
+        'http://ponto.vmacengenharia.com/api',
       ];
     }
     return ['http://localhost:8000'];
