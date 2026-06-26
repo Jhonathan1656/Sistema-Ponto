@@ -216,16 +216,26 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _loadTodayRecords() async {
     try {
       final now = DateTime.now();
-      final start = DateTime(now.year, now.month, now.day).toIso8601String();
+      final startOfToday = DateTime(now.year, now.month, now.day);
+      final start = startOfToday.toIso8601String();
       final end =
           DateTime(now.year, now.month, now.day, 23, 59, 59).toIso8601String();
+      final lookbackStart =
+          startOfToday.subtract(const Duration(days: 30)).toIso8601String();
 
       final records =
           await _apiService.getTimeRecords(startDate: start, endDate: end);
+      final recentRecords = await _apiService.getTimeRecords(
+          startDate: lookbackStart, endDate: end);
       final pendingRecords = await _apiService.getOfflineRecords();
+      final visibleRecords = _mergeTodayWithOpenSession(
+        todayRecords: records,
+        recentRecords: recentRecords,
+        startOfToday: startOfToday,
+      );
 
       setState(() {
-        _todayRecords = records.reversed.toList(); // Ordem cronológica
+        _todayRecords = visibleRecords;
         _pendingOfflineRecordsCount = pendingRecords.length;
         _updateStatus();
       });
@@ -233,6 +243,44 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (e) {
       debugPrint('Erro records: $e');
     }
+  }
+
+  List<dynamic> _mergeTodayWithOpenSession({
+    required List<dynamic> todayRecords,
+    required List<dynamic> recentRecords,
+    required DateTime startOfToday,
+  }) {
+    final todayChronological = todayRecords.reversed.toList();
+    final recentChronological = recentRecords.reversed.toList();
+    if (recentChronological.isEmpty) return todayChronological;
+
+    final lastRecord = recentChronological.last;
+    if (lastRecord['record_type']?.toString() == 'check_out') {
+      return todayChronological;
+    }
+
+    final lastTimestamp =
+        DateTime.tryParse(lastRecord['timestamp']?.toString() ?? '');
+    if (lastTimestamp == null || !lastTimestamp.isBefore(startOfToday)) {
+      return todayChronological;
+    }
+
+    var sessionStartIndex = recentChronological.lastIndexWhere(
+      (record) => record['record_type']?.toString() == 'check_in',
+    );
+    if (sessionStartIndex < 0) sessionStartIndex = 0;
+
+    final openSession = recentChronological.sublist(sessionStartIndex);
+    final seenIds = <String>{};
+    final merged = <dynamic>[];
+
+    for (final record in [...openSession, ...todayChronological]) {
+      final id = record['id']?.toString();
+      if (id != null && !seenIds.add(id)) continue;
+      merged.add(record);
+    }
+
+    return merged;
   }
 
   Future<void> _trySyncOfflineRecords({bool showMessage = false}) async {
