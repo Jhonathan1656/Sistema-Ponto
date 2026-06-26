@@ -11,3 +11,6 @@ build/
 *.log
 __pycache__/
 *.pyc
+.idea/
+ponto-system/backend/venv/
+ponto-system/frontend/firebase.exe.exe

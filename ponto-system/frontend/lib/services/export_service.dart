@@ -6,9 +6,10 @@ import 'package:flutter/foundation.dart' show Uint8List, kIsWeb;
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
+import 'app_config.dart';
+
 class ExportService {
-  static String get backendUrl =>
-      kIsWeb ? '${Uri.base.origin}/api' : 'http://localhost:8000';
+  static String get backendUrl => AppConfig.backendUrl;
 
   Future<void> exportToExcel({
     required Map<String, dynamic> data,

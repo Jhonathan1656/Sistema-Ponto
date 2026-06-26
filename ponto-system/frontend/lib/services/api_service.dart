@@ -12,6 +12,8 @@ import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'app_config.dart';
+
 class AdjustmentRequestResult {
   final String id;
   final String? audioUrl;
@@ -30,8 +32,7 @@ class ApiService {
   final FirebaseStorage _storage = FirebaseStorage.instance;
   static const String _offlineRecordsKey = 'offline_time_records';
   static const String _cachedUserKey = 'cached_current_user';
-  static String get backendUrl =>
-      kIsWeb ? '${Uri.base.origin}/api' : 'http://localhost:8000';
+  static String get backendUrl => AppConfig.backendUrl;
 
   Future<Map<String, String>> _authorizedHeaders() async {
     final user = _auth.currentUser;
