@@ -8,7 +8,7 @@ class AppConfig {
     if (_apiBaseUrl.isNotEmpty) return _apiBaseUrl;
     if (kIsWeb) return '${Uri.base.origin}/api';
     if (defaultTargetPlatform == TargetPlatform.android) {
-      return 'http://192.168.1.2:8000';
+      return 'http://192.168.1.2:8080/api';
     }
     return 'http://localhost:8000';
   }
