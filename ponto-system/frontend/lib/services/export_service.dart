@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:file_saver/file_saver.dart';
 import 'package:flutter/foundation.dart' show Uint8List, kIsWeb;
 import 'package:http/http.dart' as http;
@@ -10,6 +11,23 @@ import 'app_config.dart';
 
 class ExportService {
   static String get backendUrl => AppConfig.backendUrl;
+
+  Future<Map<String, String>> _authorizedJsonHeaders() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      throw Exception('Usuario nao autenticado.');
+    }
+
+    final token = await user.getIdToken(true);
+    if (token == null || token.isEmpty) {
+      throw Exception('Nao foi possivel renovar sua sessao.');
+    }
+
+    return {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer $token',
+    };
+  }
 
   Future<void> exportToExcel({
     required Map<String, dynamic> data,
@@ -36,7 +54,7 @@ class ExportService {
 
       final response = await http.post(
         Uri.parse('$backendUrl/export-excel'),
-        headers: {'Content-Type': 'application/json'},
+        headers: await _authorizedJsonHeaders(),
         body: body,
       );
 
@@ -104,7 +122,7 @@ class ExportService {
 
       final response = await http.post(
         Uri.parse('$backendUrl/export-batch-html'),
-        headers: {'Content-Type': 'application/json'},
+        headers: await _authorizedJsonHeaders(),
         body: json.encode(batchData),
       );
 
@@ -162,7 +180,7 @@ class ExportService {
 
       final response = await http.post(
         Uri.parse('$backendUrl/export-batch'),
-        headers: {'Content-Type': 'application/json'},
+        headers: await _authorizedJsonHeaders(),
         body: json.encode(batchData),
       );
 

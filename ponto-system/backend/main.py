@@ -43,7 +43,14 @@ except ImportError:
     messaging = None
 
 # --- CONFIGURAÇÕES ---
-SECRET_KEY = os.getenv("SECRET_KEY", "sua-chave-secreta-aqui-mude-em-producao")
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+if not SECRET_KEY or SECRET_KEY in {
+    "sua-chave-secreta-aqui-mude-em-producao",
+    "sua-chave-secreta-super-segura-mude-isso",
+    "change-this-in-production",
+}:
+    logger.warning("SECRET_KEY ausente ou insegura; usando chave temporaria desta execucao.")
+    SECRET_KEY = secrets.token_urlsafe(32)
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 ZAPSIGN_API_TOKEN = os.getenv("ZAPSIGN_API_TOKEN", "")
@@ -60,6 +67,20 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/ponto.db")
 FIREBASE_WEB_API_KEY = os.getenv("FIREBASE_WEB_API_KEY", "")
 SHARED_ACCESS_TOKEN = os.getenv("SHARED_ACCESS_TOKEN", "")
 SHARED_ACCESS_COOKIE = "ponto_access"
+ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "sim",
+}
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "ALLOWED_ORIGINS",
+        "https://ponto.vmacengenharia.com,http://localhost:8080,http://127.0.0.1:8080",
+    ).split(",")
+    if origin.strip()
+]
 
 # Configurações de E-mail
 MAIL_USERNAME = "vmac.rh.01@gmail.com"
@@ -103,7 +124,12 @@ SUMMARY_ROW_VALUE = 43
 SUMMARY_ROW_FINAL = 44
 SUMMARY_START_COL = 2
 
-app = FastAPI(title="Ponto System API")
+app = FastAPI(
+    title="Ponto System API",
+    docs_url="/docs" if ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
+)
 security = HTTPBearer(auto_error=True)
 
 
@@ -162,7 +188,7 @@ async def access_check(request: Request):
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1211,7 +1237,10 @@ function showTab(id){{
     return tmp.name
 
 @app.post("/export-excel")
-async def export_excel(data: ExportData):
+async def export_excel(
+    data: ExportData,
+    user=Depends(require_authenticated_user),
+):
     try:
         file_path = generate_excel_file(data)
         return FileResponse(file_path, filename=excel_download_filename(data), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1219,7 +1248,10 @@ async def export_excel(data: ExportData):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/export-batch")
-async def export_batch(data_list: List[ExportData]):
+async def export_batch(
+    data_list: List[ExportData],
+    user=Depends(require_authenticated_user),
+):
     try:
         temp_dir = tempfile.mkdtemp()
         zip_path = os.path.join(temp_dir, "folhas_ponto.zip")
@@ -1233,7 +1265,10 @@ async def export_batch(data_list: List[ExportData]):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/export-batch-html")
-async def export_batch_html(data_list: List[ExportData]):
+async def export_batch_html(
+    data_list: List[ExportData],
+    user=Depends(require_authenticated_user),
+):
     try:
         file_path = generate_batch_html_file(data_list)
         first = data_list[0]
@@ -1250,7 +1285,8 @@ async def send_assistant_message(
     employee_name: str = Form(...),
     employee_email: str = Form(...),
     message: str = Form(...),
-    audio: Optional[UploadFile] = File(None)
+    audio: Optional[UploadFile] = File(None),
+    user=Depends(require_authenticated_user),
 ):
     try:
         body = f"""

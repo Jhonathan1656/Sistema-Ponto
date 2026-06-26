@@ -2,13 +2,14 @@ services:
   backend:
     build: ./backend
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     env_file:
       - ./backend/.env
     environment:
-      - SECRET_KEY=sua-chave-secreta-super-segura-mude-isso
       - DATABASE_URL=sqlite:////app/data/ponto.db
       - DATABASE_PATH=/app/data/ponto.db
+      - ENABLE_API_DOCS=false
+      - ALLOWED_ORIGINS=https://ponto.vmacengenharia.com
     volumes:
       - ./backend/data:/app/data
       - ./frontend/assets:/app/frontend/assets:ro

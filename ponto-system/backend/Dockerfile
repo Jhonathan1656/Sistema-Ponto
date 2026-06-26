@@ -13,7 +13,6 @@ COPY main.py .
 EXPOSE 8000
 
 # Variáveis de ambiente
-ENV SECRET_KEY=change-this-in-production
 ENV DATABASE_URL=sqlite:///./ponto.db
 
 # Executar aplicação
