@@ -9,6 +9,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class AdjustmentRequestResult {
@@ -28,7 +29,171 @@ class ApiService {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
   final FirebaseStorage _storage = FirebaseStorage.instance;
   static const String _offlineRecordsKey = 'offline_time_records';
-  static const String backendUrl = 'http://localhost:8001';
+  static const String _cachedUserKey = 'cached_current_user';
+  static String get backendUrl =>
+      kIsWeb ? '${Uri.base.origin}/api' : 'http://localhost:8000';
+
+  Future<Map<String, String>> _authorizedHeaders() async {
+    final user = _auth.currentUser;
+    if (user == null) throw Exception('Usuario nao autenticado.');
+    final token = await user.getIdToken(true);
+    if (token == null || token.isEmpty) {
+      throw Exception('Nao foi possivel renovar sua sessao. Entre novamente.');
+    }
+    return {'Authorization': 'Bearer $token'};
+  }
+
+  String _apiError(http.Response response) {
+    try {
+      final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+      return decoded['detail']?.toString() ?? response.body;
+    } catch (_) {
+      return response.body;
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> getSignatureDocuments(
+      {required bool admin}) async {
+    final response = await http
+        .get(
+          Uri.parse(admin
+              ? '$backendUrl/admin/signature-documents'
+              : '$backendUrl/signature-documents'),
+          headers: await _authorizedHeaders(),
+        )
+        .timeout(const Duration(seconds: 30));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes)) as List;
+    return decoded
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .toList();
+  }
+
+  Future<Map<String, dynamic>> createSignatureDocument({
+    required String targetUserId,
+    required String targetUserName,
+    required String targetUserEmail,
+    required String title,
+    required String message,
+    required String fileName,
+    required Uint8List pdfBytes,
+  }) async {
+    final documentId =
+        '${DateTime.now().microsecondsSinceEpoch}_${targetUserId.substring(0, 6)}';
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('$backendUrl/admin/signature-documents'),
+    );
+    request.headers.addAll(await _authorizedHeaders());
+    request.fields.addAll({
+      'target_user_id': targetUserId,
+      'target_user_name': targetUserName,
+      'target_user_email': targetUserEmail,
+      'local_document_id': documentId,
+      'title': title,
+      'message': message,
+    });
+    request.files.add(http.MultipartFile.fromBytes(
+      'pdf',
+      pdfBytes,
+      filename: fileName,
+    ));
+
+    final streamed = await request.send().timeout(const Duration(seconds: 90));
+    final response = await http.Response.fromStream(streamed);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    return Map<String, dynamic>.from(
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
+  Future<Map<String, dynamic>> refreshSignatureDocument(
+      String documentId) async {
+    final response = await http
+        .post(
+          Uri.parse('$backendUrl/signature-documents/$documentId/refresh'),
+          headers: await _authorizedHeaders(),
+        )
+        .timeout(const Duration(seconds: 45));
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    return Map<String, dynamic>.from(
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
+  Future<List<Map<String, dynamic>>> getSignatureNotifications() async {
+    final response = await http
+        .get(
+          Uri.parse('$backendUrl/signature-notifications'),
+          headers: await _authorizedHeaders(),
+        )
+        .timeout(const Duration(seconds: 30));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes)) as List;
+    return decoded
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .toList();
+  }
+
+  Future<void> markSignatureNotificationsRead() async {
+    final response = await http
+        .post(
+          Uri.parse('$backendUrl/signature-notifications/read'),
+          headers: await _authorizedHeaders(),
+        )
+        .timeout(const Duration(seconds: 30));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+  }
+
+  Future<void> _cacheCurrentUser(Map<String, dynamic> user) async {
+    final prefs = await SharedPreferences.getInstance();
+    final cachedUser = <String, dynamic>{
+      for (final key in const [
+        'id',
+        'uid',
+        'email',
+        'name',
+        'cpf',
+        'role',
+        'job_title',
+        'daily_hours',
+      ])
+        if (user[key] != null) key: user[key],
+    };
+    await prefs.setString(_cachedUserKey, jsonEncode(cachedUser));
+  }
+
+  Future<Map<String, dynamic>?> getCachedCurrentUser() async {
+    final prefs = await SharedPreferences.getInstance();
+    final rawUser = prefs.getString(_cachedUserKey);
+    if (rawUser == null || rawUser.isEmpty) return null;
+
+    try {
+      return Map<String, dynamic>.from(jsonDecode(rawUser) as Map);
+    } catch (e) {
+      debugPrint('Erro ao ler perfil offline: $e');
+      await prefs.remove(_cachedUserKey);
+      return null;
+    }
+  }
+
+  Future<bool> hasCachedSession() async {
+    return await getCachedCurrentUser() != null;
+  }
+
+  Future<bool> _hasNetworkConnection() async {
+    final results = await Connectivity().checkConnectivity();
+    return !results.contains(ConnectivityResult.none);
+  }
 
   // --- MÉTODOS DE AJUSTE (CHAT INTERNO) ---
 
@@ -288,10 +453,13 @@ class ApiService {
 
       final String? token = await result.user!.getIdToken();
 
-      return {
+      final response = {
         'access_token': token,
         'user': {'id': result.user!.uid, ...userData}
       };
+      await _cacheCurrentUser(
+          Map<String, dynamic>.from(response['user'] as Map));
+      return response;
     } on FirebaseAuthException catch (e) {
       // Mapeamento de erros amigáveis para o usuário
       String errorMessage;
@@ -346,13 +514,37 @@ class ApiService {
         'created_at': FieldValue.serverTimestamp(),
       };
       await _db.collection('users').doc(result.user!.uid).set(userData);
-      return {'id': result.user!.uid, ...userData};
+      final user = {'id': result.user!.uid, ...userData};
+      await _cacheCurrentUser(user);
+      return user;
     } on FirebaseAuthException catch (e) {
       throw Exception('Registro falhou: ${e.message}');
     }
   }
 
   Future<Map<String, dynamic>> getCurrentUser() async {
+    final user = _auth.currentUser;
+    if (user != null) {
+      try {
+        final currentUser =
+            await _getCurrentUserOnline().timeout(const Duration(seconds: 10));
+        await _cacheCurrentUser(currentUser);
+        return currentUser;
+      } catch (e) {
+        debugPrint('Perfil online indisponivel, usando cache local: $e');
+      }
+    }
+
+    final cachedUser = await getCachedCurrentUser();
+    if (cachedUser != null &&
+        (user == null || cachedUser['id']?.toString() == user.uid)) {
+      return cachedUser;
+    }
+
+    throw Exception('Perfil do usuario nao encontrado neste aparelho.');
+  }
+
+  Future<Map<String, dynamic>> _getCurrentUserOnline() async {
     User? user = _auth.currentUser;
     if (user == null) throw Exception('Nenhum usuário logado');
     DocumentSnapshot doc = await _db.collection('users').doc(user.uid).get();
@@ -362,7 +554,11 @@ class ApiService {
     throw Exception('Perfil do usuário não encontrado');
   }
 
-  Future<void> clearToken() async => await _auth.signOut();
+  Future<void> clearToken() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_cachedUserKey);
+    await _auth.signOut();
+  }
 
   Future<void> resetPassword(String email) async {
     try {
@@ -415,7 +611,16 @@ class ApiService {
         firestoreData['created_at'] = FieldValue.serverTimestamp();
         firestoreData['synced_from_offline'] = true;
 
-        await _db.collection('time_records').add(firestoreData);
+        final recordId = record['id']?.toString();
+        if (recordId == null || recordId.isEmpty) {
+          throw Exception('Registro offline sem identificador.');
+        }
+
+        await _db
+            .collection('time_records')
+            .doc(recordId)
+            .set(firestoreData)
+            .timeout(const Duration(seconds: 15));
         syncedCount++;
       } catch (e) {
         debugPrint('Erro ao sincronizar ponto offline ${record['id']}: $e');
@@ -532,6 +737,68 @@ class ApiService {
     double? latitude,
     double? longitude,
   }) async {
+    final currentUser = _auth.currentUser;
+    final cachedUser = await getCachedCurrentUser();
+    final currentUserId = currentUser?.uid ?? cachedUser?['id']?.toString();
+    if (currentUserId == null || currentUserId.isEmpty) {
+      throw Exception(
+          'Faca login com internet uma vez antes de registrar offline.');
+    }
+
+    final targetUid = userId ?? currentUserId;
+    final now = DateTime.now();
+    final recordTimestamp = timestamp ?? now.toIso8601String();
+    final recordData = {
+      'user_id': targetUid,
+      'record_type': recordType,
+      'location': location ?? 'App',
+      'notes': notes,
+      'timestamp': recordTimestamp,
+      'latitude': latitude,
+      'longitude': longitude,
+      if (userId != null && userId != currentUserId) 'created_by_admin': true,
+    };
+
+    try {
+      if (currentUser == null) {
+        throw Exception('Sem sessao online.');
+      }
+      if (!await _hasNetworkConnection()) {
+        throw Exception('Sem conexao de rede.');
+      }
+
+      final docRef = await _db.collection('time_records').add({
+        ...recordData,
+        'created_at': FieldValue.serverTimestamp(),
+      }).timeout(const Duration(seconds: 10));
+      return {'id': docRef.id, ...recordData};
+    } catch (e) {
+      if (userId != null && userId != currentUserId) rethrow;
+
+      final offlineRecord = {
+        'id': 'offline_${now.microsecondsSinceEpoch}',
+        ...recordData,
+        'offline': true,
+        'sync_status': 'pending',
+        'created_at_local': now.toIso8601String(),
+      };
+      await _saveOfflineRecord(offlineRecord);
+      debugPrint(
+          'Ponto salvo offline para sincronizar depois: ${offlineRecord['id']}');
+      return offlineRecord;
+    }
+  }
+
+  // ignore: unused_element
+  Future<Map<String, dynamic>> _createTimeRecordLegacy({
+    required String recordType,
+    String? location,
+    String? notes,
+    String? timestamp,
+    String? userId,
+    double? latitude,
+    double? longitude,
+  }) async {
     User? currentUser = _auth.currentUser;
     if (currentUser == null) throw Exception('Usuário não autenticado');
 
@@ -576,6 +843,52 @@ class ApiService {
   }
 
   Future<List<dynamic>> getTimeRecords(
+      {String? startDate, String? endDate, String? userId}) async {
+    final cachedUser = await getCachedCurrentUser();
+    final currentUserId =
+        _auth.currentUser?.uid ?? cachedUser?['id']?.toString();
+    final targetUid = userId ?? currentUserId;
+    var records = <Map<String, dynamic>>[];
+
+    try {
+      final snapshot = await _db
+          .collection('time_records')
+          .where('user_id', isEqualTo: targetUid)
+          .get()
+          .timeout(const Duration(seconds: 10));
+      records =
+          snapshot.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
+    } catch (e) {
+      debugPrint('Pontos online indisponiveis, usando registros offline: $e');
+    }
+
+    if (targetUid == currentUserId) {
+      final offlineRecords = await getOfflineRecords();
+      records.addAll(
+          offlineRecords.where((record) => record['user_id'] == targetUid));
+    }
+
+    records.sort((a, b) =>
+        (b['timestamp'] as String).compareTo(a['timestamp'] as String));
+    if (startDate != null || endDate != null) {
+      records = records.where((record) {
+        final timestamp = record['timestamp'] as String;
+        var matches = true;
+        if (startDate != null) {
+          matches = matches && timestamp.compareTo(startDate) >= 0;
+        }
+        if (endDate != null) {
+          matches = matches && timestamp.compareTo(endDate) <= 0;
+        }
+        return matches;
+      }).toList();
+    }
+
+    return records;
+  }
+
+  // ignore: unused_element
+  Future<List<dynamic>> _getTimeRecordsLegacy(
       {String? startDate, String? endDate, String? userId}) async {
     String? targetUid = userId ?? _auth.currentUser?.uid;
     var records = <Map<String, dynamic>>[];

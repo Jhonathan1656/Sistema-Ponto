@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
@@ -27,6 +28,7 @@ class AdminChatDetailScreen extends StatefulWidget {
 
 class _AdminChatDetailScreenState extends State<AdminChatDetailScreen> {
   final _db = FirebaseFirestore.instance;
+  final _textController = TextEditingController();
   final _audioPlayer = AudioPlayer();
   Timer? _refreshTimer;
   String? _currentlyPlayingUrl;
@@ -95,8 +97,41 @@ class _AdminChatDetailScreenState extends State<AdminChatDetailScreen> {
     _positionSub?.cancel();
     _durationSub?.cancel();
     _completeSub?.cancel();
+    _textController.dispose();
     _audioPlayer.dispose();
     super.dispose();
+  }
+
+  Future<void> _sendReply() async {
+    final message = _textController.text.trim();
+    if (message.isEmpty) return;
+
+    final admin = FirebaseAuth.instance.currentUser;
+    final conversationId = widget.conversationId ?? widget.userId;
+    final now = DateTime.now().toIso8601String();
+    _textController.clear();
+
+    await _db.collection('adjustment_requests').add({
+      'conversation_id': conversationId,
+      'user_id': widget.userId,
+      'user_name': widget.userName,
+      'sender_id': admin?.uid,
+      'sender_role': 'admin',
+      'message': message,
+      'timestamp': now,
+      'status': 'read',
+      'notification_read': false,
+    });
+
+    await _db.collection('adjustment_conversations').doc(conversationId).set({
+      'user_id': widget.userId,
+      'user_name': widget.userName,
+      'last_message': message,
+      'last_time': now,
+      'updated_at': now,
+      'status': 'open',
+      'deleted': false,
+    }, SetOptions(merge: true));
   }
 
   Future<void> _playAudio(String url) async {
@@ -133,24 +168,59 @@ class _AdminChatDetailScreenState extends State<AdminChatDetailScreen> {
         backgroundColor: const Color(0xFF8B0000),
         foregroundColor: Colors.white,
       ),
-      body: StreamBuilder<List<Map<String, dynamic>>>(
-        stream: _watchRequests(),
-        initialData: widget.requests,
-        builder: (context, snapshot) {
-          if (snapshot.hasError) {
-            return Center(
-                child: Text('Erro ao carregar conversa: ${snapshot.error}'));
-          }
+      body: Column(
+        children: [
+          Expanded(
+            child: StreamBuilder<List<Map<String, dynamic>>>(
+              stream: _watchRequests(),
+              initialData: widget.requests,
+              builder: (context, snapshot) {
+                if (snapshot.hasError) {
+                  return Center(
+                      child:
+                          Text('Erro ao carregar conversa: ${snapshot.error}'));
+                }
 
-          final requests = snapshot.data ?? widget.requests;
-          if (requests.isEmpty) {
-            return const Center(
-                child: Text('Nenhuma mensagem encontrada.',
-                    style: TextStyle(color: Colors.grey)));
-          }
+                final requests = snapshot.data ?? widget.requests;
+                if (requests.isEmpty) {
+                  return const Center(
+                      child: Text('Nenhuma mensagem encontrada.',
+                          style: TextStyle(color: Colors.grey)));
+                }
 
-          return _buildRequestsList(context, requests);
-        },
+                return _buildRequestsList(context, requests);
+              },
+            ),
+          ),
+          SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _textController,
+                      textCapitalization: TextCapitalization.sentences,
+                      onSubmitted: (_) => _sendReply(),
+                      decoration: const InputDecoration(
+                        hintText: 'Responder ao colaborador',
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton.filled(
+                    onPressed: _sendReply,
+                    icon: const Icon(Icons.send),
+                    tooltip: 'Enviar resposta',
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -211,18 +281,20 @@ class _AdminChatDetailScreenState extends State<AdminChatDetailScreen> {
     final isAudioUploading = audioStatus == 'uploading' && !uploadExpired;
     final hasAudioError = audioStatus == 'error' || uploadExpired;
     final time = DateFormat('HH:mm').format(timestamp);
+    final isAdminReply = req['sender_role'] == 'admin';
 
     return Align(
-      alignment: Alignment.centerLeft,
+      alignment: isAdminReply ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
         margin: const EdgeInsets.only(bottom: 12),
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: const BorderRadius.only(
-            topLeft: Radius.circular(16),
-            topRight: Radius.circular(16),
-            bottomRight: Radius.circular(16),
+          color: isAdminReply ? const Color(0xFF8B0000) : Colors.white,
+          borderRadius: BorderRadius.only(
+            topLeft: const Radius.circular(16),
+            topRight: const Radius.circular(16),
+            bottomLeft: Radius.circular(isAdminReply ? 16 : 0),
+            bottomRight: Radius.circular(isAdminReply ? 0 : 16),
           ),
           boxShadow: [
             BoxShadow(
@@ -243,12 +315,16 @@ class _AdminChatDetailScreenState extends State<AdminChatDetailScreen> {
               )
             else
               Text(req['message'] ?? '',
-                  style: const TextStyle(fontSize: 15, color: Colors.black87)),
+                  style: TextStyle(
+                      fontSize: 15,
+                      color: isAdminReply ? Colors.white : Colors.black87)),
             const SizedBox(height: 4),
             Align(
               alignment: Alignment.bottomRight,
               child: Text(time,
-                  style: const TextStyle(fontSize: 10, color: Colors.grey)),
+                  style: TextStyle(
+                      fontSize: 10,
+                      color: isAdminReply ? Colors.white70 : Colors.grey)),
             ),
           ],
         ),

@@ -192,7 +192,95 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
 
   bool _isLoading = true;
   List<Map<String, dynamic>> _summaries = [];
+  String _statusFilter = 'all';
+  String _roleFilter = 'all';
   Timer? _timer;
+
+  String _statusFilterLabel() {
+    switch (_statusFilter) {
+      case 'working':
+        return 'Trabalhando';
+      case 'paused':
+        return 'Em pausa';
+      case 'paused_overdue':
+        return 'Pausa longa';
+      case 'done':
+        return 'Expediente encerrado';
+      case 'none':
+        return 'Sem ponto hoje';
+      default:
+        return 'Todos os status';
+    }
+  }
+
+  bool _matchesStatusFilter(Map<String, dynamic> summary) {
+    if (_statusFilter == 'all') return true;
+    return summary['status_key'] == _statusFilter;
+  }
+
+  String _roleFilterLabel() {
+    switch (_roleFilter) {
+      case 'intern':
+        return 'Somente estagiários';
+      case 'aux_general':
+        return 'Aux. Geral';
+      case 'technical_general':
+        return 'Técnico Geral';
+      default:
+        return 'Todos os cargos';
+    }
+  }
+
+  bool _matchesRoleFilter(Map<String, dynamic> summary) {
+    if (_roleFilter == 'all') return true;
+
+    final role = (summary['role'] ?? '').toString().toLowerCase();
+    final title = (summary['job_title'] ?? '').toString().toLowerCase();
+    final normalizedTitle = title
+        .replaceAll('á', 'a')
+        .replaceAll('ã', 'a')
+        .replaceAll('é', 'e')
+        .replaceAll('í', 'i')
+        .replaceAll('ó', 'o')
+        .replaceAll('ú', 'u');
+
+    switch (_roleFilter) {
+      case 'intern':
+        return role == 'intern' ||
+            role.contains('estag') ||
+            normalizedTitle.contains('estag');
+      case 'aux_general':
+        return normalizedTitle.contains('aux') &&
+            normalizedTitle.contains('geral');
+      case 'technical_general':
+        return normalizedTitle.contains('tecnico') &&
+            normalizedTitle.contains('geral');
+      default:
+        return true;
+    }
+  }
+
+  Widget _filterField({required String label, required Widget child}) {
+    return Container(
+      width: 220,
+      height: 52,
+      padding: const EdgeInsets.fromLTRB(12, 5, 10, 5),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFD8B5B1)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label,
+              style: const TextStyle(fontSize: 11, color: Color(0xFF7A5B58))),
+          const SizedBox(height: 1),
+          Expanded(child: Align(alignment: Alignment.centerLeft, child: child)),
+        ],
+      ),
+    );
+  }
 
   @override
   void initState() {
@@ -321,6 +409,7 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
     return {
       'name': user['name']?.toString() ?? 'Sem nome',
       'role': user['role']?.toString() ?? '',
+      'job_title': user['job_title']?.toString() ?? '',
       'status_key': statusKey,
       'status_label': statusLabel,
       'status_color': statusColor,
@@ -351,6 +440,10 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
         .length;
     final overdueCount =
         _summaries.where((s) => s['pause_overdue'] == true).length;
+    final filteredSummaries = _summaries
+        .where(_matchesStatusFilter)
+        .where(_matchesRoleFilter)
+        .toList();
 
     return RefreshIndicator(
       onRefresh: _loadSummary,
@@ -368,6 +461,75 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
             ],
           ),
           const SizedBox(height: 16),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              PopupMenuButton<String>(
+                constraints: const BoxConstraints(minWidth: 190, maxWidth: 240),
+                menuPadding: const EdgeInsets.symmetric(vertical: 4),
+                onSelected: (value) => setState(() => _statusFilter = value),
+                itemBuilder: (_) => const [
+                  PopupMenuItem(
+                      height: 40, value: 'all', child: Text('Todos os status')),
+                  PopupMenuItem(
+                      height: 40, value: 'working', child: Text('Trabalhando')),
+                  PopupMenuItem(
+                      height: 40, value: 'paused', child: Text('Em pausa')),
+                  PopupMenuItem(
+                      height: 40,
+                      value: 'paused_overdue',
+                      child: Text('Pausa longa')),
+                  PopupMenuItem(
+                      height: 40,
+                      value: 'done',
+                      child: Text('Expediente encerrado')),
+                  PopupMenuItem(
+                      height: 40, value: 'none', child: Text('Sem ponto hoje')),
+                ],
+                child: _filterField(
+                  label: 'Status',
+                  child: Row(
+                    children: [
+                      Expanded(child: Text(_statusFilterLabel())),
+                      const Icon(Icons.keyboard_arrow_down, size: 18),
+                    ],
+                  ),
+                ),
+              ),
+              PopupMenuButton<String>(
+                constraints: const BoxConstraints(minWidth: 190, maxWidth: 240),
+                menuPadding: const EdgeInsets.symmetric(vertical: 4),
+                onSelected: (value) => setState(() => _roleFilter = value),
+                itemBuilder: (_) => const [
+                  PopupMenuItem(
+                      height: 40, value: 'all', child: Text('Todos os cargos')),
+                  PopupMenuItem(
+                      height: 40,
+                      value: 'intern',
+                      child: Text('Somente estagiários')),
+                  PopupMenuItem(
+                      height: 40,
+                      value: 'aux_general',
+                      child: Text('Aux. Geral')),
+                  PopupMenuItem(
+                      height: 40,
+                      value: 'technical_general',
+                      child: Text('Técnico Geral')),
+                ],
+                child: _filterField(
+                  label: 'Cargo',
+                  child: Row(
+                    children: [
+                      Expanded(child: Text(_roleFilterLabel())),
+                      const Icon(Icons.keyboard_arrow_down, size: 18),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
           const Text(
             'STATUS DA EQUIPE',
             style: TextStyle(
@@ -381,14 +543,14 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
             height: 188,
             child: ListView.separated(
               scrollDirection: Axis.horizontal,
-              itemCount: _summaries.length,
+              itemCount: filteredSummaries.length,
               separatorBuilder: (_, __) => const SizedBox(width: 12),
               itemBuilder: (context, index) =>
-                  _buildEmployeeStatusCard(_summaries[index]),
+                  _buildEmployeeStatusCard(filteredSummaries[index]),
             ),
           ),
           const SizedBox(height: 20),
-          ..._summaries
+          ...filteredSummaries
               .where((summary) =>
                   summary['status_key'] == 'working' ||
                   summary['status_key'] == 'paused_overdue')

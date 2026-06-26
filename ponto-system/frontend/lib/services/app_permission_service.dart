@@ -19,6 +19,8 @@ class AppPermissionService {
   }
 
   static Future<bool> requestCorePermissions() async {
+    if (kIsWeb) return true;
+
     for (final permission in _corePermissions) {
       try {
         final status = await permission.status;
@@ -34,6 +36,8 @@ class AppPermissionService {
   }
 
   static Future<bool> hasCorePermissions() async {
+    if (kIsWeb) return true;
+
     final needsRuntimeNotificationPermission =
         defaultTargetPlatform == TargetPlatform.android ||
             defaultTargetPlatform == TargetPlatform.iOS;

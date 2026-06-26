@@ -4,6 +4,7 @@ import '../services/api_service.dart';
 import '../services/theme_service.dart';
 import '../widgets/export_dialog.dart';
 import 'admin_chat_list_screen.dart';
+import 'documents_screen.dart';
 import 'login_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
@@ -161,6 +162,23 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 ),
               ),
               const SizedBox(height: 16),
+
+              _buildExportCard(
+                icon: Icons.assignment_turned_in_outlined,
+                title:
+                    isAdmin ? 'Documentos para Assinatura' : 'Meus Documentos',
+                subtitle: isAdmin
+                    ? 'Enviar PDFs e acompanhar assinaturas'
+                    : 'Visualizar e assinar documentos recebidos',
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const DocumentsScreen()),
+                ),
+                textColor: textColor,
+                cardColor: cardColor,
+                iconColor: Colors.indigo,
+              ),
+              const SizedBox(height: 12),
 
               // Botões de Exportação (Cards como no backup) - VISÍVEIS APENAS PARA ADMIN
               if (isAdmin) ...[

@@ -7,7 +7,8 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
 class ExportService {
-  static const String backendUrl = 'http://localhost:8001';
+  static String get backendUrl =>
+      kIsWeb ? '${Uri.base.origin}/api' : 'http://localhost:8000';
 
   Future<void> exportToExcel({
     required Map<String, dynamic> data,

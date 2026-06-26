@@ -127,6 +127,8 @@ class _ChatScreenState extends State<ChatScreen> {
       'conversation_id': widget.conversationId,
       'user_id': user.uid,
       'user_name': userName,
+      'sender_id': user.uid,
+      'sender_role': 'user',
       'message': message,
       'audio_url': null,
       'audio_levels': audioLevels,
@@ -625,16 +627,18 @@ class _ChatScreenState extends State<ChatScreen> {
     final hasAudio = audioSource != null || msg['audio_upload_status'] != null;
     final isSending = msg['audio_upload_status'] == 'uploading';
     final hasError = msg['audio_upload_status'] == 'error';
+    final isManagerMessage = msg['sender_role'] == 'admin';
     final time =
         DateTime.tryParse(msg['timestamp']?.toString() ?? '') ?? DateTime.now();
 
     return Align(
-      alignment: Alignment.centerRight,
+      alignment:
+          isManagerMessage ? Alignment.centerLeft : Alignment.centerRight,
       child: Row(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          if (!isSending)
+          if (!isSending && !isManagerMessage)
             PopupMenuButton<String>(
               icon: const Icon(Icons.more_vert, size: 18, color: Colors.grey),
               onSelected: (value) {
@@ -669,16 +673,21 @@ class _ChatScreenState extends State<ChatScreen> {
               ],
             ),
           GestureDetector(
-            onLongPress: isSending ? null : () => _showOptions(msg, hasAudio),
+            onLongPress: isSending || isManagerMessage
+                ? null
+                : () => _showOptions(msg, hasAudio),
             child: Container(
               margin: const EdgeInsets.only(bottom: 12),
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
               decoration: BoxDecoration(
-                color: hasError ? Colors.red.shade900 : wineColor,
-                borderRadius: const BorderRadius.only(
-                  topLeft: Radius.circular(16),
-                  topRight: Radius.circular(16),
-                  bottomLeft: Radius.circular(16),
+                color: isManagerMessage
+                    ? Colors.grey.shade200
+                    : (hasError ? Colors.red.shade900 : wineColor),
+                borderRadius: BorderRadius.only(
+                  topLeft: const Radius.circular(16),
+                  topRight: const Radius.circular(16),
+                  bottomLeft: Radius.circular(isManagerMessage ? 0 : 16),
+                  bottomRight: Radius.circular(isManagerMessage ? 16 : 0),
                 ),
               ),
               constraints: BoxConstraints(
@@ -696,12 +705,17 @@ class _ChatScreenState extends State<ChatScreen> {
                                 _currentlyPlayingUrl == audioSource
                                     ? Icons.stop
                                     : Icons.play_arrow,
-                                color: Colors.white),
+                                color: isManagerMessage
+                                    ? wineColor
+                                    : Colors.white),
                             onPressed: () => _playAudio(audioSource),
                           )
                         else
-                          const Icon(Icons.mic,
-                              color: Colors.white70, size: 20),
+                          Icon(Icons.mic,
+                              color: isManagerMessage
+                                  ? Colors.black54
+                                  : Colors.white70,
+                              size: 20),
                         const SizedBox(width: 8),
                         Text(
                           isSending
@@ -709,17 +723,26 @@ class _ChatScreenState extends State<ChatScreen> {
                               : (hasError
                                   ? 'Falha ao anexar audio'
                                   : 'Mensagem de audio'),
-                          style: const TextStyle(color: Colors.white),
+                          style: TextStyle(
+                              color: isManagerMessage
+                                  ? Colors.black87
+                                  : Colors.white),
                         ),
                       ],
                     )
                   else
                     Text(msg['message']?.toString() ?? '',
-                        style: const TextStyle(color: Colors.white)),
+                        style: TextStyle(
+                            color: isManagerMessage
+                                ? Colors.black87
+                                : Colors.white)),
                   const SizedBox(height: 4),
                   Text(DateFormat('HH:mm').format(time),
-                      style:
-                          const TextStyle(color: Colors.white70, fontSize: 10)),
+                      style: TextStyle(
+                          color: isManagerMessage
+                              ? Colors.black54
+                              : Colors.white70,
+                          fontSize: 10)),
                 ],
               ),
             ),

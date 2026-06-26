@@ -9,3 +9,5 @@ pydantic[email]==2.10.0
 openpyxl==3.1.2
 python-dotenv==1.0.0
 firebase-admin==6.5.0
+fastapi-mail
+httpx==0.28.1

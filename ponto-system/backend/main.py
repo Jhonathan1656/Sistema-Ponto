@@ -5,36 +5,61 @@ import tempfile
 import zipfile
 import html
 import re
+import base64
+import json
+import sqlite3
+import hashlib
+import hmac
+import secrets
+import logging
 from datetime import datetime, timedelta, time, date
 from calendar import monthrange
 from typing import Optional, List
 
+import httpx
 import openpyxl
 from openpyxl.styles import Alignment, Font, Border, Side
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig, MessageType
 from pydantic import BaseModel
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
+logger = logging.getLogger(__name__)
+
 try:
     import firebase_admin
     from firebase_admin import auth as firebase_auth
-    from firebase_admin import credentials, firestore
+    from firebase_admin import credentials, firestore, messaging
 except ImportError:
     firebase_admin = None
     firebase_auth = None
     credentials = None
     firestore = None
+    messaging = None
 
 # --- CONFIGURAÇÕES ---
 SECRET_KEY = os.getenv("SECRET_KEY", "sua-chave-secreta-aqui-mude-em-producao")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ZAPSIGN_API_TOKEN = os.getenv("ZAPSIGN_API_TOKEN", "")
+ZAPSIGN_API_BASE_URL = os.getenv(
+    "ZAPSIGN_API_BASE_URL",
+    "https://sandbox.api.zapsign.com.br/api/v1",
+).rstrip("/")
+ZAPSIGN_APP_URL = os.getenv(
+    "ZAPSIGN_APP_URL",
+    "https://sandbox.app.zapsign.com.br/verificar",
+).rstrip("/")
+ZAPSIGN_WEBHOOK_SECRET = os.getenv("ZAPSIGN_WEBHOOK_SECRET", "")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/ponto.db")
+FIREBASE_WEB_API_KEY = os.getenv("FIREBASE_WEB_API_KEY", "")
+SHARED_ACCESS_TOKEN = os.getenv("SHARED_ACCESS_TOKEN", "")
+SHARED_ACCESS_COOKIE = "ponto_access"
 
 # Configurações de E-mail
 MAIL_USERNAME = "vmac.rh.01@gmail.com"
@@ -80,6 +105,59 @@ SUMMARY_START_COL = 2
 
 app = FastAPI(title="Ponto System API")
 security = HTTPBearer(auto_error=True)
+
+
+def _shared_access_cookie_value() -> str:
+    """Returns a signed value without exposing the shared access token."""
+    return hmac.new(
+        SECRET_KEY.encode("utf-8"),
+        SHARED_ACCESS_TOKEN.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _safe_redirect_path(path: str) -> str:
+    return path if path.startswith("/") and not path.startswith("//") else "/"
+
+
+@app.get("/access/unlock", response_class=HTMLResponse)
+async def access_unlock_form(next: str = "/"):
+    safe_next = html.escape(_safe_redirect_path(next), quote=True)
+    return f"""<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Acesso ao Ponto</title><style>
+body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f6f8;font-family:Arial,sans-serif;color:#18212b}}
+main{{width:min(360px,calc(100% - 48px));background:#fff;padding:32px;border-radius:14px;box-shadow:0 12px 32px #0002}}
+h1{{margin:0 0 10px;font-size:24px}}p{{margin:0 0 24px;color:#52606d;line-height:1.45}}label{{display:block;font-weight:600;margin-bottom:8px}}input{{box-sizing:border-box;width:100%;padding:13px;border:1px solid #b8c2cc;border-radius:8px;font-size:16px}}button{{width:100%;margin-top:16px;padding:13px;border:0;border-radius:8px;background:#1769aa;color:#fff;font-size:16px;font-weight:600;cursor:pointer}}
+</style></head><body><main><h1>Acesso restrito</h1><p>Informe o token de acesso para continuar.</p>
+<form method="post" action="/access/login"><input type="hidden" name="next" value="{safe_next}"><label for="token">Token de acesso</label><input id="token" name="token" type="password" autocomplete="current-password" autofocus required><button type="submit">Entrar</button></form>
+</main></body></html>"""
+
+
+@app.post("/access/login")
+async def access_unlock(token: str = Form(...), next: str = Form("/")):
+    if not SHARED_ACCESS_TOKEN or not secrets.compare_digest(token, SHARED_ACCESS_TOKEN):
+        return HTMLResponse("<h1>Token inválido</h1><p><a href='/access/unlock'>Tentar novamente</a></p>", status_code=401)
+
+    response = RedirectResponse(url=_safe_redirect_path(next), status_code=303)
+    response.set_cookie(
+        key=SHARED_ACCESS_COOKIE,
+        value=_shared_access_cookie_value(),
+        max_age=60 * 60 * 24 * 30,
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+    return response
+
+
+@app.get("/access/check")
+async def access_check(request: Request):
+    is_authorized = SHARED_ACCESS_TOKEN and secrets.compare_digest(
+        request.cookies.get(SHARED_ACCESS_COOKIE, ""),
+        _shared_access_cookie_value(),
+    )
+    return Response(status_code=204 if is_authorized else 401)
 
 # CORS
 app.add_middleware(
@@ -276,37 +354,330 @@ def init_firebase_admin():
         return
 
     service_account_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
-    if service_account_path:
+    service_account_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    project_id = os.getenv("FIREBASE_PROJECT_ID", "")
+    options = {"projectId": project_id} if project_id else None
+    if service_account_json:
+        cred = credentials.Certificate(json.loads(service_account_json))
+        firebase_admin.initialize_app(cred, options=options)
+    elif service_account_path:
         cred = credentials.Certificate(service_account_path)
-        firebase_admin.initialize_app(cred)
+        firebase_admin.initialize_app(cred, options=options)
     else:
-        firebase_admin.initialize_app()
+        firebase_admin.initialize_app(options=options)
 
 def get_firestore_admin():
     init_firebase_admin()
     return firestore.client()
 
-async def require_admin_user(token: HTTPAuthorizationCredentials = Depends(security)):
-    init_firebase_admin()
+def send_document_push_notification(user_id: str, title: str, body: str, document_id: str):
+    """Envia o push aos aparelhos cadastrados pelo colaborador.
+
+    Falhas de push nao impedem a criacao do documento nem a notificacao interna.
+    """
+    if messaging is None:
+        logger.warning("Push de documento ignorado: firebase-admin indisponivel.")
+        return
+
     try:
-        decoded = firebase_auth.verify_id_token(token.credentials)
-    except Exception:
+        user_doc = get_firestore_admin().collection("users").document(user_id).get()
+        user_data = user_doc.to_dict() or {} if user_doc.exists else {}
+        tokens = [token for token in user_data.get("fcm_tokens", []) if isinstance(token, str) and token]
+        if not tokens:
+            logger.info("Push de documento sem aparelho cadastrado para o usuario %s", user_id)
+            return
+
+        for start in range(0, len(tokens), 500):
+            message = messaging.MulticastMessage(
+                tokens=tokens[start:start + 500],
+                notification=messaging.Notification(title=title, body=body),
+                data={"type": "signature_document", "document_id": document_id},
+                android=messaging.AndroidConfig(priority="high"),
+                apns=messaging.APNSConfig(
+                    payload=messaging.APNSPayload(aps=messaging.Aps(sound="default"))
+                ),
+            )
+            messaging.send_each_for_multicast(message)
+    except Exception as exc:
+        logger.warning("Falha ao enviar push de documento: %s", exc)
+
+def decode_firestore_value(value: dict):
+    if "stringValue" in value:
+        return value["stringValue"]
+    if "booleanValue" in value:
+        return value["booleanValue"]
+    if "integerValue" in value:
+        return int(value["integerValue"])
+    if "doubleValue" in value:
+        return float(value["doubleValue"])
+    if "timestampValue" in value:
+        return value["timestampValue"]
+    if "nullValue" in value:
+        return None
+    if "mapValue" in value:
+        fields = value["mapValue"].get("fields", {})
+        return {key: decode_firestore_value(item) for key, item in fields.items()}
+    if "arrayValue" in value:
+        return [
+            decode_firestore_value(item)
+            for item in value["arrayValue"].get("values", [])
+        ]
+    return None
+
+async def get_firestore_document_with_user_token(
+    collection_name: str,
+    document_id: str,
+    id_token: str,
+) -> Optional[dict]:
+    project_id = os.getenv("FIREBASE_PROJECT_ID", "")
+    if not project_id:
+        raise HTTPException(status_code=503, detail="FIREBASE_PROJECT_ID nao configurado.")
+
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{project_id}"
+        f"/databases/(default)/documents/{collection_name}/{document_id}"
+    )
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {id_token}"},
+        )
+    if response.status_code == 404:
+        return None
+    if response.status_code < 200 or response.status_code >= 300:
+        raise HTTPException(
+            status_code=403,
+            detail="Nao foi possivel validar as permissoes no Firebase.",
+        )
+
+    fields = response.json().get("fields", {})
+    return {key: decode_firestore_value(value) for key, value in fields.items()}
+
+async def verify_firebase_user_token(id_token: str) -> str:
+    if FIREBASE_WEB_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    "https://identitytoolkit.googleapis.com/v1/accounts:lookup",
+                    params={"key": FIREBASE_WEB_API_KEY},
+                    json={"idToken": id_token},
+                )
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail="Falha ao validar a sessao Firebase.") from exc
+
+        users = response.json().get("users", []) if response.is_success else []
+        user_uid = users[0].get("localId") if users else None
+        if user_uid:
+            return user_uid
         raise HTTPException(status_code=401, detail="Token invalido ou expirado.")
 
-    admin_uid = decoded.get("uid")
-    if not admin_uid:
+    init_firebase_admin()
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+        user_uid = decoded.get("uid")
+    except Exception as exc:
+        logger.warning("Firebase token validation failed: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status_code=401, detail="Token invalido ou expirado.")
+
+    if not user_uid:
         raise HTTPException(status_code=401, detail="Usuario nao autenticado.")
+    return user_uid
 
-    db = get_firestore_admin()
-    admin_doc = db.collection("users").document(admin_uid).get()
-    if not admin_doc.exists:
-        raise HTTPException(status_code=403, detail="Perfil admin nao encontrado.")
+async def require_authenticated_user(token: HTTPAuthorizationCredentials = Depends(security)):
+    user_uid = await verify_firebase_user_token(token.credentials)
 
-    admin_data = admin_doc.to_dict() or {}
-    if admin_data.get("role") not in ["admin", "manager"]:
-        raise HTTPException(status_code=403, detail="Apenas admin ou manager pode excluir usuarios.")
+    user_data = await get_firestore_document_with_user_token(
+        "users",
+        user_uid,
+        token.credentials,
+    )
+    if user_data is None:
+        raise HTTPException(status_code=403, detail="Perfil do usuario nao encontrado.")
 
-    return {"id": admin_uid, **admin_data}
+    return {
+        "id": user_uid,
+        "_id_token": token.credentials,
+        **user_data,
+    }
+
+async def require_admin_user(user=Depends(require_authenticated_user)):
+    if user.get("role") not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Apenas admin ou manager pode executar esta acao.")
+    return user
+
+def serialize_firestore_document(document) -> dict:
+    data = document.to_dict() or {}
+    for key, value in list(data.items()):
+        if isinstance(value, datetime):
+            data[key] = value.isoformat()
+    return {"id": document.id, **data}
+
+def get_zapsign_headers() -> dict:
+    if not ZAPSIGN_API_TOKEN or ZAPSIGN_API_TOKEN.startswith("cole-aqui"):
+        raise HTTPException(
+            status_code=503,
+            detail="ZapSign nao configurada. Defina ZAPSIGN_API_TOKEN no backend.",
+        )
+    return {
+        "Authorization": f"Bearer {ZAPSIGN_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+async def zapsign_request(method: str, path: str, json_data: Optional[dict] = None) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.request(
+                method,
+                f"{ZAPSIGN_API_BASE_URL}/{path.lstrip('/')}",
+                headers=get_zapsign_headers(),
+                json=json_data,
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Falha ao conectar com a ZapSign: {exc}")
+
+    if response.status_code < 200 or response.status_code >= 300:
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text
+        raise HTTPException(
+            status_code=502,
+            detail=f"ZapSign recusou a operacao ({response.status_code}): {detail}",
+        )
+
+    return response.json()
+
+def zapsign_document_fields(payload: dict) -> dict:
+    signers = payload.get("signers") or []
+    signer = signers[0] if signers else {}
+    signer_token = signer.get("token", "")
+    return {
+        "zapsign_document_token": payload.get("token", ""),
+        "zapsign_signer_token": signer_token,
+        "status": payload.get("status", "pending"),
+        "signer_status": signer.get("status", "new"),
+        "sign_url": f"{ZAPSIGN_APP_URL}/{signer_token}" if signer_token else "",
+        "original_file_url": payload.get("original_file") or "",
+        "signed_file_url": payload.get("signed_file") or "",
+        "signed_at": signer.get("signed_at"),
+        "zapsign_last_update_at": payload.get("last_update_at"),
+    }
+
+SIGNATURE_DOCUMENT_COLUMNS = """
+    id, user_id, user_name, user_email, title, message, original_file_name,
+    status, signer_status, zapsign_document_token, zapsign_signer_token,
+    sign_url, original_file_url, signed_file_url, signed_at,
+    zapsign_last_update_at, error_message, webhook_event,
+    created_by_id, created_by_name, created_by_email, created_at, updated_at
+"""
+
+def signature_db_connection():
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+def init_signature_documents_table():
+    with signature_db_connection() as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS signature_documents (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                user_name TEXT NOT NULL,
+                user_email TEXT NOT NULL,
+                title TEXT NOT NULL,
+                message TEXT NOT NULL DEFAULT '',
+                original_file_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'creating',
+                signer_status TEXT NOT NULL DEFAULT '',
+                zapsign_document_token TEXT NOT NULL DEFAULT '',
+                zapsign_signer_token TEXT NOT NULL DEFAULT '',
+                sign_url TEXT NOT NULL DEFAULT '',
+                original_file_url TEXT NOT NULL DEFAULT '',
+                signed_file_url TEXT NOT NULL DEFAULT '',
+                signed_at TEXT,
+                zapsign_last_update_at TEXT,
+                error_message TEXT NOT NULL DEFAULT '',
+                webhook_event TEXT NOT NULL DEFAULT '',
+                created_by_id TEXT NOT NULL,
+                created_by_name TEXT NOT NULL DEFAULT '',
+                created_by_email TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS signature_notifications (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                document_id TEXT NOT NULL DEFAULT '',
+                is_read INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+def get_signature_document(document_id: str) -> Optional[dict]:
+    with signature_db_connection() as connection:
+        row = connection.execute(
+            f"SELECT {SIGNATURE_DOCUMENT_COLUMNS} FROM signature_documents WHERE id = ?",
+            (document_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+def update_signature_document(document_id: str, fields: dict):
+    allowed_fields = {
+        "status", "signer_status", "zapsign_document_token",
+        "zapsign_signer_token", "sign_url", "original_file_url",
+        "signed_file_url", "signed_at", "zapsign_last_update_at",
+        "error_message", "webhook_event", "updated_at",
+    }
+    values = {key: value for key, value in fields.items() if key in allowed_fields}
+    if not values:
+        return
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with signature_db_connection() as connection:
+        connection.execute(
+            f"UPDATE signature_documents SET {assignments} WHERE id = ?",
+            (*values.values(), document_id),
+        )
+
+def find_signature_document_id(document_token: str) -> Optional[str]:
+    with signature_db_connection() as connection:
+        row = connection.execute(
+            "SELECT id FROM signature_documents WHERE zapsign_document_token = ? LIMIT 1",
+            (document_token,),
+        ).fetchone()
+    return row["id"] if row else None
+
+def create_signature_notification(user_id: str, title: str, body: str, document_id: str):
+    if not user_id:
+        return
+    with signature_db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO signature_notifications (id, user_id, title, body, document_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                secrets.token_urlsafe(16), user_id, title, body, document_id,
+                datetime.utcnow().isoformat() + "Z",
+            ),
+        )
+
+def create_signed_notification_if_needed(document: dict, previous_status: str, current_status: str):
+    if previous_status == "signed" or current_status != "signed":
+        return
+    create_signature_notification(
+        document.get("created_by_id", ""),
+        "Documento assinado",
+        f"{document.get('user_name', 'O colaborador')} assinou \"{document.get('title', 'o documento')}\".",
+        document.get("id", ""),
+    )
+
+@app.on_event("startup")
+def initialize_local_tables():
+    init_signature_documents_table()
 
 def delete_query_in_batches(db, query, batch_size: int = 300) -> int:
     deleted = 0
@@ -897,6 +1268,215 @@ async def send_assistant_message(
         return {"status": "success", "message": "E-mail enviado com sucesso"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao enviar e-mail: {str(e)}")
+
+@app.post("/admin/signature-documents")
+async def create_signature_document(
+    target_user_id: str = Form(...),
+    target_user_name: str = Form(...),
+    target_user_email: str = Form(...),
+    local_document_id: str = Form(...),
+    title: str = Form(...),
+    message: str = Form(""),
+    pdf: UploadFile = File(...),
+    admin=Depends(require_admin_user),
+):
+    if not title.strip():
+        raise HTTPException(status_code=400, detail="Informe o titulo do documento.")
+
+    file_name = pdf.filename or "documento.pdf"
+    if not file_name.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Envie um arquivo PDF.")
+
+    pdf_bytes = await pdf.read()
+    if not pdf_bytes or not pdf_bytes.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="O arquivo enviado nao e um PDF valido.")
+    if len(pdf_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="O PDF deve ter no maximo 10 MB.")
+
+    target_name = target_user_name.strip()
+    target_email = target_user_email.strip()
+    if not target_name:
+        raise HTTPException(status_code=400, detail="Informe o nome do colaborador.")
+    if not target_email:
+        raise HTTPException(status_code=400, detail="O colaborador precisa ter um e-mail cadastrado.")
+
+    now = datetime.utcnow().isoformat() + "Z"
+    with signature_db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO signature_documents (
+                id, user_id, user_name, user_email, title, message,
+                original_file_name, status, created_by_id, created_by_name,
+                created_by_email, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                local_document_id, target_user_id, target_name, target_email,
+                title.strip(), message.strip(), file_name, "creating",
+                admin["id"], admin.get("name", ""), admin.get("email", ""),
+                now, now,
+            ),
+        )
+
+    payload = {
+        "name": title.strip()[:255],
+        "base64_pdf": base64.b64encode(pdf_bytes).decode("ascii"),
+        "lang": "pt-br",
+        "external_id": local_document_id,
+        "folder_path": "/Ponto-VMac/",
+        "disable_signer_emails": False,
+        "allow_refuse_signature": True,
+        "signers": [{
+            "name": target_name,
+            "email": target_email,
+            "auth_mode": "assinaturaTela-tokenEmail",
+            "send_automatic_email": True,
+            "lock_name": True,
+            "lock_email": True,
+            "external_id": target_user_id,
+        }],
+    }
+
+    try:
+        result = await zapsign_request("POST", "/docs/", payload)
+        update_signature_document(local_document_id, {
+            **zapsign_document_fields(result),
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        })
+    except HTTPException as exc:
+        update_signature_document(local_document_id, {
+            "status": "error",
+            "error_message": str(exc.detail),
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        })
+        raise
+
+    document = get_signature_document(local_document_id)
+    create_signature_notification(
+        target_user_id,
+        "Documento aguardando assinatura",
+        f"RH enviou \"{title.strip()}\" para sua assinatura.",
+        local_document_id,
+    )
+    send_document_push_notification(
+        target_user_id,
+        "Documento aguardando assinatura",
+        f"RH enviou \"{title.strip()}\" para sua assinatura.",
+        local_document_id,
+    )
+    return document
+
+@app.get("/signature-notifications")
+async def list_signature_notifications(user=Depends(require_authenticated_user)):
+    with signature_db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, title, body, document_id, is_read, created_at
+            FROM signature_notifications
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            LIMIT 30
+            """,
+            (user["id"],),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+@app.post("/signature-notifications/read")
+async def mark_signature_notifications_read(user=Depends(require_authenticated_user)):
+    with signature_db_connection() as connection:
+        connection.execute(
+            "UPDATE signature_notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0",
+            (user["id"],),
+        )
+    return {"status": "success"}
+
+@app.get("/signature-documents")
+async def list_my_signature_documents(user=Depends(require_authenticated_user)):
+    with signature_db_connection() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT {SIGNATURE_DOCUMENT_COLUMNS}
+            FROM signature_documents
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            """,
+            (user["id"],),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+@app.get("/admin/signature-documents")
+async def list_all_signature_documents(admin=Depends(require_admin_user)):
+    with signature_db_connection() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT {SIGNATURE_DOCUMENT_COLUMNS}
+            FROM signature_documents
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+@app.post("/signature-documents/{document_id}/refresh")
+async def refresh_signature_document(
+    document_id: str,
+    user=Depends(require_authenticated_user),
+):
+    data = get_signature_document(document_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Documento nao encontrado.")
+
+    is_admin = user.get("role") in ["admin", "manager"]
+    if data.get("user_id") != user["id"] and not is_admin:
+        raise HTTPException(status_code=403, detail="Sem acesso a este documento.")
+
+    document_token = data.get("zapsign_document_token")
+    if not document_token:
+        raise HTTPException(status_code=409, detail="Documento ainda nao foi criado na ZapSign.")
+
+    result = await zapsign_request("GET", f"/docs/{document_token}/")
+    previous_status = data.get("status", "")
+    update_signature_document(document_id, {
+        **zapsign_document_fields(result),
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    })
+    updated_document = get_signature_document(document_id)
+    create_signed_notification_if_needed(
+        updated_document, previous_status, updated_document.get("status", ""),
+    )
+    return updated_document
+
+@app.post("/zapsign/webhook")
+async def zapsign_webhook(request: Request):
+    if ZAPSIGN_WEBHOOK_SECRET:
+        supplied_secret = (
+            request.query_params.get("secret")
+            or request.headers.get("X-Webhook-Secret")
+        )
+        if supplied_secret != ZAPSIGN_WEBHOOK_SECRET:
+            raise HTTPException(status_code=401, detail="Webhook nao autorizado.")
+
+    payload = await request.json()
+    external_id = str(payload.get("external_id") or "")
+    document_token = str(payload.get("token") or "")
+    document_id = external_id if external_id and get_signature_document(external_id) else None
+    if document_id is None and document_token:
+        document_id = find_signature_document_id(document_token)
+
+    if document_id is None:
+        return {"status": "ignored", "reason": "document_not_found"}
+
+    document = get_signature_document(document_id)
+    previous_status = document.get("status", "") if document else ""
+    update_signature_document(document_id, {
+        **zapsign_document_fields(payload),
+        "webhook_event": payload.get("event_type") or payload.get("event") or "",
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    })
+    updated_document = get_signature_document(document_id)
+    create_signed_notification_if_needed(
+        updated_document, previous_status, updated_document.get("status", ""),
+    )
+    return {"status": "success"}
 
 @app.delete("/admin/users/{user_id}")
 async def delete_user_admin_endpoint(

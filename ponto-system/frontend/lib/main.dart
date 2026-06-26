@@ -1,4 +1,7 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -8,22 +11,107 @@ import 'package:intl/date_symbol_data_local.dart';
 import 'screens/login_screen.dart';
 import 'screens/main_screen.dart';
 import 'services/app_permission_service.dart';
+import 'services/api_service.dart';
 import 'services/notification_service.dart';
 import 'services/theme_service.dart';
 
-void main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
-  await initializeDateFormatting('pt_BR', null);
-  await NotificationService.initialize();
-  runApp(
-    ChangeNotifierProvider(
-      create: (_) => ThemeService(),
-      child: const MyApp(),
-    ),
-  );
+  runApp(const AppBootstrap());
+}
+
+class AppBootstrap extends StatefulWidget {
+  const AppBootstrap({super.key});
+
+  @override
+  State<AppBootstrap> createState() => _AppBootstrapState();
+}
+
+class _AppBootstrapState extends State<AppBootstrap> {
+  late Future<void> _initialization;
+
+  @override
+  void initState() {
+    super.initState();
+    _initialization = _initialize();
+  }
+
+  Future<void> _initialize() async {
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    ).timeout(const Duration(seconds: 20));
+    await initializeDateFormatting('pt_BR', null);
+
+    if (!kIsWeb) {
+      unawaited(NotificationService.initialize());
+    }
+  }
+
+  void _retry() {
+    setState(() {
+      _initialization = _initialize();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<void>(
+      future: _initialization,
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return MaterialApp(
+            debugShowCheckedModeBanner: false,
+            home: Scaffold(
+              body: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text(
+                        'Nao foi possivel iniciar o aplicativo.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        snapshot.error.toString(),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 20),
+                      ElevatedButton(
+                        onPressed: _retry,
+                        child: const Text('Tentar novamente'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+        }
+
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const MaterialApp(
+            debugShowCheckedModeBanner: false,
+            home: Scaffold(
+              body: Center(
+                child: CircularProgressIndicator(color: Color(0xFF8B0000)),
+              ),
+            ),
+          );
+        }
+
+        return ChangeNotifierProvider(
+          create: (_) => ThemeService(),
+          child: const MyApp(),
+        );
+      },
+    );
+  }
 }
 
 class MyApp extends StatelessWidget {
@@ -199,27 +287,51 @@ class _PermissionGateState extends State<PermissionGate>
   }
 }
 
-class AuthGate extends StatelessWidget {
+class AuthGate extends StatefulWidget {
   const AuthGate({super.key});
 
   @override
+  State<AuthGate> createState() => _AuthGateState();
+}
+
+class _AuthGateState extends State<AuthGate> {
+  final ApiService _apiService = ApiService();
+  late final Future<bool> _hasCachedSession;
+
+  @override
+  void initState() {
+    super.initState();
+    _hasCachedSession = _apiService.hasCachedSession();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return StreamBuilder<User?>(
-      stream: FirebaseAuth.instance.authStateChanges(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Scaffold(
-            body: Center(
-              child: CircularProgressIndicator(color: Color(0xFF8B0000)),
-            ),
-          );
-        }
+    return FutureBuilder<bool>(
+      future: _hasCachedSession,
+      builder: (context, cachedSnapshot) {
+        return StreamBuilder<User?>(
+          stream: FirebaseAuth.instance.authStateChanges(),
+          builder: (context, authSnapshot) {
+            final isCheckingCache =
+                cachedSnapshot.connectionState != ConnectionState.done;
+            final isCheckingAuth =
+                authSnapshot.connectionState == ConnectionState.waiting;
 
-        if (snapshot.data != null) {
-          return const MainScreen();
-        }
+            if (isCheckingCache && isCheckingAuth) {
+              return const Scaffold(
+                body: Center(
+                  child: CircularProgressIndicator(color: Color(0xFF8B0000)),
+                ),
+              );
+            }
 
-        return const LoginScreen();
+            if (authSnapshot.data != null || cachedSnapshot.data == true) {
+              return const MainScreen();
+            }
+
+            return const LoginScreen();
+          },
+        );
       },
     );
   }

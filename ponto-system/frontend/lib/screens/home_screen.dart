@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 import 'package:intl/intl.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import '../services/api_service.dart';
 import '../services/notification_service.dart';
 
@@ -23,6 +24,7 @@ class _HomeScreenState extends State<HomeScreen> {
   String _currentStatus = "Carregando...";
   String _lastActionTime = "";
   Timer? _timer;
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
   Map<String, dynamic>? _user;
   bool _isAutoClosingBreak = false;
   bool _isSyncingOffline = false;
@@ -39,12 +41,19 @@ class _HomeScreenState extends State<HomeScreen> {
     _updateTime();
     _timer =
         Timer.periodic(const Duration(seconds: 1), (timer) => _updateTime());
+    _connectivitySubscription =
+        Connectivity().onConnectivityChanged.listen((results) {
+      if (!results.contains(ConnectivityResult.none)) {
+        unawaited(_trySyncOfflineRecords(showMessage: true));
+      }
+    });
     _loadInitialData();
   }
 
   @override
   void dispose() {
     _timer?.cancel();
+    _connectivitySubscription?.cancel();
     super.dispose();
   }
 
