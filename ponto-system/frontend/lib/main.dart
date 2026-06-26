@@ -11,6 +11,7 @@ import 'package:intl/date_symbol_data_local.dart';
 import 'screens/login_screen.dart';
 import 'screens/main_screen.dart';
 import 'services/app_permission_service.dart';
+import 'services/app_navigation_service.dart';
 import 'services/api_service.dart';
 import 'services/notification_service.dart';
 import 'services/theme_service.dart';
@@ -122,6 +123,7 @@ class MyApp extends StatelessWidget {
     final themeService = Provider.of<ThemeService>(context);
 
     return MaterialApp(
+      navigatorKey: AppNavigationService.navigatorKey,
       title: 'Vmac Ponto',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(

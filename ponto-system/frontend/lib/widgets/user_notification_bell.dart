@@ -23,7 +23,9 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
   final _apiService = ApiService();
   List<Map<String, dynamic>> _documentNotifications = [];
   final Set<String> _seenDocumentNotificationIds = {};
+  final Set<String> _seenChatNotificationIds = {};
   bool _documentNotificationsInitialized = false;
+  bool _chatNotificationsInitialized = false;
   Timer? _pollTimer;
 
   @override
@@ -178,6 +180,35 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
     }
   }
 
+  void _notifyNewChatMessages(List<Map<String, dynamic>> messages) {
+    final newMessages = messages.where((message) {
+      final id = message['id']?.toString();
+      return id != null && !_seenChatNotificationIds.contains(id);
+    }).toList();
+
+    _seenChatNotificationIds
+      ..clear()
+      ..addAll(messages
+          .map((message) => message['id']?.toString())
+          .whereType<String>());
+
+    if (!_chatNotificationsInitialized) {
+      _chatNotificationsInitialized = true;
+      return;
+    }
+    if (newMessages.isEmpty) return;
+
+    final message = newMessages.first;
+    unawaited(NotificationService.showChatMessage(
+      conversationId: message['conversation_id']?.toString() ?? '',
+      title: widget.isAdmin
+          ? 'Nova mensagem de colaborador'
+          : 'Resposta da gestao',
+      body: message['message']?.toString() ?? 'Audio',
+      isAdmin: widget.isAdmin,
+    ));
+  }
+
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<List<Map<String, dynamic>>>(
@@ -185,6 +216,9 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
       initialData: const [],
       builder: (context, snapshot) {
         final messages = snapshot.data ?? [];
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _notifyNewChatMessages(messages);
+        });
         final unreadDocuments = widget.isAdmin
             ? 0
             : _documentNotifications

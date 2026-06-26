@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -6,6 +8,8 @@ import 'package:intl/intl.dart';
 import 'package:timezone/data/latest_all.dart' as tz;
 import 'package:timezone/timezone.dart' as tz;
 
+import 'app_navigation_service.dart';
+
 class NotificationService {
   NotificationService._();
 
@@ -13,6 +17,7 @@ class NotificationService {
       FlutterLocalNotificationsPlugin();
   static const int _internReminderId = 1002;
   static const int _openShift24hReminderId = 1005;
+  static const int _chatMessageNotificationId = 1006;
   static bool _pushListenersConfigured = false;
 
   static const AndroidNotificationChannel _breakChannel =
@@ -55,6 +60,16 @@ class NotificationService {
     enableVibration: true,
   );
 
+  static const AndroidNotificationChannel _chatMessagesChannel =
+      AndroidNotificationChannel(
+    'chat_messages',
+    'Mensagens',
+    description: 'Avisos de novas mensagens em conversas.',
+    importance: Importance.max,
+    playSound: true,
+    enableVibration: true,
+  );
+
   static Future<void> initialize() async {
     tz.initializeTimeZones();
     tz.setLocalLocation(tz.getLocation('America/Sao_Paulo'));
@@ -72,7 +87,12 @@ class NotificationService {
       macOS: darwinSettings,
     );
 
-    await _plugin.initialize(settings: initializationSettings);
+    await _plugin.initialize(
+      settings: initializationSettings,
+      onDidReceiveNotificationResponse: (response) {
+        AppNavigationService.openWhenReady(response.payload);
+      },
+    );
 
     final androidPlugin = _plugin.resolvePlatformSpecificImplementation<
         AndroidFlutterLocalNotificationsPlugin>();
@@ -80,6 +100,7 @@ class NotificationService {
     await androidPlugin?.createNotificationChannel(_internReminderChannel);
     await androidPlugin?.createNotificationChannel(_signatureDocumentsChannel);
     await androidPlugin?.createNotificationChannel(_openShiftReminderChannel);
+    await androidPlugin?.createNotificationChannel(_chatMessagesChannel);
     await androidPlugin?.requestNotificationsPermission();
     await _configurePushNotifications();
   }
@@ -102,6 +123,13 @@ class NotificationService {
       if (_pushListenersConfigured) return;
       _pushListenersConfigured = true;
       messaging.onTokenRefresh.listen(saveToken);
+      FirebaseMessaging.onMessageOpenedApp.listen((message) {
+        AppNavigationService.openWhenReady(jsonEncode(message.data));
+      });
+      final initialMessage = await messaging.getInitialMessage();
+      if (initialMessage != null) {
+        AppNavigationService.openWhenReady(jsonEncode(initialMessage.data));
+      }
       FirebaseMessaging.onMessage.listen((message) {
         final notification = message.notification;
         if (notification == null) return;
@@ -109,6 +137,7 @@ class NotificationService {
           id: 1004,
           title: notification.title ?? 'Nova notificação',
           body: notification.body ?? '',
+          payload: jsonEncode(message.data),
           notificationDetails: const NotificationDetails(
             android: AndroidNotificationDetails(
               'signature_documents',
@@ -166,6 +195,7 @@ class NotificationService {
       title: 'Pausa fechada automaticamente',
       body:
           'Provavelmente voce esqueceu a pausa aberta. Fechando a pausa $time e retomando o turno.',
+      payload: jsonEncode({'type': 'home'}),
       notificationDetails: details,
     );
   }
@@ -200,6 +230,7 @@ class NotificationService {
       title: 'Ponto aberto',
       body:
           'Talvez voce tenha esquecido de fechar o ponto. Se ainda estiver trabalhando, pode ignorar.',
+      payload: jsonEncode({'type': 'intern_open_point'}),
       notificationDetails: details,
     );
   }
@@ -246,6 +277,7 @@ class NotificationService {
       title: 'Ponto aberto',
       body:
           'Talvez voce tenha esquecido de fechar o ponto. Se ainda estiver trabalhando, pode ignorar.',
+      payload: jsonEncode({'type': 'intern_open_point'}),
       scheduledDate: tz.TZDateTime.from(scheduledAt, tz.local),
       notificationDetails: details,
       androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
@@ -294,6 +326,7 @@ class NotificationService {
       title: 'Ponto aberto',
       body:
           'Seu ponto esta aberto ha mais de 24h. Se estiver correto, desconsidere este aviso.',
+      payload: jsonEncode({'type': 'open_shift_24h'}),
       scheduledDate: tz.TZDateTime.from(scheduledAt, tz.local),
       notificationDetails: details,
       androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
@@ -323,6 +356,7 @@ class NotificationService {
       title: 'Ponto aberto',
       body:
           'Seu ponto esta aberto ha mais de 24h. Se estiver correto, desconsidere este aviso.',
+      payload: jsonEncode({'type': 'open_shift_24h'}),
       notificationDetails: const NotificationDetails(
         android: androidDetails,
         iOS: darwinDetails,
@@ -333,6 +367,44 @@ class NotificationService {
 
   static Future<void> cancelOpenShift24hReminder() async {
     await _plugin.cancel(id: _openShift24hReminderId);
+  }
+
+  static Future<void> showChatMessage({
+    required String conversationId,
+    required String title,
+    required String body,
+    bool isAdmin = false,
+  }) async {
+    const androidDetails = AndroidNotificationDetails(
+      'chat_messages',
+      'Mensagens',
+      channelDescription: 'Avisos de novas mensagens em conversas.',
+      importance: Importance.max,
+      priority: Priority.high,
+      category: AndroidNotificationCategory.message,
+      visibility: NotificationVisibility.public,
+    );
+
+    const darwinDetails = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+    );
+
+    await _plugin.show(
+      id: _chatMessageNotificationId,
+      title: title,
+      body: body,
+      payload: jsonEncode({
+        'type': isAdmin ? 'admin_chat_message' : 'chat_message',
+        'conversation_id': conversationId,
+      }),
+      notificationDetails: const NotificationDetails(
+        android: androidDetails,
+        iOS: darwinDetails,
+        macOS: darwinDetails,
+      ),
+    );
   }
 
   static Future<void> showSignatureRequest({
@@ -363,6 +435,7 @@ class NotificationService {
       body: pendingCount == 1
           ? 'RH enviou "$title" para sua assinatura.'
           : 'RH enviou $pendingCount documentos para sua assinatura.',
+      payload: jsonEncode({'type': 'signature_document'}),
       notificationDetails: const NotificationDetails(
         android: androidDetails,
         iOS: darwinDetails,
