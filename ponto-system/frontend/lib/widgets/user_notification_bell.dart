@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import '../screens/admin_chat_list_screen.dart';
 import '../screens/chat_screen.dart';
 import '../services/api_service.dart';
+import '../services/notification_service.dart';
 
 class UserNotificationBell extends StatefulWidget {
   final bool isAdmin;
@@ -21,6 +22,8 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
   static const _wineColor = Color(0xFF8B0000);
   final _apiService = ApiService();
   List<Map<String, dynamic>> _documentNotifications = [];
+  final Set<String> _seenDocumentNotificationIds = {};
+  bool _documentNotificationsInitialized = false;
   Timer? _pollTimer;
 
   @override
@@ -44,6 +47,28 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
 
     try {
       final notifications = await _apiService.getSignatureNotifications();
+      final unread = notifications
+          .where((notification) => notification['is_read'] != 1)
+          .toList();
+      final newUnread = unread.where((notification) {
+        final id = notification['id']?.toString();
+        return id != null && !_seenDocumentNotificationIds.contains(id);
+      }).toList();
+
+      _seenDocumentNotificationIds
+        ..clear()
+        ..addAll(unread
+            .map((notification) => notification['id']?.toString())
+            .whereType<String>());
+
+      if (_documentNotificationsInitialized && newUnread.isNotEmpty) {
+        await NotificationService.showSignatureRequest(
+          pendingCount: newUnread.length,
+          title: newUnread.first['title']?.toString() ?? 'Documento',
+        );
+      }
+      _documentNotificationsInitialized = true;
+
       if (mounted) setState(() => _documentNotifications = notifications);
     } catch (_) {
       // O sino continua exibindo as mensagens mesmo se a API estiver offline.

@@ -35,9 +35,22 @@ class ApiService {
   static String get backendUrl => AppConfig.backendUrl;
   static List<String> get backendUrls => AppConfig.backendUrls;
 
+  Future<User> _waitForAuthenticatedUser() async {
+    final currentUser = _auth.currentUser;
+    if (currentUser != null) return currentUser;
+
+    final user = await _auth
+        .authStateChanges()
+        .firstWhere((user) => user != null)
+        .timeout(const Duration(seconds: 5), onTimeout: () => null);
+    if (user == null) {
+      throw Exception('Usuario nao autenticado.');
+    }
+    return user;
+  }
+
   Future<Map<String, String>> _authorizedHeaders() async {
-    final user = _auth.currentUser;
-    if (user == null) throw Exception('Usuario nao autenticado.');
+    final user = await _waitForAuthenticatedUser();
     final token = await user.getIdToken(true);
     if (token == null || token.isEmpty) {
       throw Exception('Nao foi possivel renovar sua sessao. Entre novamente.');
@@ -574,7 +587,10 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> getCurrentUser() async {
-    final user = _auth.currentUser;
+    final user = await _auth.authStateChanges().first.timeout(
+          const Duration(seconds: 3),
+          onTimeout: () => _auth.currentUser,
+        );
     if (user != null) {
       try {
         final currentUser =
@@ -596,8 +612,7 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> _getCurrentUserOnline() async {
-    User? user = _auth.currentUser;
-    if (user == null) throw Exception('Nenhum usuário logado');
+    final user = await _waitForAuthenticatedUser();
     DocumentSnapshot doc = await _db.collection('users').doc(user.uid).get();
     if (doc.exists) {
       return {'id': user.uid, ...doc.data() as Map<String, dynamic>};
