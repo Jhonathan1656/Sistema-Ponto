@@ -287,7 +287,8 @@ def classify_estag_payroll(record: ExportRecord, record_date: date, holiday_days
     total = mins["normal"] + mins["extras"]
     rules = rules or EstagRules()
 
-    if record_date.weekday() == 6 or record_date.day in holiday_days:
+    is_holiday = record_date.day in holiday_days or record_date.isoformat() in holiday_days
+    if record_date.weekday() == 6 or is_holiday:
         if rules.sunday_100:
             result["100"] = total
         else:
@@ -365,6 +366,51 @@ class ExportData(BaseModel):
     target_hours: Optional[float] = 210.0
     holidays: Optional[List[int]] = None
     estag_rules: Optional[EstagRules] = None
+    period_start: Optional[str] = None
+    period_end: Optional[str] = None
+    period_label: Optional[str] = None
+
+def export_period_dates(data: ExportData) -> List[date]:
+    if data.period_start and data.period_end:
+        start = datetime.fromisoformat(data.period_start[:10]).date()
+        end = datetime.fromisoformat(data.period_end[:10]).date()
+    else:
+        year = int(data.year)
+        month = int(data.month)
+        start = date(year, month, 1)
+        end = date(year, month, monthrange(year, month)[1])
+
+    if end < start:
+        raise ValueError("Periodo de fechamento invalido.")
+
+    dates = []
+    current = start
+    while current <= end:
+        dates.append(current)
+        current += timedelta(days=1)
+    return dates
+
+def export_period_label(data: ExportData) -> str:
+    if data.period_label:
+        return data.period_label
+    dates = export_period_dates(data)
+    if not dates:
+        return f"{data.month}/{data.year}"
+    if len(dates) == monthrange(int(data.year), int(data.month))[1] and dates[0].day == 1:
+        return f"{MONTH_NAMES.get(int(data.month), data.month)}/{data.year}"
+    return f"{dates[0].strftime('%d/%m/%Y')} a {dates[-1].strftime('%d/%m/%Y')}"
+
+def holiday_date_keys(data: ExportData) -> set:
+    days = set(data.holidays or [])
+    dates = export_period_dates(data)
+    keys = set()
+    for item in days:
+        if 1 <= item <= len(dates):
+            keys.add(dates[item - 1].isoformat())
+        for current in dates:
+            if current.day == item:
+                keys.add(current.isoformat())
+    return keys
 
 class DeleteUserRequest(BaseModel):
     user_id: str
@@ -793,6 +839,10 @@ def generate_excel_file(data: ExportData) -> str:
     if data.generate_from_scratch:
         data.daily_records = generate_scratch_records(int(data.year), int(data.month), data.target_hours or 210.0)
 
+    period_dates = export_period_dates(data)
+    custom_period = bool(data.period_start and data.period_end)
+    row_by_date = {current.isoformat(): 9 + idx for idx, current in enumerate(period_dates[:31])}
+
     ws.cell(row=5, column=3).value = data.employee_name
     is_estagiario = "estagiario" in data.employee_role.lower() or "intern" in data.employee_role.lower()
 
@@ -807,16 +857,23 @@ def generate_excel_file(data: ExportData) -> str:
 
     total_bank = {"normal": 0, "extras": 0, "50": 0, "100": 0}
 
-    for d in range(1, 32):
-        row_idx = 8 + d
+    for idx in range(31):
+        row_idx = 9 + idx
+        if custom_period:
+            current_date = period_dates[idx] if idx < len(period_dates) else None
+            ws.cell(row=row_idx, column=2).value = current_date.strftime("%d/%m") if current_date else None
+            for clear_col in range(3, 9):
+                ws.cell(row=row_idx, column=clear_col).value = None
         ws.cell(row=row_idx, column=9).value = f"=IFERROR(MOD(D{row_idx}-C{row_idx},1),0)+IFERROR(MOD(F{row_idx}-E{row_idx},1),0)+IFERROR(MOD(H{row_idx}-G{row_idx},1),0)"
         ws.cell(row=row_idx, column=9).number_format = "[h]:mm"
 
-    holiday_days = set(data.holidays or [])
+    holiday_keys = holiday_date_keys(data)
 
     for record in data.daily_records:
-        day = datetime.fromisoformat(record.date).day
-        row_idx = 8 + day
+        record_date = datetime.fromisoformat(record.date).date()
+        row_idx = row_by_date.get(record_date.isoformat())
+        if row_idx is None:
+            continue
         if record.check_in: ws.cell(row=row_idx, column=3).value = record.check_in
         if record.check_out:
             val_out = record.check_out
@@ -826,8 +883,7 @@ def generate_excel_file(data: ExportData) -> str:
         if record.break_end: ws.cell(row=row_idx, column=6).value = record.break_end
 
         if is_estagiario and record.check_in and record.check_out:
-            record_date = datetime.fromisoformat(record.date).date()
-            payroll = classify_estag_payroll(record, record_date, holiday_days, data.estag_rules)
+            payroll = classify_estag_payroll(record, record_date, holiday_keys, data.estag_rules)
             total_bank["normal"] += payroll["normal"]
             total_bank["extras"] += payroll["extras"]
             total_bank["50"] += payroll["50"]
@@ -1037,16 +1093,16 @@ def build_employee_html(data: ExportData, panel_id: str, visible: bool) -> tuple
     if data.generate_from_scratch:
         data.daily_records = generate_scratch_records(year, month, data.target_hours or 210.0)
 
-    holiday_days = set(data.holidays or [])
-    records_by_day = {datetime.fromisoformat(r.date).day: r for r in data.daily_records}
+    period_dates = export_period_dates(data)
+    holiday_keys = holiday_date_keys(data)
+    records_by_date = {datetime.fromisoformat(r.date).date().isoformat(): r for r in data.daily_records}
     totals = {"days": 0, "total": 0, "normal": 0, "extra_contract": 0, "he50": 0, "he100": 0, "noc_real": 0, "noc_ficto": 0}
     rows = []
 
-    for day in range(1, monthrange(year, month)[1] + 1):
-        current_date = date(year, month, day)
-        record = records_by_day.get(day)
+    for index, current_date in enumerate(period_dates, start=1):
+        record = records_by_date.get(current_date.isoformat())
         classes = []
-        is_holiday = day in holiday_days
+        is_holiday = current_date.isoformat() in holiday_keys
         if is_holiday:
             classes.append("feriado")
         elif current_date.weekday() == 5:
@@ -1078,7 +1134,7 @@ def build_employee_html(data: ExportData, panel_id: str, visible: bool) -> tuple
 
         rows.append(f"""
 <tr class="{' '.join(classes)}">
-  <td>{day}</td><td>{WEEKDAY_NAMES[current_date.weekday()]}</td>
+  <td>{current_date.strftime('%d/%m')}</td><td>{WEEKDAY_NAMES[current_date.weekday()]}</td>
   <td>{esc(record.check_in if record else '')}</td><td>{esc(record.check_out if record else '')}</td>
   <td>{esc(record.break_start if record else '')}</td><td>{esc(record.break_end if record else '')}</td>
   <td>{esc(record.entry_3 if record else '')}</td><td>{esc(record.exit_3 if record else '')}</td>
@@ -1182,8 +1238,7 @@ def generate_batch_html_file(data_list: List[ExportData]) -> str:
         raise ValueError("Nenhum colaborador para exportar.")
 
     first = data_list[0]
-    month_num = int(first.month)
-    month_label = f"{MONTH_NAMES.get(month_num, first.month)}/{first.year}"
+    month_label = export_period_label(first)
     tabs = []
     panels = []
     summaries = []
@@ -1500,6 +1555,27 @@ async def refresh_signature_document(
         updated_document, previous_status, updated_document.get("status", ""),
     )
     return updated_document
+
+@app.delete("/admin/signature-documents/{document_id}")
+async def delete_signature_document(
+    document_id: str,
+    admin=Depends(require_admin_user),
+):
+    data = get_signature_document(document_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Documento nao encontrado.")
+
+    with signature_db_connection() as connection:
+        connection.execute(
+            "DELETE FROM signature_notifications WHERE document_id = ?",
+            (document_id,),
+        )
+        connection.execute(
+            "DELETE FROM signature_documents WHERE id = ?",
+            (document_id,),
+        )
+
+    return {"status": "success"}
 
 @app.post("/zapsign/webhook")
 async def zapsign_webhook(request: Request):

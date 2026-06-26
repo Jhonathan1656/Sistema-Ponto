@@ -34,6 +34,9 @@ class ExportService {
     required String month,
     required String year,
     required bool isCampo,
+    String? periodStart,
+    String? periodEnd,
+    String? periodLabel,
   }) async {
     try {
       final body = json.encode({
@@ -49,6 +52,9 @@ class ExportService {
         'generate_from_scratch': data['generate_from_scratch'],
         'target_hours': data['target_hours'],
         'holidays': data['holidays'] ?? [],
+        if (periodStart != null) 'period_start': periodStart,
+        if (periodEnd != null) 'period_end': periodEnd,
+        if (periodLabel != null) 'period_label': periodLabel,
         if (data['estag_rules'] != null) 'estag_rules': data['estag_rules'],
       });
 
@@ -98,6 +104,9 @@ class ExportService {
     required List<Map<String, dynamic>> reports,
     required String month,
     required String year,
+    String? periodStart,
+    String? periodEnd,
+    String? periodLabel,
   }) async {
     try {
       final List<Map<String, dynamic>> batchData = reports.map((r) {
@@ -117,6 +126,9 @@ class ExportService {
           'generate_from_scratch': r['generate_from_scratch'],
           'target_hours': r['target_hours'],
           'holidays': r['holidays'] ?? [],
+          if (periodStart != null) 'period_start': periodStart,
+          if (periodEnd != null) 'period_end': periodEnd,
+          if (periodLabel != null) 'period_label': periodLabel,
         };
       }).toList();
 
@@ -156,6 +168,9 @@ class ExportService {
     required List<Map<String, dynamic>> reports,
     required String month,
     required String year,
+    String? periodStart,
+    String? periodEnd,
+    String? periodLabel,
   }) async {
     try {
       final List<Map<String, dynamic>> batchData = reports.map((r) {
@@ -175,6 +190,9 @@ class ExportService {
           'generate_from_scratch': r['generate_from_scratch'],
           'target_hours': r['target_hours'],
           'holidays': r['holidays'] ?? [],
+          if (periodStart != null) 'period_start': periodStart,
+          if (periodEnd != null) 'period_end': periodEnd,
+          if (periodLabel != null) 'period_label': periodLabel,
         };
       }).toList();
 

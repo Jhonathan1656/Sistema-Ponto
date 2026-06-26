@@ -110,6 +110,45 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
     }
   }
 
+  Future<void> _deleteDocument(Map<String, dynamic> document) async {
+    final title = document['title']?.toString() ?? 'Documento';
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Apagar documento'),
+        content: Text('Deseja apagar "$title" da lista de documentos?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: wineColor),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Apagar'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    try {
+      await _apiService.deleteSignatureDocument(document['id'].toString());
+      await _load();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Documento apagado.')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Erro ao apagar documento: $e')),
+        );
+      }
+    }
+  }
+
   Future<void> _openUrl(String? value) async {
     if (value == null || value.isEmpty) return;
     final uri = Uri.tryParse(value);
@@ -640,6 +679,13 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
                                             icon: Icons.sync,
                                             label: 'Atualizar status',
                                           ),
+                                          if (_isAdmin)
+                                            _documentActionButton(
+                                              onPressed: () =>
+                                                  _deleteDocument(document),
+                                              icon: Icons.delete_outline,
+                                              label: 'Apagar documento',
+                                            ),
                                         ],
                                       ),
                                     ],

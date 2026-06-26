@@ -34,6 +34,9 @@ class _ExportDialogState extends State<ExportDialog> {
   bool _isProcessing = false;
 
   DateTime _selectedDate = DateTime.now();
+  String _closingMode = 'calendar';
+  DateTime? _customStartDate;
+  DateTime? _customEndDate;
 
   @override
   void initState() {
@@ -86,13 +89,19 @@ class _ExportDialogState extends State<ExportDialog> {
 
     setState(() => _isProcessing = true);
     try {
+      final period = _selectedPeriod();
       final month = _selectedDate.month.toString().padLeft(2, '0');
       final year = _selectedDate.year.toString();
-      final start = DateTime(_selectedDate.year, _selectedDate.month, 1)
-          .toIso8601String();
-      final end =
-          DateTime(_selectedDate.year, _selectedDate.month + 1, 0, 23, 59, 59)
+      final start =
+          DateTime(period.start.year, period.start.month, period.start.day)
               .toIso8601String();
+      final end = DateTime(
+              period.end.year, period.end.month, period.end.day, 23, 59, 59)
+          .toIso8601String();
+      final periodStart = period.start.toIso8601String();
+      final periodEnd = period.end.toIso8601String();
+      final periodLabel = period.label;
+      final useCustomPeriod = _closingMode != 'calendar';
 
       if (widget.isScratch) {
         // Modo Avulso (Do 0)
@@ -115,6 +124,9 @@ class _ExportDialogState extends State<ExportDialog> {
           month: month,
           year: year,
           isCampo: true,
+          periodStart: useCustomPeriod ? periodStart : null,
+          periodEnd: useCustomPeriod ? periodEnd : null,
+          periodLabel: useCustomPeriod ? periodLabel : null,
         );
       } else {
         // Modo Normal (Registros do App)
@@ -138,10 +150,22 @@ class _ExportDialogState extends State<ExportDialog> {
           }
           if (widget.htmlOnly) {
             await _exportService.exportBatchToHtml(
-                reports: reports, month: month, year: year);
+              reports: reports,
+              month: month,
+              year: year,
+              periodStart: useCustomPeriod ? periodStart : null,
+              periodEnd: useCustomPeriod ? periodEnd : null,
+              periodLabel: useCustomPeriod ? periodLabel : null,
+            );
           } else {
             await _exportService.exportBatchToZip(
-                reports: reports, month: month, year: year);
+              reports: reports,
+              month: month,
+              year: year,
+              periodStart: useCustomPeriod ? periodStart : null,
+              periodEnd: useCustomPeriod ? periodEnd : null,
+              periodLabel: useCustomPeriod ? periodLabel : null,
+            );
           }
         } else {
           // Individual
@@ -166,6 +190,9 @@ class _ExportDialogState extends State<ExportDialog> {
             month: month,
             year: year,
             isCampo: !_isIntern(user),
+            periodStart: useCustomPeriod ? periodStart : null,
+            periodEnd: useCustomPeriod ? periodEnd : null,
+            periodLabel: useCustomPeriod ? periodLabel : null,
           );
         }
       }
@@ -257,6 +284,71 @@ class _ExportDialogState extends State<ExportDialog> {
     return dailyHours * 30;
   }
 
+  ({DateTime start, DateTime end, String label}) _selectedPeriod() {
+    final month = _selectedDate.month;
+    final year = _selectedDate.year;
+
+    if (_closingMode == 'cutoff28') {
+      final start = DateTime(year, month - 1, 29);
+      final end = DateTime(year, month, 28);
+      return (
+        start: start,
+        end: end,
+        label:
+            '${_formatDate(start)} a ${_formatDate(end)} - compet. ${month.toString().padLeft(2, '0')}/$year'
+      );
+    }
+
+    if (_closingMode == 'custom') {
+      final start = _customStartDate ?? DateTime(year, month, 1);
+      final end = _customEndDate ?? DateTime(year, month + 1, 0);
+      return (
+        start: start,
+        end: end,
+        label:
+            '${_formatDate(start)} a ${_formatDate(end)} - compet. ${month.toString().padLeft(2, '0')}/$year'
+      );
+    }
+
+    final start = DateTime(year, month, 1);
+    final end = DateTime(year, month + 1, 0);
+    return (
+      start: start,
+      end: end,
+      label: '${month.toString().padLeft(2, '0')}/$year'
+    );
+  }
+
+  String _formatDate(DateTime value) {
+    return '${value.day.toString().padLeft(2, '0')}/${value.month.toString().padLeft(2, '0')}/${value.year}';
+  }
+
+  Future<void> _pickCustomDate({required bool start}) async {
+    final currentPeriod = _selectedPeriod();
+    final initialDate = start ? currentPeriod.start : currentPeriod.end;
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initialDate,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(2100),
+    );
+    if (picked == null) return;
+
+    setState(() {
+      if (start) {
+        _customStartDate = picked;
+        if (_customEndDate != null && _customEndDate!.isBefore(picked)) {
+          _customEndDate = picked;
+        }
+      } else {
+        _customEndDate = picked;
+        if (_customStartDate != null && _customStartDate!.isAfter(picked)) {
+          _customStartDate = picked;
+        }
+      }
+    });
+  }
+
   Future<List<int>?> _askHolidayDays() async {
     final hasHoliday = await showDialog<bool>(
       context: context,
@@ -292,7 +384,8 @@ class _ExportDialogState extends State<ExportDialog> {
   Future<List<int>?> _askHolidayInput() async {
     final controller = TextEditingController();
     String? errorText;
-    final maxDay = DateTime(_selectedDate.year, _selectedDate.month + 1, 0).day;
+    final period = _selectedPeriod();
+    final maxDay = period.end.difference(period.start).inDays + 1;
 
     final result = await showDialog<List<int>>(
       context: context,
@@ -494,6 +587,32 @@ class _ExportDialogState extends State<ExportDialog> {
                 Expanded(child: _buildYearDropdown()),
               ],
             ),
+            const SizedBox(height: 12),
+            _buildClosingModeDropdown(),
+            const SizedBox(height: 8),
+            _buildPeriodPreview(),
+            if (_closingMode == 'custom') ...[
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: _buildDateButton(
+                      label: 'Inicio',
+                      value: _selectedPeriod().start,
+                      onTap: () => _pickCustomDate(start: true),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _buildDateButton(
+                      label: 'Fim',
+                      value: _selectedPeriod().end,
+                      onTap: () => _pickCustomDate(start: false),
+                    ),
+                  ),
+                ],
+              ),
+            ],
             if (widget.isScratch) ...[
               const SizedBox(height: 12),
               _buildTextField(_roleController, 'Função'),
@@ -592,6 +711,46 @@ class _ExportDialogState extends State<ExportDialog> {
           },
         ),
       ),
+    );
+  }
+
+  Widget _buildClosingModeDropdown() {
+    return _buildDropdown(
+      label: 'Fechamento',
+      value: _closingMode,
+      items: const [
+        DropdownMenuItem(value: 'calendar', child: Text('Mes calendario')),
+        DropdownMenuItem(value: 'cutoff28', child: Text('29 a 28')),
+        DropdownMenuItem(value: 'custom', child: Text('Personalizado')),
+      ],
+      onChanged: (val) {
+        if (val == null) return;
+        setState(() => _closingMode = val);
+      },
+    );
+  }
+
+  Widget _buildPeriodPreview() {
+    final period = _selectedPeriod();
+    return Text(
+      'Periodo: ${_formatDate(period.start)} ate ${_formatDate(period.end)}',
+      style: const TextStyle(color: Colors.grey, fontSize: 12),
+    );
+  }
+
+  Widget _buildDateButton({
+    required String label,
+    required DateTime value,
+    required VoidCallback onTap,
+  }) {
+    return OutlinedButton(
+      onPressed: onTap,
+      style: OutlinedButton.styleFrom(
+        foregroundColor: Colors.white,
+        side: const BorderSide(color: Colors.white24),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      ),
+      child: Text('$label: ${_formatDate(value)}'),
     );
   }
 

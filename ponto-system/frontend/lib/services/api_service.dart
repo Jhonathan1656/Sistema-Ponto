@@ -109,6 +109,27 @@ class ApiService {
     );
   }
 
+  Future<http.Response> _deleteBackend(
+    String path, {
+    required Map<String, String> headers,
+    Duration timeout = const Duration(seconds: 12),
+  }) async {
+    Object? lastError;
+    for (final baseUrl in backendUrls) {
+      try {
+        return await http
+            .delete(Uri.parse('$baseUrl$path'), headers: headers)
+            .timeout(timeout);
+      } catch (e) {
+        lastError = e;
+        debugPrint('ApiService: falha em $baseUrl$path: $e');
+      }
+    }
+    throw Exception(
+      'Nao foi possivel conectar ao servidor. Tentativas: ${backendUrls.join(', ')}. Ultimo erro: $lastError',
+    );
+  }
+
   Future<List<Map<String, dynamic>>> getSignatureDocuments(
       {required bool admin}) async {
     final response = await _getBackend(
@@ -192,6 +213,17 @@ class ApiService {
     }
     return Map<String, dynamic>.from(
         jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
+  Future<void> deleteSignatureDocument(String documentId) async {
+    final response = await _deleteBackend(
+      '/admin/signature-documents/$documentId',
+      headers: await _authorizedHeaders(),
+    );
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
   }
 
   Future<List<Map<String, dynamic>>> getSignatureNotifications() async {
