@@ -12,6 +12,7 @@ class NotificationService {
   static final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
   static const int _internReminderId = 1002;
+  static const int _openShift24hReminderId = 1005;
   static bool _pushListenersConfigured = false;
 
   static const AndroidNotificationChannel _breakChannel =
@@ -44,6 +45,16 @@ class NotificationService {
     enableVibration: true,
   );
 
+  static const AndroidNotificationChannel _openShiftReminderChannel =
+      AndroidNotificationChannel(
+    'open_shift_reminder',
+    'Lembretes de ponto aberto',
+    description: 'Avisos quando um ponto permanece aberto por muito tempo.',
+    importance: Importance.max,
+    playSound: true,
+    enableVibration: true,
+  );
+
   static Future<void> initialize() async {
     tz.initializeTimeZones();
     tz.setLocalLocation(tz.getLocation('America/Sao_Paulo'));
@@ -68,6 +79,7 @@ class NotificationService {
     await androidPlugin?.createNotificationChannel(_breakChannel);
     await androidPlugin?.createNotificationChannel(_internReminderChannel);
     await androidPlugin?.createNotificationChannel(_signatureDocumentsChannel);
+    await androidPlugin?.createNotificationChannel(_openShiftReminderChannel);
     await androidPlugin?.requestNotificationsPermission();
     await _configurePushNotifications();
   }
@@ -242,6 +254,85 @@ class NotificationService {
 
   static Future<void> cancelInternOpenPointReminder() async {
     await _plugin.cancel(id: _internReminderId);
+  }
+
+  static Future<void> scheduleOpenShift24hReminder(DateTime checkInAt) async {
+    final scheduledAt = checkInAt.add(const Duration(hours: 24));
+
+    await cancelOpenShift24hReminder();
+    if (!scheduledAt.isAfter(DateTime.now())) {
+      await showOpenShift24hReminder();
+      return;
+    }
+
+    const androidDetails = AndroidNotificationDetails(
+      'open_shift_reminder',
+      'Lembretes de ponto aberto',
+      channelDescription:
+          'Avisos quando um ponto permanece aberto por muito tempo.',
+      importance: Importance.max,
+      priority: Priority.high,
+      category: AndroidNotificationCategory.reminder,
+      visibility: NotificationVisibility.public,
+      ticker: 'Ponto aberto ha mais de 24h',
+    );
+
+    const darwinDetails = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+    );
+
+    const details = NotificationDetails(
+      android: androidDetails,
+      iOS: darwinDetails,
+      macOS: darwinDetails,
+    );
+
+    await _plugin.zonedSchedule(
+      id: _openShift24hReminderId,
+      title: 'Ponto aberto',
+      body:
+          'Seu ponto esta aberto ha mais de 24h. Se estiver correto, desconsidere este aviso.',
+      scheduledDate: tz.TZDateTime.from(scheduledAt, tz.local),
+      notificationDetails: details,
+      androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+    );
+  }
+
+  static Future<void> showOpenShift24hReminder() async {
+    const androidDetails = AndroidNotificationDetails(
+      'open_shift_reminder',
+      'Lembretes de ponto aberto',
+      channelDescription:
+          'Avisos quando um ponto permanece aberto por muito tempo.',
+      importance: Importance.max,
+      priority: Priority.high,
+      category: AndroidNotificationCategory.reminder,
+      visibility: NotificationVisibility.public,
+    );
+
+    const darwinDetails = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+    );
+
+    await _plugin.show(
+      id: _openShift24hReminderId,
+      title: 'Ponto aberto',
+      body:
+          'Seu ponto esta aberto ha mais de 24h. Se estiver correto, desconsidere este aviso.',
+      notificationDetails: const NotificationDetails(
+        android: androidDetails,
+        iOS: darwinDetails,
+        macOS: darwinDetails,
+      ),
+    );
+  }
+
+  static Future<void> cancelOpenShift24hReminder() async {
+    await _plugin.cancel(id: _openShift24hReminderId);
   }
 
   static Future<void> showSignatureRequest({

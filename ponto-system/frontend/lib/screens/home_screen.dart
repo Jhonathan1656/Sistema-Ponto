@@ -165,6 +165,17 @@ class _HomeScreenState extends State<HomeScreen> {
     await NotificationService.scheduleInternOpenPointReminder(DateTime.now());
   }
 
+  Future<void> _configureOpenShift24hReminder() async {
+    if (!_hasOpenPoint) {
+      await NotificationService.cancelOpenShift24hReminder();
+      return;
+    }
+
+    final shiftStart = _currentShiftStartDate();
+    if (shiftStart == null) return;
+    await NotificationService.scheduleOpenShift24hReminder(shiftStart);
+  }
+
   Future<void> _notifyInternIfPointIsOpen() async {
     await _loadTodayRecords();
     if (!_isInternUser || !_hasOpenPoint) return;
@@ -240,6 +251,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _updateStatus();
       });
       unawaited(_configureInternReminder());
+      unawaited(_configureOpenShift24hReminder());
     } catch (e) {
       debugPrint('Erro records: $e');
     }
@@ -408,6 +420,12 @@ class _HomeScreenState extends State<HomeScreen> {
       } else {
         _showSuccess('Registro de ${_getRecordLabel(type)} salvo com sucesso!');
         unawaited(_trySyncOfflineRecords());
+      }
+      if (type == 'check_in') {
+        final checkInAt = timestamp ?? DateTime.now();
+        unawaited(NotificationService.scheduleOpenShift24hReminder(checkInAt));
+      } else if (type == 'check_out') {
+        unawaited(NotificationService.cancelOpenShift24hReminder());
       }
     } catch (e) {
       _showError('Erro ao registrar: $e');
