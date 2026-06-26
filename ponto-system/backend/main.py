@@ -854,6 +854,8 @@ def generate_excel_file(data: ExportData) -> str:
 
     ws.cell(row=5, column=11).value = data.custom_work_hours or ("13:30 - 19:30" if is_estagiario else "-")
     ws.cell(row=6, column=9).value = data.custom_department or ("Processamento de Dados" if is_estagiario else "Campo")
+    if custom_period:
+        ws.cell(row=7, column=2).value = f"Fechamento: {export_period_label(data)}"
 
     total_bank = {"normal": 0, "extras": 0, "50": 0, "100": 0}
 
@@ -861,7 +863,8 @@ def generate_excel_file(data: ExportData) -> str:
         row_idx = 9 + idx
         if custom_period:
             current_date = period_dates[idx] if idx < len(period_dates) else None
-            ws.cell(row=row_idx, column=2).value = current_date.strftime("%d/%m") if current_date else None
+            ws.cell(row=row_idx, column=1).value = current_date.strftime("%d/%m") if current_date else None
+            ws.cell(row=row_idx, column=2).value = WEEKDAY_NAMES[current_date.weekday()] if current_date else None
             for clear_col in range(3, 9):
                 ws.cell(row=row_idx, column=clear_col).value = None
         ws.cell(row=row_idx, column=9).value = f"=IFERROR(MOD(D{row_idx}-C{row_idx},1),0)+IFERROR(MOD(F{row_idx}-E{row_idx},1),0)+IFERROR(MOD(H{row_idx}-G{row_idx},1),0)"
