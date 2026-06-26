@@ -33,6 +33,7 @@ class ApiService {
   static const String _offlineRecordsKey = 'offline_time_records';
   static const String _cachedUserKey = 'cached_current_user';
   static String get backendUrl => AppConfig.backendUrl;
+  static List<String> get backendUrls => AppConfig.backendUrls;
 
   Future<Map<String, String>> _authorizedHeaders() async {
     final user = _auth.currentUser;
@@ -53,16 +54,54 @@ class ApiService {
     }
   }
 
+  Future<http.Response> _getBackend(
+    String path, {
+    required Map<String, String> headers,
+    Duration timeout = const Duration(seconds: 12),
+  }) async {
+    Object? lastError;
+    for (final baseUrl in backendUrls) {
+      try {
+        return await http
+            .get(Uri.parse('$baseUrl$path'), headers: headers)
+            .timeout(timeout);
+      } catch (e) {
+        lastError = e;
+        debugPrint('ApiService: falha em $baseUrl$path: $e');
+      }
+    }
+    throw Exception(
+      'Nao foi possivel conectar ao servidor. Tentativas: ${backendUrls.join(', ')}. Ultimo erro: $lastError',
+    );
+  }
+
+  Future<http.Response> _postBackend(
+    String path, {
+    required Map<String, String> headers,
+    Duration timeout = const Duration(seconds: 12),
+  }) async {
+    Object? lastError;
+    for (final baseUrl in backendUrls) {
+      try {
+        return await http
+            .post(Uri.parse('$baseUrl$path'), headers: headers)
+            .timeout(timeout);
+      } catch (e) {
+        lastError = e;
+        debugPrint('ApiService: falha em $baseUrl$path: $e');
+      }
+    }
+    throw Exception(
+      'Nao foi possivel conectar ao servidor. Tentativas: ${backendUrls.join(', ')}. Ultimo erro: $lastError',
+    );
+  }
+
   Future<List<Map<String, dynamic>>> getSignatureDocuments(
       {required bool admin}) async {
-    final response = await http
-        .get(
-          Uri.parse(admin
-              ? '$backendUrl/admin/signature-documents'
-              : '$backendUrl/signature-documents'),
-          headers: await _authorizedHeaders(),
-        )
-        .timeout(const Duration(seconds: 30));
+    final response = await _getBackend(
+      admin ? '/admin/signature-documents' : '/signature-documents',
+      headers: await _authorizedHeaders(),
+    );
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(_apiError(response));
     }
@@ -83,27 +122,43 @@ class ApiService {
   }) async {
     final documentId =
         '${DateTime.now().microsecondsSinceEpoch}_${targetUserId.substring(0, 6)}';
-    final request = http.MultipartRequest(
-      'POST',
-      Uri.parse('$backendUrl/admin/signature-documents'),
-    );
-    request.headers.addAll(await _authorizedHeaders());
-    request.fields.addAll({
-      'target_user_id': targetUserId,
-      'target_user_name': targetUserName,
-      'target_user_email': targetUserEmail,
-      'local_document_id': documentId,
-      'title': title,
-      'message': message,
-    });
-    request.files.add(http.MultipartFile.fromBytes(
-      'pdf',
-      pdfBytes,
-      filename: fileName,
-    ));
-
-    final streamed = await request.send().timeout(const Duration(seconds: 90));
-    final response = await http.Response.fromStream(streamed);
+    final headers = await _authorizedHeaders();
+    http.Response? response;
+    Object? lastError;
+    for (final baseUrl in backendUrls) {
+      try {
+        final request = http.MultipartRequest(
+          'POST',
+          Uri.parse('$baseUrl/admin/signature-documents'),
+        );
+        request.headers.addAll(headers);
+        request.fields.addAll({
+          'target_user_id': targetUserId,
+          'target_user_name': targetUserName,
+          'target_user_email': targetUserEmail,
+          'local_document_id': documentId,
+          'title': title,
+          'message': message,
+        });
+        request.files.add(http.MultipartFile.fromBytes(
+          'pdf',
+          pdfBytes,
+          filename: fileName,
+        ));
+        final streamed =
+            await request.send().timeout(const Duration(seconds: 45));
+        response = await http.Response.fromStream(streamed);
+        break;
+      } catch (e) {
+        lastError = e;
+        debugPrint('ApiService: falha ao enviar documento em $baseUrl: $e');
+      }
+    }
+    if (response == null) {
+      throw Exception(
+        'Nao foi possivel conectar ao servidor. Tentativas: ${backendUrls.join(', ')}. Ultimo erro: $lastError',
+      );
+    }
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(_apiError(response));
     }
@@ -113,12 +168,11 @@ class ApiService {
 
   Future<Map<String, dynamic>> refreshSignatureDocument(
       String documentId) async {
-    final response = await http
-        .post(
-          Uri.parse('$backendUrl/signature-documents/$documentId/refresh'),
-          headers: await _authorizedHeaders(),
-        )
-        .timeout(const Duration(seconds: 45));
+    final response = await _postBackend(
+      '/signature-documents/$documentId/refresh',
+      headers: await _authorizedHeaders(),
+      timeout: const Duration(seconds: 20),
+    );
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(_apiError(response));
@@ -128,12 +182,10 @@ class ApiService {
   }
 
   Future<List<Map<String, dynamic>>> getSignatureNotifications() async {
-    final response = await http
-        .get(
-          Uri.parse('$backendUrl/signature-notifications'),
-          headers: await _authorizedHeaders(),
-        )
-        .timeout(const Duration(seconds: 30));
+    final response = await _getBackend(
+      '/signature-notifications',
+      headers: await _authorizedHeaders(),
+    );
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(_apiError(response));
     }
@@ -144,12 +196,10 @@ class ApiService {
   }
 
   Future<void> markSignatureNotificationsRead() async {
-    final response = await http
-        .post(
-          Uri.parse('$backendUrl/signature-notifications/read'),
-          headers: await _authorizedHeaders(),
-        )
-        .timeout(const Duration(seconds: 30));
+    final response = await _postBackend(
+      '/signature-notifications/read',
+      headers: await _authorizedHeaders(),
+    );
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(_apiError(response));
     }
