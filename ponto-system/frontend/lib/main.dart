@@ -257,7 +257,7 @@ class _PermissionGateState extends State<PermissionGate>
                   ),
                   const SizedBox(height: 12),
                   const Text(
-                    'Para acessar o Ponto_VMac, libere notificações, localização e microfone.',
+                    'Para acessar o Ponto_VMac, libere localização e microfone. As notificações também serão solicitadas para alertas do app.',
                     textAlign: TextAlign.center,
                     style: TextStyle(color: Colors.grey, fontSize: 14),
                   ),

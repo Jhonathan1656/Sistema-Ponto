@@ -513,7 +513,6 @@ class _ChatScreenState extends State<ChatScreen> {
           Expanded(
             child: StreamBuilder<List<Map<String, dynamic>>>(
               stream: _watchMessages(),
-              initialData: const [],
               builder: (context, snapshot) {
                 if (snapshot.hasError) {
                   return Center(
@@ -521,8 +520,15 @@ class _ChatScreenState extends State<ChatScreen> {
                           'Erro ao carregar mensagens: ${snapshot.error}'));
                 }
 
+                if (!snapshot.hasData) {
+                  return const Center(
+                    child: CircularProgressIndicator(color: wineColor),
+                  );
+                }
+
                 final messages = snapshot.data ?? [];
-                final showIntro = _showIntroTyping || _showIntroMessage;
+                final showIntro =
+                    messages.isEmpty && (_showIntroTyping || _showIntroMessage);
                 final showConfirmation =
                     _showConfirmationTyping || _showConfirmation;
                 final introCount = showIntro ? 1 : 0;

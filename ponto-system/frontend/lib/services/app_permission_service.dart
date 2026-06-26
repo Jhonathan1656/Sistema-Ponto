@@ -6,10 +6,14 @@ class AppPermissionService {
 
   static bool _requestedThisSession = false;
 
-  static const List<Permission> _corePermissions = [
-    Permission.notification,
+  static const List<Permission> _requiredPermissions = [
     Permission.locationWhenInUse,
     Permission.microphone,
+  ];
+
+  static const List<Permission> _startupPermissions = [
+    Permission.notification,
+    ..._requiredPermissions,
   ];
 
   static Future<void> requestStartupPermissions() async {
@@ -21,15 +25,19 @@ class AppPermissionService {
   static Future<bool> requestCorePermissions() async {
     if (kIsWeb) return true;
 
-    for (final permission in _corePermissions) {
-      try {
+    try {
+      final pendingPermissions = <Permission>[];
+      for (final permission in _startupPermissions) {
         final status = await permission.status;
         if (status.isDenied || status.isRestricted || status.isLimited) {
-          await permission.request();
+          pendingPermissions.add(permission);
         }
-      } catch (e) {
-        debugPrint('Erro ao solicitar permissao ${permission.toString()}: $e');
       }
+      if (pendingPermissions.isNotEmpty) {
+        await pendingPermissions.request();
+      }
+    } catch (e) {
+      debugPrint('Erro ao solicitar permissoes: $e');
     }
 
     return hasCorePermissions();
@@ -38,15 +46,10 @@ class AppPermissionService {
   static Future<bool> hasCorePermissions() async {
     if (kIsWeb) return true;
 
-    final needsRuntimeNotificationPermission =
-        defaultTargetPlatform == TargetPlatform.android ||
-            defaultTargetPlatform == TargetPlatform.iOS;
-    final notificationOk = !needsRuntimeNotificationPermission ||
-        await Permission.notification.isGranted;
     final locationOk = await Permission.locationWhenInUse.isGranted;
     final microphoneOk = await Permission.microphone.isGranted;
 
-    return notificationOk && locationOk && microphoneOk;
+    return locationOk && microphoneOk;
   }
 
   static Future<void> openSettings() async {
