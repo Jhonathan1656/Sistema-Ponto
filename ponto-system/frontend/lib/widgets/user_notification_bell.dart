@@ -4,11 +4,14 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
+import '../screens/admin_chat_list_screen.dart';
 import '../screens/chat_screen.dart';
 import '../services/api_service.dart';
 
 class UserNotificationBell extends StatefulWidget {
-  const UserNotificationBell({super.key});
+  final bool isAdmin;
+
+  const UserNotificationBell({super.key, this.isAdmin = false});
 
   @override
   State<UserNotificationBell> createState() => _UserNotificationBellState();
@@ -37,6 +40,8 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
   }
 
   Future<void> _loadDocumentNotifications() async {
+    if (widget.isAdmin) return;
+
     try {
       final notifications = await _apiService.getSignatureNotifications();
       if (mounted) setState(() => _documentNotifications = notifications);
@@ -45,15 +50,24 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
     }
   }
 
-  Stream<List<Map<String, dynamic>>> _unreadManagerMessages() {
+  Stream<List<Map<String, dynamic>>> _unreadChatMessages() {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return const Stream.empty();
 
-    return FirebaseFirestore.instance
-        .collection('adjustment_requests')
-        .where('user_id', isEqualTo: user.uid)
-        .snapshots()
-        .map((snapshot) => snapshot.docs
+    final query = FirebaseFirestore.instance.collection('adjustment_requests');
+
+    if (widget.isAdmin) {
+      return query
+          .where('sender_role', isEqualTo: 'user')
+          .where('status', isEqualTo: 'unread')
+          .snapshots()
+          .map((snapshot) => snapshot.docs
+              .map((doc) => {'id': doc.id, ...doc.data()})
+              .toList());
+    }
+
+    return query.where('user_id', isEqualTo: user.uid).snapshots().map(
+        (snapshot) => snapshot.docs
             .map((doc) => {'id': doc.id, ...doc.data()})
             .where((message) =>
                 message['sender_role'] == 'admin' &&
@@ -62,10 +76,12 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
   }
 
   Future<void> _openNotifications(
-      List<Map<String, dynamic>> managerMessages) async {
-    final unreadDocuments = _documentNotifications
-        .where((notification) => notification['is_read'] != 1)
-        .toList();
+      List<Map<String, dynamic>> chatMessages) async {
+    final unreadDocuments = widget.isAdmin
+        ? <Map<String, dynamic>>[]
+        : _documentNotifications
+            .where((notification) => notification['is_read'] != 1)
+            .toList();
 
     await showModalBottomSheet<void>(
       context: context,
@@ -76,34 +92,43 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
           child: ListView(
             shrinkWrap: true,
             children: [
-              const Text('Notificações',
+              const Text('Notificacoes',
                   style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-              if (managerMessages.isEmpty && unreadDocuments.isEmpty)
+              if (chatMessages.isEmpty && unreadDocuments.isEmpty)
                 const Padding(
                   padding: EdgeInsets.symmetric(vertical: 28),
-                  child: Center(child: Text('Nenhuma notificação nova.')),
+                  child: Center(child: Text('Nenhuma notificacao nova.')),
                 ),
-              ...managerMessages.map((message) => ListTile(
+              ...chatMessages.map((message) => ListTile(
                     leading: const CircleAvatar(
                       backgroundColor: Color(0x1A8B0000),
                       child: Icon(Icons.chat_outlined, color: _wineColor),
                     ),
-                    title: const Text('Resposta da gestão'),
-                    subtitle: Text(message['message']?.toString() ?? 'Áudio'),
+                    title: Text(widget.isAdmin
+                        ? 'Mensagem de ${message['user_name']?.toString() ?? 'colaborador'}'
+                        : 'Resposta da gestao'),
+                    subtitle: Text(message['message']?.toString() ?? 'Audio'),
                     onTap: () async {
-                      await FirebaseFirestore.instance
-                          .collection('adjustment_requests')
-                          .doc(message['id'])
-                          .update({'notification_read': true});
-                      if (!context.mounted) return;
+                      if (!widget.isAdmin) {
+                        await FirebaseFirestore.instance
+                            .collection('adjustment_requests')
+                            .doc(message['id'])
+                            .update({'notification_read': true});
+                      }
+                      if (!mounted || !context.mounted) return;
                       Navigator.pop(context);
-                      Navigator.of(this.context).push(MaterialPageRoute(
-                        builder: (_) => ChatScreen(
-                          conversationId:
-                              message['conversation_id']?.toString() ?? '',
-                          title: 'Ajuste de ponto',
+                      Navigator.of(this.context).push(
+                        MaterialPageRoute(
+                          builder: (_) => widget.isAdmin
+                              ? const AdminChatListScreen()
+                              : ChatScreen(
+                                  conversationId:
+                                      message['conversation_id']?.toString() ??
+                                          '',
+                                  title: 'Ajuste de ponto',
+                                ),
                         ),
-                      ));
+                      );
                     },
                   )),
               ...unreadDocuments.map((notification) => ListTile(
@@ -131,17 +156,19 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<List<Map<String, dynamic>>>(
-      stream: _unreadManagerMessages(),
+      stream: _unreadChatMessages(),
       initialData: const [],
       builder: (context, snapshot) {
         final messages = snapshot.data ?? [];
-        final unreadDocuments = _documentNotifications
-            .where((notification) => notification['is_read'] != 1)
-            .length;
+        final unreadDocuments = widget.isAdmin
+            ? 0
+            : _documentNotifications
+                .where((notification) => notification['is_read'] != 1)
+                .length;
         final total = messages.length + unreadDocuments;
 
         return IconButton(
-          tooltip: 'Notificações',
+          tooltip: 'Notificacoes',
           onPressed: () => _openNotifications(messages),
           icon: Badge(
             isLabelVisible: total > 0,

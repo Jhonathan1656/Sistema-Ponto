@@ -5,11 +5,15 @@ import 'package:geolocator/geolocator.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import '../services/api_service.dart';
 import '../services/notification_service.dart';
+import '../widgets/user_notification_bell.dart';
 
+import 'admin_chat_list_screen.dart';
 import 'user_chat_list_screen.dart';
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  final bool isAdmin;
+
+  const HomeScreen({super.key, this.isAdmin = false});
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -466,13 +470,17 @@ class _HomeScreenState extends State<HomeScreen> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         actions: [
+          UserNotificationBell(isAdmin: widget.isAdmin),
           IconButton(
             icon: const Icon(Icons.chat_outlined, color: wineColor),
             onPressed: () {
               Navigator.push(
                 context,
                 MaterialPageRoute(
-                    builder: (context) => const UserChatListScreen()),
+                  builder: (context) => widget.isAdmin
+                      ? const AdminChatListScreen()
+                      : const UserChatListScreen(),
+                ),
               );
             },
           ),
