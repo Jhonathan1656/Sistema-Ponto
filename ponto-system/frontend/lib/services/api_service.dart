@@ -662,6 +662,8 @@ class ApiService {
   Future<int> syncOfflineRecords() async {
     final pendingRecords = await getOfflineRecords();
     if (pendingRecords.isEmpty) return 0;
+    if (!await _hasNetworkConnection()) return 0;
+    await _waitForAuthenticatedUser();
 
     int syncedCount = 0;
     final failedRecords = <Map<String, dynamic>>[];
@@ -686,7 +688,7 @@ class ApiService {
             .collection('time_records')
             .doc(recordId)
             .set(firestoreData)
-            .timeout(const Duration(seconds: 15));
+            .timeout(const Duration(seconds: 8));
         syncedCount++;
       } catch (e) {
         debugPrint('Erro ao sincronizar ponto offline ${record['id']}: $e');
@@ -826,17 +828,15 @@ class ApiService {
     };
 
     try {
-      if (currentUser == null) {
-        throw Exception('Sem sessao online.');
-      }
-      if (!await _hasNetworkConnection()) {
-        throw Exception('Sem conexao de rede.');
+      final hasNetwork = await _hasNetworkConnection();
+      if (currentUser == null || !hasNetwork) {
+        throw Exception('Sem sessao online ou sem conexao de rede.');
       }
 
       final docRef = await _db.collection('time_records').add({
         ...recordData,
         'created_at': FieldValue.serverTimestamp(),
-      }).timeout(const Duration(seconds: 10));
+      }).timeout(const Duration(seconds: 5));
       return {'id': docRef.id, ...recordData};
     } catch (e) {
       if (userId != null && userId != currentUserId) rethrow;

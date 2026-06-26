@@ -215,7 +215,7 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final user = await _apiService.getCurrentUser();
       _user = user;
-      await _trySyncOfflineRecords();
+      unawaited(_trySyncOfflineRecords());
       await _loadTodayRecords();
     } catch (e) {
       debugPrint('Erro init: $e');
@@ -312,9 +312,15 @@ class _HomeScreenState extends State<HomeScreen> {
         if (mounted && showMessage) {
           _showSuccess('$syncedCount registro(s) offline sincronizado(s).');
         }
+      } else if (mounted && showMessage && pendingRecords.isNotEmpty) {
+        _showError(
+            'Ainda nao foi possivel sincronizar. Verifique a internet e tente novamente.');
       }
     } catch (e) {
       debugPrint('Erro ao sincronizar pontos offline: $e');
+      if (mounted && showMessage) {
+        _showError('Ainda nao foi possivel sincronizar os registros offline.');
+      }
     } finally {
       _isSyncingOffline = false;
     }
@@ -387,17 +393,22 @@ class _HomeScreenState extends State<HomeScreen> {
       // 1. Obter localização atual
       Position? position;
       try {
-        LocationPermission permission = await Geolocator.checkPermission();
-        if (permission == LocationPermission.denied) {
-          permission = await Geolocator.requestPermission();
-        }
+        final connection = await Connectivity().checkConnectivity();
+        final hasConnection = !connection.contains(ConnectivityResult.none);
 
-        if (permission == LocationPermission.always ||
-            permission == LocationPermission.whileInUse) {
-          position = await Geolocator.getCurrentPosition(
-            desiredAccuracy: LocationAccuracy.high,
-            timeLimit: const Duration(seconds: 5),
-          );
+        if (hasConnection) {
+          LocationPermission permission = await Geolocator.checkPermission();
+          if (permission == LocationPermission.denied) {
+            permission = await Geolocator.requestPermission();
+          }
+
+          if (permission == LocationPermission.always ||
+              permission == LocationPermission.whileInUse) {
+            position = await Geolocator.getCurrentPosition(
+              desiredAccuracy: LocationAccuracy.high,
+              timeLimit: const Duration(seconds: 3),
+            );
+          }
         }
       } catch (e) {
         debugPrint('Erro ao obter localização: $e');
