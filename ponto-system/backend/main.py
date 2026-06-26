@@ -380,24 +380,44 @@ def send_document_push_notification(user_id: str, title: str, body: str, documen
         return
 
     try:
-        user_doc = get_firestore_admin().collection("users").document(user_id).get()
+        db = get_firestore_admin()
+        user_ref = db.collection("users").document(user_id)
+        user_doc = user_ref.get()
         user_data = user_doc.to_dict() or {} if user_doc.exists else {}
         tokens = [token for token in user_data.get("fcm_tokens", []) if isinstance(token, str) and token]
         if not tokens:
             logger.info("Push de documento sem aparelho cadastrado para o usuario %s", user_id)
             return
 
+        invalid_tokens = []
         for start in range(0, len(tokens), 500):
+            batch_tokens = tokens[start:start + 500]
             message = messaging.MulticastMessage(
-                tokens=tokens[start:start + 500],
+                tokens=batch_tokens,
                 notification=messaging.Notification(title=title, body=body),
                 data={"type": "signature_document", "document_id": document_id},
-                android=messaging.AndroidConfig(priority="high"),
+                android=messaging.AndroidConfig(
+                    priority="high",
+                    notification=messaging.AndroidNotification(
+                        channel_id="signature_documents",
+                        icon="notification_icon",
+                        color="#8B0000",
+                    ),
+                ),
                 apns=messaging.APNSConfig(
                     payload=messaging.APNSPayload(aps=messaging.Aps(sound="default"))
                 ),
             )
-            messaging.send_each_for_multicast(message)
+            response = messaging.send_each_for_multicast(message)
+            for token, item in zip(batch_tokens, response.responses):
+                if item.success or item.exception is None:
+                    continue
+                error_code = getattr(item.exception, "code", "")
+                if error_code in {"registration-token-not-registered", "invalid-registration-token"}:
+                    invalid_tokens.append(token)
+
+        if invalid_tokens:
+            user_ref.update({"fcm_tokens": firestore.ArrayRemove(invalid_tokens)})
     except Exception as exc:
         logger.warning("Falha ao enviar push de documento: %s", exc)
 

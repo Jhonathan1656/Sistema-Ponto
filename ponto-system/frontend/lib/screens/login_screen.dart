@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
 import '../services/app_permission_service.dart';
+import '../services/notification_service.dart';
 import 'main_screen.dart';
 import 'register_screen.dart';
 
@@ -38,6 +39,7 @@ class _LoginScreenState extends State<LoginScreen> {
         _emailController.text,
         _passwordController.text,
       );
+      await NotificationService.registerCurrentDevice();
       debugPrint('Login Auth OK. Redirecionando...');
 
       if (mounted) {
@@ -54,7 +56,9 @@ class _LoginScreenState extends State<LoginScreen> {
             title: const Text('Falha no Acesso'),
             content: Text(e.toString().replaceAll('Exception:', '').trim()),
             actions: [
-              TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK')),
+              TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('OK')),
             ],
           ),
         );
@@ -73,7 +77,8 @@ class _LoginScreenState extends State<LoginScreen> {
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Text('Informe seu e-mail para receber o link de redefinição de senha:'),
+            const Text(
+                'Informe seu e-mail para receber o link de redefinição de senha:'),
             const SizedBox(height: 16),
             TextField(
               controller: emailController,
@@ -99,7 +104,8 @@ class _LoginScreenState extends State<LoginScreen> {
                     Navigator.pop(context);
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(
-                        content: Text('E-mail de recuperação enviado! Verifique sua caixa de entrada.'),
+                        content: Text(
+                            'E-mail de recuperação enviado! Verifique sua caixa de entrada.'),
                         backgroundColor: Colors.green,
                       ),
                     );
@@ -107,7 +113,9 @@ class _LoginScreenState extends State<LoginScreen> {
                 } catch (e) {
                   if (mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text(e.toString()), backgroundColor: Colors.red),
+                      SnackBar(
+                          content: Text(e.toString()),
+                          backgroundColor: Colors.red),
                     );
                   }
                 }
