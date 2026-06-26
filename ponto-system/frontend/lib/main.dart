@@ -319,7 +319,7 @@ class _AuthGateState extends State<AuthGate> {
             final isCheckingAuth =
                 authSnapshot.connectionState == ConnectionState.waiting;
 
-            if (isCheckingCache && isCheckingAuth) {
+            if (isCheckingAuth || isCheckingCache) {
               return const Scaffold(
                 body: Center(
                   child: CircularProgressIndicator(color: Color(0xFF8B0000)),

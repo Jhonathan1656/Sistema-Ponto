@@ -42,7 +42,7 @@ class ApiService {
     final user = await _auth
         .authStateChanges()
         .firstWhere((user) => user != null)
-        .timeout(const Duration(seconds: 5), onTimeout: () => null);
+        .timeout(const Duration(seconds: 15), onTimeout: () => null);
     if (user == null) {
       throw Exception('Usuario nao autenticado.');
     }
