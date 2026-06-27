@@ -14,7 +14,6 @@ class AppConfig {
     if (defaultTargetPlatform == TargetPlatform.android) {
       return [
         'https://ponto.vmacengenharia.com/api',
-        'http://ponto.vmacengenharia.com/api',
       ];
     }
     return ['http://localhost:8000'];

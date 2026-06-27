@@ -415,6 +415,19 @@ def holiday_date_keys(data: ExportData) -> set:
 class DeleteUserRequest(BaseModel):
     user_id: str
 
+class AdminUserUpdateRequest(BaseModel):
+    name: str
+    email: str
+    role: str
+    job_title: str
+    daily_hours: float
+    cpf: str
+
+class AdminTimeRecordUpdateRequest(BaseModel):
+    new_timestamp: str
+    reason: str
+    notes: Optional[str] = None
+
 def init_firebase_admin():
     if firebase_admin is None:
         raise HTTPException(
@@ -1612,6 +1625,108 @@ async def zapsign_webhook(request: Request):
         updated_document, previous_status, updated_document.get("status", ""),
     )
     return {"status": "success"}
+
+@app.put("/admin/users/{user_id}")
+async def update_user_admin_endpoint(
+    user_id: str,
+    payload: AdminUserUpdateRequest,
+    admin=Depends(require_admin_user),
+):
+    if admin.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode atualizar usuarios.")
+
+    target_id = user_id.strip()
+    if not target_id:
+        raise HTTPException(status_code=400, detail="Usuario invalido.")
+
+    allowed_roles = {"admin", "manager", "employee", "intern", "estagiario"}
+    role = payload.role.strip()
+    if role not in allowed_roles:
+        raise HTTPException(status_code=400, detail="Cargo invalido.")
+
+    db = get_firestore_admin()
+    user_ref = db.collection("users").document(target_id)
+    target_doc = user_ref.get()
+    if not target_doc.exists:
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado.")
+
+    update_data = {
+        "name": payload.name.strip(),
+        "email": payload.email.strip(),
+        "role": role,
+        "job_title": payload.job_title.strip(),
+        "daily_hours": payload.daily_hours,
+        "cpf": payload.cpf.strip(),
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "last_admin_update_by_id": admin["id"],
+        "last_admin_update_by_name": admin.get("name", ""),
+        "last_admin_update_by_email": admin.get("email", ""),
+    }
+    user_ref.update(update_data)
+    db.collection("system_audits").document().set({
+        "action": "update_user_admin",
+        "target_user_id": target_id,
+        "admin_id": admin["id"],
+        "admin_name": admin.get("name", ""),
+        "admin_email": admin.get("email", ""),
+        "updated_fields": ["name", "email", "role", "job_title", "daily_hours", "cpf"],
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+    return {"status": "success", "id": target_id}
+
+@app.patch("/admin/time-records/{record_id}")
+async def update_time_record_admin_endpoint(
+    record_id: str,
+    payload: AdminTimeRecordUpdateRequest,
+    admin=Depends(require_admin_user),
+):
+    if admin.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode editar registros de ponto.")
+    if not payload.reason.strip():
+        raise HTTPException(status_code=400, detail="Informe o motivo da edicao.")
+
+    db = get_firestore_admin()
+    record_ref = db.collection("time_records").document(record_id)
+    audit_ref = db.collection("time_record_audits").document()
+
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def update_in_transaction(transaction):
+        snapshot = record_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            raise HTTPException(status_code=404, detail="Registro de ponto nao encontrado.")
+
+        old_data = snapshot.to_dict() or {}
+        transaction.update(record_ref, {
+            "timestamp": payload.new_timestamp,
+            "notes": payload.notes or "",
+            "updated_at": firestore.SERVER_TIMESTAMP,
+            "edited_by_admin": True,
+            "admin_edit_message": "Editado pelo admin",
+            "last_admin_edit_reason": payload.reason,
+            "last_admin_edit_by_id": admin["id"],
+            "last_admin_edit_by_name": admin.get("name") or admin.get("email") or "Admin",
+            "last_admin_edit_at": firestore.SERVER_TIMESTAMP,
+        })
+        transaction.set(audit_ref, {
+            "record_id": record_id,
+            "record_user_id": old_data.get("user_id"),
+            "record_type": old_data.get("record_type"),
+            "old_timestamp": old_data.get("timestamp"),
+            "new_timestamp": payload.new_timestamp,
+            "old_notes": old_data.get("notes"),
+            "new_notes": payload.notes or "",
+            "reason": payload.reason,
+            "admin_id": admin["id"],
+            "admin_name": admin.get("name", ""),
+            "admin_email": admin.get("email", ""),
+            "edited_at": firestore.SERVER_TIMESTAMP,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+
+    update_in_transaction(transaction)
+    return {"status": "success", "id": record_id}
 
 @app.delete("/admin/users/{user_id}")
 async def delete_user_admin_endpoint(

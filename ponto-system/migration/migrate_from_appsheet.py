@@ -16,12 +16,29 @@ import pandas as pd
 import requests
 import json
 from datetime import datetime
+import os
 import sys
 
 # Configurações
-API_BASE_URL = "http://localhost:8000"  # Altere para seu servidor
-ADMIN_EMAIL = "admin@example.com"  # Email do admin para criar usuários
-ADMIN_PASSWORD = "admin123"  # Senha do admin
+API_BASE_URL = os.getenv("APPSHEET_API_BASE_URL", "http://localhost:8000").rstrip("/")
+ADMIN_EMAIL = os.getenv("APPSHEET_ADMIN_EMAIL", "")
+ADMIN_PASSWORD = os.getenv("APPSHEET_ADMIN_PASSWORD", "")
+USER_DEFAULT_PASSWORD = os.getenv("APPSHEET_USER_DEFAULT_PASSWORD", "")
+
+def require_config():
+    missing = [
+        name
+        for name, value in {
+            "APPSHEET_ADMIN_EMAIL": ADMIN_EMAIL,
+            "APPSHEET_ADMIN_PASSWORD": ADMIN_PASSWORD,
+            "APPSHEET_USER_DEFAULT_PASSWORD": USER_DEFAULT_PASSWORD,
+        }.items()
+        if not value
+    ]
+    if missing:
+        print("Configuracao ausente para migracao: " + ", ".join(missing))
+        print("Defina as variaveis de ambiente antes de executar este script.")
+        sys.exit(1)
 
 def get_admin_token():
     """Autentica como admin para criar usuários"""
@@ -37,7 +54,7 @@ def get_admin_token():
         return response.json()["access_token"]
     else:
         print("Erro ao autenticar admin. Certifique-se de criar um usuário admin primeiro.")
-        print(f"Resposta: {response.text}")
+        print(f"Status HTTP: {response.status_code}")
         sys.exit(1)
 
 def migrate_users(token):
@@ -62,7 +79,7 @@ def migrate_users(token):
             "email": row.get('email', row.get('Email', '')),
             "name": row.get('name', row.get('Nome', row.get('Name', ''))),
             "cpf": str(row.get('cpf', row.get('CPF', ''))).replace('.', '').replace('-', ''),
-            "password": "senha123",  # Senha padrão - usuários devem trocar
+            "password": USER_DEFAULT_PASSWORD,
             "role": row.get('role', row.get('cargo', 'employee')),
             "daily_hours": float(row.get('daily_hours', row.get('carga_horaria', 8.0)))
         }
@@ -80,7 +97,7 @@ def migrate_users(token):
             user_map[row.get('id', index)] = user_id
             print(f"  ✓ Criado com sucesso (ID: {user_id})")
         else:
-            print(f"  ✗ Erro: {response.text}")
+            print(f"  ✗ Erro HTTP {response.status_code}")
     
     print(f"\nTotal de usuários migrados: {len(user_map)}")
     return user_map
@@ -149,9 +166,10 @@ def create_admin_user():
     if response.status_code == 200:
         print("Usuário admin criado com sucesso!")
     else:
-        print("Admin já existe ou erro ao criar:", response.text)
+        print(f"Admin já existe ou erro ao criar. Status HTTP: {response.status_code}")
 
 def main():
+    require_config()
     print("=" * 60)
     print("MIGRAÇÃO DE DADOS DO APPSHEET PARA SISTEMA DE PONTO")
     print("=" * 60)
@@ -183,7 +201,7 @@ def main():
     print("=" * 60)
     print("\nPróximos passos:")
     print("1. Verifique os dados migrados no sistema")
-    print("2. Informe os usuários para alterarem suas senhas (senha padrão: senha123)")
+    print("2. Informe os usuários para alterarem suas senhas temporárias")
     print("3. Configure backups automáticos")
 
 if __name__ == "__main__":
