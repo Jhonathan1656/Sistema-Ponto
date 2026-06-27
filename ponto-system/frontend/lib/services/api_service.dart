@@ -349,7 +349,7 @@ class ApiService {
         'audio_url': audioUrl,
         'audio_upload_status': 'sent',
       });
-      debugPrint('ApiService: Upload concluído e anexado. URL: $audioUrl');
+      debugPrint('ApiService: Upload de audio anexado ao ajuste $requestId');
     } catch (e) {
       debugPrint('Erro ao anexar áudio no ajuste $requestId: $e');
       if (audioBytes != null &&
@@ -1136,15 +1136,30 @@ class ApiService {
     required double dailyHours,
     required String cpf,
   }) async {
-    await _db.collection('users').doc(userId.toString()).update({
-      'name': name,
-      'email': email,
-      'role': role,
-      'job_title': jobTitle,
-      'daily_hours': dailyHours,
-      'cpf': cpf,
-    });
-    return {'status': 'success'};
+    final headers = await _authorizedHeaders();
+    final response = await http
+        .put(
+          Uri.parse('$backendUrl/admin/users/${userId.toString()}'),
+          headers: {
+            ...headers,
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'name': name,
+            'email': email,
+            'role': role,
+            'job_title': jobTitle,
+            'daily_hours': dailyHours,
+            'cpf': cpf,
+          }),
+        )
+        .timeout(const Duration(seconds: 30));
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Falha ao atualizar usuario: ${_apiError(response)}');
+    }
+    return Map<String, dynamic>.from(
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
   }
 
   Future<void> deleteUserAdmin(dynamic userId) async {
@@ -1211,50 +1226,24 @@ class ApiService {
     required String reason,
     String? notes,
   }) async {
-    final admin = await getCurrentUser();
-    if (admin['role'] != 'admin') {
-      throw Exception('Apenas admin pode editar registros de ponto.');
+    final headers = await _authorizedHeaders();
+    final response = await http
+        .patch(
+          Uri.parse('$backendUrl/admin/time-records/$recordId'),
+          headers: {
+            ...headers,
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'new_timestamp': newTimestamp,
+            'reason': reason,
+            'notes': notes,
+          }),
+        )
+        .timeout(const Duration(seconds: 30));
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Falha ao editar registro de ponto: ${_apiError(response)}');
     }
-    final recordRef = _db.collection('time_records').doc(recordId);
-    final auditRef = _db.collection('time_record_audits').doc();
-
-    await _db.runTransaction((transaction) async {
-      final snapshot = await transaction.get(recordRef);
-      if (!snapshot.exists) {
-        throw Exception('Registro de ponto nao encontrado.');
-      }
-
-      final oldData = snapshot.data() as Map<String, dynamic>;
-      final oldTimestamp = oldData['timestamp']?.toString();
-      final oldNotes = oldData['notes']?.toString();
-
-      transaction.update(recordRef, {
-        'timestamp': newTimestamp,
-        'notes': notes ?? '',
-        'updated_at': FieldValue.serverTimestamp(),
-        'edited_by_admin': true,
-        'admin_edit_message': 'Editado pelo admin',
-        'last_admin_edit_reason': reason,
-        'last_admin_edit_by_id': admin['id'],
-        'last_admin_edit_by_name': admin['name'] ?? admin['email'] ?? 'Admin',
-        'last_admin_edit_at': FieldValue.serverTimestamp(),
-      });
-
-      transaction.set(auditRef, {
-        'record_id': recordId,
-        'record_user_id': oldData['user_id'],
-        'record_type': oldData['record_type'],
-        'old_timestamp': oldTimestamp,
-        'new_timestamp': newTimestamp,
-        'old_notes': oldNotes,
-        'new_notes': notes ?? '',
-        'reason': reason,
-        'admin_id': admin['id'],
-        'admin_name': admin['name'] ?? '',
-        'admin_email': admin['email'] ?? '',
-        'edited_at': FieldValue.serverTimestamp(),
-        'created_at': FieldValue.serverTimestamp(),
-      });
-    });
   }
 }

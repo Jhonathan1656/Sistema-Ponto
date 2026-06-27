@@ -1,16 +1,62 @@
-*.env
+# Environment and local secrets
 .env
 .env.*
+*.env
+!.env.example
+*.pem
+*.p8
+*.key
+*.jks
+*.keystore
+*service-account*.json
+
+# Local databases and runtime data
 *.db
 *.sqlite
 *.sqlite3
 data/
-build/
-.dart_tool/
-.flutter-plugins-dependencies
-*.log
+ponto-system/backend/data/
+
+# Python
 __pycache__/
-*.pyc
-.idea/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
 ponto-system/backend/venv/
+
+# Flutter/Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+ponto-system/frontend/build/
+ponto-system/frontend/.dart_tool/
+ponto-system/frontend/.flutter-plugins
+ponto-system/frontend/.flutter-plugins-dependencies
 ponto-system/frontend/firebase.exe.exe
+
+# Android/iOS/macOS/Windows generated artifacts
+*.iml
+.gradle/
+ponto-system/frontend/android/.gradle/
+ponto-system/frontend/android/local.properties
+ponto-system/frontend/android/.kotlin/
+ponto-system/frontend/ios/Flutter/Generated.xcconfig
+ponto-system/frontend/ios/Flutter/flutter_export_environment.sh
+ponto-system/frontend/ios/Flutter/ephemeral/
+ponto-system/frontend/macos/Flutter/ephemeral/
+ponto-system/frontend/windows/flutter/ephemeral/
+
+# IDE, OS, logs
+.idea/
+.vscode/
+*.log
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
