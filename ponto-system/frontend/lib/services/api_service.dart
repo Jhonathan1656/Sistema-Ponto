@@ -40,7 +40,7 @@ class ApiService {
     if (currentUser != null) return currentUser;
 
     final user = await _auth
-        .authStateChanges()
+        .idTokenChanges()
         .firstWhere((user) => user != null)
         .timeout(const Duration(seconds: 15), onTimeout: () => null);
     if (user == null) {
@@ -49,13 +49,19 @@ class ApiService {
     return user;
   }
 
-  Future<Map<String, String>> _authorizedHeaders() async {
+  Future<Map<String, String>> _authorizedHeaders({
+    bool forceRefresh = false,
+  }) async {
     final user = await _waitForAuthenticatedUser();
-    final token = await user.getIdToken(true);
+    final token = await user.getIdToken(forceRefresh);
     if (token == null || token.isEmpty) {
       throw Exception('Nao foi possivel renovar sua sessao. Entre novamente.');
     }
     return {'Authorization': 'Bearer $token'};
+  }
+
+  bool _isUnauthorizedResponse(http.Response response) {
+    return response.statusCode == 401 || response.statusCode == 403;
   }
 
   String _apiError(http.Response response) {
@@ -69,15 +75,101 @@ class ApiService {
 
   Future<http.Response> _getBackend(
     String path, {
-    required Map<String, String> headers,
+    Map<String, String>? headers,
     Duration timeout = const Duration(seconds: 12),
   }) async {
     Object? lastError;
     for (final baseUrl in backendUrls) {
       try {
-        return await http
-            .get(Uri.parse('$baseUrl$path'), headers: headers)
+        final requestHeaders = headers ?? await _authorizedHeaders();
+        var response = await http
+            .get(Uri.parse('$baseUrl$path'), headers: requestHeaders)
             .timeout(timeout);
+        if (_isUnauthorizedResponse(response)) {
+          response = await http
+              .get(
+                Uri.parse('$baseUrl$path'),
+                headers: await _authorizedHeaders(forceRefresh: true),
+              )
+              .timeout(timeout);
+        }
+        return response;
+      } catch (e) {
+        lastError = e;
+        debugPrint('ApiService: falha em $baseUrl$path: $e');
+      }
+    }
+    throw Exception(
+      'Nao foi possivel conectar ao servidor. Tentativas: ${backendUrls.join(', ')}. Ultimo erro: $lastError',
+    );
+  }
+
+  Future<http.Response> _putBackend(
+    String path, {
+    Map<String, String>? headers,
+    Object? body,
+    Duration timeout = const Duration(seconds: 12),
+  }) async {
+    Object? lastError;
+    for (final baseUrl in backendUrls) {
+      try {
+        final requestHeaders = headers ?? await _authorizedHeaders();
+        var response = await http
+            .put(Uri.parse('$baseUrl$path'),
+                headers: requestHeaders, body: body)
+            .timeout(timeout);
+        if (_isUnauthorizedResponse(response)) {
+          response = await http
+              .put(
+                Uri.parse('$baseUrl$path'),
+                headers: {
+                  ...await _authorizedHeaders(forceRefresh: true),
+                  if (requestHeaders['Content-Type'] != null)
+                    'Content-Type': requestHeaders['Content-Type']!,
+                },
+                body: body,
+              )
+              .timeout(timeout);
+        }
+        return response;
+      } catch (e) {
+        lastError = e;
+        debugPrint('ApiService: falha em $baseUrl$path: $e');
+      }
+    }
+    throw Exception(
+      'Nao foi possivel conectar ao servidor. Tentativas: ${backendUrls.join(', ')}. Ultimo erro: $lastError',
+    );
+  }
+
+  Future<http.Response> _patchBackend(
+    String path, {
+    Map<String, String>? headers,
+    Object? body,
+    Duration timeout = const Duration(seconds: 12),
+  }) async {
+    Object? lastError;
+    for (final baseUrl in backendUrls) {
+      try {
+        final requestHeaders = headers ?? await _authorizedHeaders();
+        var response = await http
+            .patch(Uri.parse('$baseUrl$path'),
+                headers: requestHeaders, body: body)
+            .timeout(timeout);
+        if (_isUnauthorizedResponse(response)) {
+          response = await http
+              .patch(
+                Uri.parse('$baseUrl$path'),
+                headers: {
+                  ...await _authorizedHeaders(forceRefresh: true),
+                  if (requestHeaders['Content-Type'] != null)
+                    'Content-Type': requestHeaders['Content-Type']!,
+                },
+                body: body,
+              )
+              .timeout(timeout);
+        }
+        return response;
       } catch (e) {
         lastError = e;
         debugPrint('ApiService: falha em $baseUrl$path: $e');
@@ -90,15 +182,25 @@ class ApiService {
 
   Future<http.Response> _postBackend(
     String path, {
-    required Map<String, String> headers,
+    Map<String, String>? headers,
     Duration timeout = const Duration(seconds: 12),
   }) async {
     Object? lastError;
     for (final baseUrl in backendUrls) {
       try {
-        return await http
-            .post(Uri.parse('$baseUrl$path'), headers: headers)
+        final requestHeaders = headers ?? await _authorizedHeaders();
+        var response = await http
+            .post(Uri.parse('$baseUrl$path'), headers: requestHeaders)
             .timeout(timeout);
+        if (_isUnauthorizedResponse(response)) {
+          response = await http
+              .post(
+                Uri.parse('$baseUrl$path'),
+                headers: await _authorizedHeaders(forceRefresh: true),
+              )
+              .timeout(timeout);
+        }
+        return response;
       } catch (e) {
         lastError = e;
         debugPrint('ApiService: falha em $baseUrl$path: $e');
@@ -111,15 +213,25 @@ class ApiService {
 
   Future<http.Response> _deleteBackend(
     String path, {
-    required Map<String, String> headers,
+    Map<String, String>? headers,
     Duration timeout = const Duration(seconds: 12),
   }) async {
     Object? lastError;
     for (final baseUrl in backendUrls) {
       try {
-        return await http
-            .delete(Uri.parse('$baseUrl$path'), headers: headers)
+        final requestHeaders = headers ?? await _authorizedHeaders();
+        var response = await http
+            .delete(Uri.parse('$baseUrl$path'), headers: requestHeaders)
             .timeout(timeout);
+        if (_isUnauthorizedResponse(response)) {
+          response = await http
+              .delete(
+                Uri.parse('$baseUrl$path'),
+                headers: await _authorizedHeaders(forceRefresh: true),
+              )
+              .timeout(timeout);
+        }
+        return response;
       } catch (e) {
         lastError = e;
         debugPrint('ApiService: falha em $baseUrl$path: $e');
@@ -161,27 +273,34 @@ class ApiService {
     Object? lastError;
     for (final baseUrl in backendUrls) {
       try {
-        final request = http.MultipartRequest(
-          'POST',
-          Uri.parse('$baseUrl/admin/signature-documents'),
-        );
-        request.headers.addAll(headers);
-        request.fields.addAll({
-          'target_user_id': targetUserId,
-          'target_user_name': targetUserName,
-          'target_user_email': targetUserEmail,
-          'local_document_id': documentId,
-          'title': title,
-          'message': message,
-        });
-        request.files.add(http.MultipartFile.fromBytes(
-          'pdf',
-          pdfBytes,
-          filename: fileName,
-        ));
-        final streamed =
-            await request.send().timeout(const Duration(seconds: 45));
-        response = await http.Response.fromStream(streamed);
+        Future<http.Response> send(Map<String, String> requestHeaders) async {
+          final request = http.MultipartRequest(
+            'POST',
+            Uri.parse('$baseUrl/admin/signature-documents'),
+          );
+          request.headers.addAll(requestHeaders);
+          request.fields.addAll({
+            'target_user_id': targetUserId,
+            'target_user_name': targetUserName,
+            'target_user_email': targetUserEmail,
+            'local_document_id': documentId,
+            'title': title,
+            'message': message,
+          });
+          request.files.add(http.MultipartFile.fromBytes(
+            'pdf',
+            pdfBytes,
+            filename: fileName,
+          ));
+          final streamed =
+              await request.send().timeout(const Duration(seconds: 45));
+          return http.Response.fromStream(streamed);
+        }
+
+        response = await send(headers);
+        if (_isUnauthorizedResponse(response)) {
+          response = await send(await _authorizedHeaders(forceRefresh: true));
+        }
         break;
       } catch (e) {
         lastError = e;
@@ -695,13 +814,25 @@ class ApiService {
     final pendingRecords = await getOfflineRecords();
     if (pendingRecords.isEmpty) return 0;
     if (!await _hasNetworkConnection()) return 0;
-    await _waitForAuthenticatedUser();
+
+    try {
+      await _waitForAuthenticatedUser();
+    } catch (e) {
+      debugPrint(
+          'Sincronizacao adiada: sessao Firebase ainda indisponivel: $e');
+      return 0;
+    }
 
     int syncedCount = 0;
     final failedRecords = <Map<String, dynamic>>[];
 
     for (final record in pendingRecords) {
       try {
+        if (!await _hasNetworkConnection()) {
+          failedRecords.add(record);
+          continue;
+        }
+
         final firestoreData = Map<String, dynamic>.from(record)
           ..remove('id')
           ..remove('offline')
@@ -716,11 +847,7 @@ class ApiService {
           throw Exception('Registro offline sem identificador.');
         }
 
-        await _db
-            .collection('time_records')
-            .doc(recordId)
-            .set(firestoreData)
-            .timeout(const Duration(seconds: 8));
+        await _writeOfflineRecordWithRetry(recordId, firestoreData);
         syncedCount++;
       } catch (e) {
         debugPrint('Erro ao sincronizar ponto offline ${record['id']}: $e');
@@ -730,6 +857,29 @@ class ApiService {
 
     await _replaceOfflineRecords(failedRecords);
     return syncedCount;
+  }
+
+  Future<void> _writeOfflineRecordWithRetry(
+    String recordId,
+    Map<String, dynamic> firestoreData,
+  ) async {
+    Object? lastError;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        await _db
+            .collection('time_records')
+            .doc(recordId)
+            .set(firestoreData, SetOptions(merge: true))
+            .timeout(const Duration(seconds: 20));
+        return;
+      } catch (e) {
+        lastError = e;
+        if (attempt < 2) {
+          await Future.delayed(Duration(seconds: attempt + 1));
+        }
+      }
+    }
+    throw Exception(lastError ?? 'Falha desconhecida ao sincronizar.');
   }
 
   // --- LÓGICA DE CÁLCULO (BASEADA NOS SCRIPTS PYTHON) ---
@@ -1137,23 +1287,22 @@ class ApiService {
     required String cpf,
   }) async {
     final headers = await _authorizedHeaders();
-    final response = await http
-        .put(
-          Uri.parse('$backendUrl/admin/users/${userId.toString()}'),
-          headers: {
-            ...headers,
-            'Content-Type': 'application/json',
-          },
-          body: jsonEncode({
-            'name': name,
-            'email': email,
-            'role': role,
-            'job_title': jobTitle,
-            'daily_hours': dailyHours,
-            'cpf': cpf,
-          }),
-        )
-        .timeout(const Duration(seconds: 30));
+    final response = await _putBackend(
+      '/admin/users/${userId.toString()}',
+      headers: {
+        ...headers,
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'name': name,
+        'email': email,
+        'role': role,
+        'job_title': jobTitle,
+        'daily_hours': dailyHours,
+        'cpf': cpf,
+      }),
+      timeout: const Duration(seconds: 30),
+    );
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception('Falha ao atualizar usuario: ${_apiError(response)}');
@@ -1174,14 +1323,14 @@ class ApiService {
       throw Exception('Voce nao pode excluir a propria conta.');
     }
 
-    final token = await currentUser.getIdToken();
-    final response = await http.delete(
-      Uri.parse('$backendUrl/admin/users/$targetId'),
+    final response = await _deleteBackend(
+      '/admin/users/$targetId',
       headers: {
-        'Authorization': 'Bearer $token',
+        ...await _authorizedHeaders(),
         'Content-Type': 'application/json',
       },
-    ).timeout(const Duration(seconds: 45));
+      timeout: const Duration(seconds: 45),
+    );
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       String detail = response.body;
@@ -1227,23 +1376,23 @@ class ApiService {
     String? notes,
   }) async {
     final headers = await _authorizedHeaders();
-    final response = await http
-        .patch(
-          Uri.parse('$backendUrl/admin/time-records/$recordId'),
-          headers: {
-            ...headers,
-            'Content-Type': 'application/json',
-          },
-          body: jsonEncode({
-            'new_timestamp': newTimestamp,
-            'reason': reason,
-            'notes': notes,
-          }),
-        )
-        .timeout(const Duration(seconds: 30));
+    final response = await _patchBackend(
+      '/admin/time-records/$recordId',
+      headers: {
+        ...headers,
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'new_timestamp': newTimestamp,
+        'reason': reason,
+        'notes': notes,
+      }),
+      timeout: const Duration(seconds: 30),
+    );
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception('Falha ao editar registro de ponto: ${_apiError(response)}');
+      throw Exception(
+          'Falha ao editar registro de ponto: ${_apiError(response)}');
     }
   }
 }
