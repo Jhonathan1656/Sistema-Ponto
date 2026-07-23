@@ -33,35 +33,51 @@ Sistema completo de controle de ponto eletrônico com backend Python (FastAPI) e
   - Relatório completo com totalizadores
   - Formato profissional
 
+## 📚 Documentação
+
+| Documento | Conteúdo |
+|---|---|
+| [QUICK_START.md](docs/QUICK_START.md) | Subir o projeto rapidamente |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Decisões de arquitetura e fluxo de dados |
+| [FEATURES.md](docs/FEATURES.md) | Funcionalidades detalhadas |
+| [DEPLOY.md](docs/DEPLOY.md) | Publicação em produção |
+| [OPERATIONAL_CONFIG.md](docs/OPERATIONAL_CONFIG.md) | Configuração operacional |
+
 ## 🏗️ Arquitetura
 
 ```
 ponto-system/
-├── backend/                 # API Python FastAPI
-│   ├── main.py             # Aplicação principal
-│   ├── requirements.txt    # Dependências Python
-│   └── ponto.db           # Banco de dados SQLite (gerado)
+├── backend/                    # API Python FastAPI
+│   ├── main.py                # Aplicação principal
+│   ├── work_schedule_rules.py # Regras de jornada
+│   ├── seed_data.py           # Carga inicial
+│   ├── update_user_role.py    # Utilitário de roles
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── data/ponto.db          # SQLite (gerado, fora do git)
 │
-├── frontend/               # App Flutter
+├── frontend/                   # App Flutter
 │   ├── lib/
 │   │   ├── main.dart
-│   │   ├── services/
-│   │   │   └── api_service.dart
-│   │   └── screens/
-│   │       ├── login_screen.dart
-│   │       ├── register_screen.dart
-│   │       ├── home_screen.dart
-│   │       ├── dashboard_screen.dart
-│   │       ├── history_screen.dart
-│   │       └── profile_screen.dart
+│   │   ├── firebase_options.dart
+│   │   ├── screens/           # Telas (login, dashboard, chat, admin…)
+│   │   ├── services/          # API, config, notificações, export
+│   │   ├── utils/             # Helpers
+│   │   └── widgets/           # Componentes reutilizáveis
+│   ├── assets/                # Imagens e templates Excel
 │   └── pubspec.yaml
 │
-├── migration/              # Scripts de migração
+├── migration/                  # Scripts de migração do AppSheet
 │   ├── migrate_from_appsheet.py
 │   └── requirements.txt
 │
-└── docs/                   # Documentação
-    └── README.md
+├── docs/                       # Documentação (ver tabela acima)
+├── openspec/                   # Propostas e specs de mudança
+│
+├── docker-compose.yml          # Orquestração backend + nginx
+├── nginx.conf                  # Proxy do frontend web
+├── firebase.json               # Config Firebase
+└── firestore.rules             # Regras de segurança Firestore
 ```
 
 ## 🚀 Como Executar

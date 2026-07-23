@@ -1,0 +1,26 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      - SECRET_KEY=sua-chave-secreta-super-segura-mude-isso
+      - DATABASE_URL=sqlite:////app/data/ponto.db
+      - DATABASE_PATH=/app/data/ponto.db
+    volumes:
+      - ./backend/data:/app/data
+      - ./frontend/assets:/app/frontend/assets:ro
+    restart: unless-stopped
+
+  frontend:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./frontend/build/web:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - backend
+    restart: unless-stopped

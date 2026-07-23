@@ -1,0 +1,282 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:intl/intl.dart';
+import 'package:timezone/data/latest_all.dart' as tz;
+import 'package:timezone/timezone.dart' as tz;
+
+class NotificationService {
+  NotificationService._();
+
+  static final FlutterLocalNotificationsPlugin _plugin =
+      FlutterLocalNotificationsPlugin();
+  static const int _internReminderId = 1002;
+  static bool _pushListenersConfigured = false;
+
+  static const AndroidNotificationChannel _breakChannel =
+      AndroidNotificationChannel(
+    'break_auto_close',
+    'Fechamento de pausas',
+    description: 'Avisos quando uma pausa e fechada automaticamente.',
+    importance: Importance.max,
+    playSound: true,
+    enableVibration: true,
+  );
+
+  static const AndroidNotificationChannel _internReminderChannel =
+      AndroidNotificationChannel(
+    'intern_open_point_reminder',
+    'Lembretes de ponto aberto',
+    description: 'Avisos para estagiarios com ponto aberto no horario limite.',
+    importance: Importance.max,
+    playSound: true,
+    enableVibration: true,
+  );
+
+  static const AndroidNotificationChannel _signatureDocumentsChannel =
+      AndroidNotificationChannel(
+    'signature_documents',
+    'Documentos para assinatura',
+    description: 'Avisos de documentos enviados pelo RH para assinatura.',
+    importance: Importance.max,
+    playSound: true,
+    enableVibration: true,
+  );
+
+  static Future<void> initialize() async {
+    tz.initializeTimeZones();
+    tz.setLocalLocation(tz.getLocation('America/Sao_Paulo'));
+
+    const androidSettings = AndroidInitializationSettings('notification_icon');
+    const darwinSettings = DarwinInitializationSettings(
+      requestAlertPermission: false,
+      requestBadgePermission: false,
+      requestSoundPermission: false,
+    );
+
+    const initializationSettings = InitializationSettings(
+      android: androidSettings,
+      iOS: darwinSettings,
+      macOS: darwinSettings,
+    );
+
+    await _plugin.initialize(settings: initializationSettings);
+
+    final androidPlugin = _plugin.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    await androidPlugin?.createNotificationChannel(_breakChannel);
+    await androidPlugin?.createNotificationChannel(_internReminderChannel);
+    await androidPlugin?.createNotificationChannel(_signatureDocumentsChannel);
+    await androidPlugin?.requestNotificationsPermission();
+    await _configurePushNotifications();
+  }
+
+  static Future<void> _configurePushNotifications() async {
+    final messaging = FirebaseMessaging.instance;
+    await messaging.requestPermission(alert: true, badge: true, sound: true);
+
+    Future<void> saveToken(String? token) async {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null || token == null || token.isEmpty) return;
+      await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
+        'fcm_tokens': FieldValue.arrayUnion([token]),
+        'fcm_token_updated_at': DateTime.now().toIso8601String(),
+      }, SetOptions(merge: true));
+    }
+
+    try {
+      await saveToken(await messaging.getToken());
+      if (_pushListenersConfigured) return;
+      _pushListenersConfigured = true;
+      messaging.onTokenRefresh.listen(saveToken);
+      FirebaseMessaging.onMessage.listen((message) {
+        final notification = message.notification;
+        if (notification == null) return;
+        _plugin.show(
+          id: 1004,
+          title: notification.title ?? 'Nova notificação',
+          body: notification.body ?? '',
+          notificationDetails: const NotificationDetails(
+            android: AndroidNotificationDetails(
+              'signature_documents',
+              'Documentos para assinatura',
+              channelDescription:
+                  'Avisos de documentos enviados pelo RH para assinatura.',
+              importance: Importance.max,
+              priority: Priority.high,
+            ),
+            iOS: DarwinNotificationDetails(
+              presentAlert: true,
+              presentBadge: true,
+              presentSound: true,
+            ),
+          ),
+        );
+      });
+    } catch (_) {
+      // O push depende da configuração FCM do aplicativo instalado.
+    }
+  }
+
+  static Future<void> registerCurrentDevice() => _configurePushNotifications();
+
+  static Future<void> showBreakAutoClosed({
+    required DateTime closedAt,
+  }) async {
+    final time = DateFormat('HH:mm:ss').format(closedAt);
+
+    const androidDetails = AndroidNotificationDetails(
+      'break_auto_close',
+      'Fechamento de pausas',
+      channelDescription: 'Avisos quando uma pausa e fechada automaticamente.',
+      importance: Importance.max,
+      priority: Priority.high,
+      category: AndroidNotificationCategory.reminder,
+      visibility: NotificationVisibility.public,
+      ticker: 'Pausa fechada automaticamente',
+    );
+
+    const darwinDetails = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+    );
+
+    const details = NotificationDetails(
+      android: androidDetails,
+      iOS: darwinDetails,
+      macOS: darwinDetails,
+    );
+
+    await _plugin.show(
+      id: 1001,
+      title: 'Pausa fechada automaticamente',
+      body:
+          'Provavelmente voce esqueceu a pausa aberta. Fechando a pausa $time e retomando o turno.',
+      notificationDetails: details,
+    );
+  }
+
+  static Future<void> showInternOpenPointReminder() async {
+    const androidDetails = AndroidNotificationDetails(
+      'intern_open_point_reminder',
+      'Lembretes de ponto aberto',
+      channelDescription:
+          'Avisos para estagiarios com ponto aberto no horario limite.',
+      importance: Importance.max,
+      priority: Priority.high,
+      category: AndroidNotificationCategory.reminder,
+      visibility: NotificationVisibility.public,
+      ticker: 'Talvez voce tenha esquecido o ponto aberto',
+    );
+
+    const darwinDetails = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+    );
+
+    const details = NotificationDetails(
+      android: androidDetails,
+      iOS: darwinDetails,
+      macOS: darwinDetails,
+    );
+
+    await _plugin.show(
+      id: _internReminderId,
+      title: 'Ponto aberto',
+      body:
+          'Talvez voce tenha esquecido de fechar o ponto. Se ainda estiver trabalhando, pode ignorar.',
+      notificationDetails: details,
+    );
+  }
+
+  static Future<void> scheduleInternOpenPointReminder(
+      DateTime reference) async {
+    final scheduledAt = DateTime(
+      reference.year,
+      reference.month,
+      reference.day,
+      19,
+      35,
+    );
+
+    await cancelInternOpenPointReminder();
+    if (!scheduledAt.isAfter(reference)) return;
+
+    const androidDetails = AndroidNotificationDetails(
+      'intern_open_point_reminder',
+      'Lembretes de ponto aberto',
+      channelDescription:
+          'Avisos para estagiarios com ponto aberto no horario limite.',
+      importance: Importance.max,
+      priority: Priority.high,
+      category: AndroidNotificationCategory.reminder,
+      visibility: NotificationVisibility.public,
+      ticker: 'Talvez voce tenha esquecido o ponto aberto',
+    );
+
+    const darwinDetails = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+    );
+
+    const details = NotificationDetails(
+      android: androidDetails,
+      iOS: darwinDetails,
+      macOS: darwinDetails,
+    );
+
+    await _plugin.zonedSchedule(
+      id: _internReminderId,
+      title: 'Ponto aberto',
+      body:
+          'Talvez voce tenha esquecido de fechar o ponto. Se ainda estiver trabalhando, pode ignorar.',
+      scheduledDate: tz.TZDateTime.from(scheduledAt, tz.local),
+      notificationDetails: details,
+      androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+    );
+  }
+
+  static Future<void> cancelInternOpenPointReminder() async {
+    await _plugin.cancel(id: _internReminderId);
+  }
+
+  static Future<void> showSignatureRequest({
+    required int pendingCount,
+    required String title,
+  }) async {
+    const androidDetails = AndroidNotificationDetails(
+      'signature_documents',
+      'Documentos para assinatura',
+      channelDescription:
+          'Avisos de documentos enviados pelo RH para assinatura.',
+      importance: Importance.max,
+      priority: Priority.high,
+      category: AndroidNotificationCategory.reminder,
+      visibility: NotificationVisibility.public,
+      ticker: 'Documento aguardando assinatura',
+    );
+
+    const darwinDetails = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+    );
+
+    await _plugin.show(
+      id: 1003,
+      title: 'Você tem documento para assinar',
+      body: pendingCount == 1
+          ? 'RH enviou "$title" para sua assinatura.'
+          : 'RH enviou $pendingCount documentos para sua assinatura.',
+      notificationDetails: const NotificationDetails(
+        android: androidDetails,
+        iOS: darwinDetails,
+        macOS: darwinDetails,
+      ),
+    );
+  }
+}
