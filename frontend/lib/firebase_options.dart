@@ -30,8 +30,8 @@ class DefaultFirebaseOptions {
   );
 
   static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyDtE1kvZ2tnXJxMFT6gugigjkn-GrKS15o',
-    appId: '1:702496632234:android:ponto.vmac.app', // ID genérico, ajuste se necessário
+    apiKey: 'AIzaSyDFzubIuTE53oSOHMlj-tuqrpa2QUlO_pE',
+    appId: '1:702496632234:android:7062b815919d31f1734fd3',
     messagingSenderId: '702496632234',
     projectId: 'ponto-vmac',
     storageBucket: 'ponto-vmac.firebasestorage.app',

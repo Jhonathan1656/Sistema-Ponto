@@ -3,6 +3,7 @@ import 'package:intl/intl.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'dart:async';
 import '../services/api_service.dart';
+import 'monthly_dashboard_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -241,7 +242,59 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     color: textColor)),
           ],
         ),
+        const SizedBox(width: 14),
+        _buildMonthlyEntry(),
       ],
+    );
+  }
+
+  /// Acesso a visao mensal: alvo compacto no cabecalho, com anel fino e
+  /// halo tenue em vez de um bloco solido.
+  Widget _buildMonthlyEntry() {
+    if (_selectedUser == null) return const SizedBox.shrink();
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Tooltip(
+      message: 'Meu Mês',
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: () => Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => MonthlyDashboardScreen(
+                user: Map<String, dynamic>.from(_selectedUser!),
+              ),
+            ),
+          ),
+          child: Ink(
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: wineColor.withOpacity(0.45)),
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  wineColor.withOpacity(isDark ? 0.30 : 0.10),
+                  wineColor.withOpacity(0.02),
+                ],
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: wineColor.withOpacity(isDark ? 0.35 : 0.18),
+                  blurRadius: 10,
+                  spreadRadius: -2,
+                ),
+              ],
+            ),
+            child: const Icon(Icons.auto_graph_rounded,
+                color: wineColor, size: 20),
+          ),
+        ),
+      ),
     );
   }
 

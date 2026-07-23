@@ -11,6 +11,7 @@ services:
       - DATABASE_PATH=/app/data/ponto.db
     volumes:
       - ./backend/data:/app/data
+      - ./backend/service-account.json:/app/service-account.json:ro
       - ./frontend/assets:/app/frontend/assets:ro
     restart: unless-stopped
 
