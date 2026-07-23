@@ -39,6 +39,7 @@ dependencies:
   geolocator: ^10.1.0
   
   # PDF & Office
+  archive: ^3.6.1
   pdf: ^3.10.7
   path_provider: ^2.1.1
   excel: 2.1.0

@@ -6,7 +6,7 @@ import 'dart:math' as math;
 import 'package:audioplayers/audioplayers.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter/foundation.dart' show Uint8List, kIsWeb;
+import 'package:flutter/foundation.dart' show Uint8List, debugPrint, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
@@ -15,6 +15,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 
 import '../services/api_service.dart';
+import '../utils/chat_timestamp.dart';
 
 class ChatScreen extends StatefulWidget {
   final String conversationId;
@@ -35,6 +36,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final _db = FirebaseFirestore.instance;
   final _apiService = ApiService();
   final _textController = TextEditingController();
+  final _inputFocusNode = FocusNode();
   final _scrollController = ScrollController();
   final _audioRecorder = AudioRecorder();
   final _audioPlayer = AudioPlayer();
@@ -48,42 +50,24 @@ class _ChatScreenState extends State<ChatScreen> {
   double _noiseFloorDb = -95;
   double _smoothedAudioLevel = 0.08;
   String? _currentlyPlayingUrl;
-  bool _showIntroTyping = true;
-  bool _showIntroMessage = false;
-  bool _showConfirmationTyping = false;
+  final bool _showIntroMessage = true;
+  bool _showFollowUpOptions = false;
   bool _showConfirmation = false;
-  int _typingDotCount = 1;
-  Timer? _introTypingTimer;
-  Timer? _confirmationTypingTimer;
-  Timer? _typingDotsTimer;
+  bool _conversationEnded = false;
+  String? _lastUserMessageId;
+  final Set<String> _notificationReadsInFlight = <String>{};
 
   static const Color wineColor = Color(0xFF8B0000);
   static const int _maxAudioBars = 90;
 
   @override
-  void initState() {
-    super.initState();
-    _startTypingDots();
-    _introTypingTimer = Timer(const Duration(seconds: 3), () {
-      if (!mounted) return;
-      setState(() {
-        _showIntroTyping = false;
-        _showIntroMessage = true;
-      });
-      _scrollToBottom();
-    });
-  }
-
-  @override
   void dispose() {
     _timer?.cancel();
-    _introTypingTimer?.cancel();
-    _confirmationTypingTimer?.cancel();
-    _typingDotsTimer?.cancel();
     _amplitudeSub?.cancel();
     _audioRecorder.dispose();
     _audioPlayer.dispose();
     _textController.dispose();
+    _inputFocusNode.dispose();
     _scrollController.dispose();
     super.dispose();
   }
@@ -102,8 +86,7 @@ class _ChatScreenState extends State<ChatScreen> {
         .map((snap) {
       final messages =
           snap.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
-      messages.sort((a, b) =>
-          (a['timestamp'] as String).compareTo(b['timestamp'] as String));
+      messages.sort(compareChatMessages);
       return messages;
     });
   }
@@ -134,6 +117,7 @@ class _ChatScreenState extends State<ChatScreen> {
       'audio_levels': audioLevels,
       'audio_upload_status': hasAudio ? 'uploading' : null,
       'timestamp': now,
+      'created_at': FieldValue.serverTimestamp(),
       'status': 'unread',
     });
 
@@ -146,8 +130,10 @@ class _ChatScreenState extends State<ChatScreen> {
       'title': message,
       'last_message': message,
       'last_time': now,
+      'last_server_at': FieldValue.serverTimestamp(),
       'updated_at': now,
       'status': 'open',
+      'closed_at': null,
       'deleted': false,
       'deleted_at': null,
       'deleted_by_type': null,
@@ -159,38 +145,110 @@ class _ChatScreenState extends State<ChatScreen> {
           audioPath: audioPath, audioBytes: audioBytes));
     }
 
-    _showAssistantConfirmationAfterTyping();
+    if (mounted) {
+      setState(() {
+        _lastUserMessageId = docRef.id;
+        _showFollowUpOptions = true;
+        _showConfirmation = false;
+        _conversationEnded = false;
+      });
+      _inputFocusNode.unfocus();
+    }
     _scrollToBottom();
   }
 
-  void _startTypingDots() {
-    _typingDotsTimer?.cancel();
-    _typingDotsTimer = Timer.periodic(const Duration(milliseconds: 450), (_) {
-      if (!mounted) return;
-      if (!_showIntroTyping && !_showConfirmationTyping) return;
-      setState(() =>
-          _typingDotCount = _typingDotCount == 4 ? 1 : _typingDotCount + 1);
+  void _continueConversation() {
+    setState(() => _showFollowUpOptions = false);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _inputFocusNode.requestFocus();
     });
   }
 
-  void _showAssistantConfirmationAfterTyping() {
-    _confirmationTypingTimer?.cancel();
-    if (!mounted) return;
-    setState(() {
-      _showConfirmation = false;
-      _showConfirmationTyping = true;
-      _typingDotCount = 1;
-    });
-    _scrollToBottom();
+  Future<void> _endConversation() async {
+    final now = DateTime.now().toIso8601String();
+    try {
+      await _db
+          .collection('adjustment_conversations')
+          .doc(widget.conversationId)
+          .set({
+        'status': 'closed_by_user',
+        'closed_at': now,
+        'updated_at': now,
+      }, SetOptions(merge: true));
 
-    _confirmationTypingTimer = Timer(const Duration(seconds: 3), () {
       if (!mounted) return;
       setState(() {
-        _showConfirmationTyping = false;
+        _showFollowUpOptions = false;
         _showConfirmation = true;
+        _conversationEnded = true;
       });
-      _scrollToBottom();
+      _inputFocusNode.unfocus();
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Nao foi possivel encerrar: $error')),
+      );
+    }
+    _scrollToBottom();
+  }
+
+  void _reopenAfterManagerReply(List<Map<String, dynamic>> messages) {
+    if (!_hasManagerReplyAfterLastUserMessage(messages)) return;
+    if (!_showFollowUpOptions && !_showConfirmation && !_conversationEnded) {
+      return;
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      setState(() {
+        _showFollowUpOptions = false;
+        _showConfirmation = false;
+        _conversationEnded = false;
+      });
     });
+  }
+
+  bool _hasManagerReplyAfterLastUserMessage(
+      List<Map<String, dynamic>> messages) {
+    final lastUserMessageId = _lastUserMessageId;
+    if (lastUserMessageId == null || messages.isEmpty) return false;
+    if (messages.last['sender_role'] != 'admin') return false;
+
+    final lastUserMessageIndex = messages.indexWhere(
+      (message) => message['id']?.toString() == lastUserMessageId,
+    );
+    return lastUserMessageIndex >= 0 &&
+        lastUserMessageIndex < messages.length - 1;
+  }
+
+  Future<void> _markManagerNotificationsRead(
+      List<Map<String, dynamic>> messages) async {
+    final unreadIds = messages
+        .where((message) =>
+            message['sender_role'] == 'admin' &&
+            message['notification_read'] != true)
+        .map((message) => message['id']?.toString())
+        .whereType<String>()
+        .where((id) => !_notificationReadsInFlight.contains(id))
+        .toList();
+
+    if (unreadIds.isEmpty) return;
+    _notificationReadsInFlight.addAll(unreadIds);
+
+    try {
+      final batch = _db.batch();
+      for (final id in unreadIds) {
+        batch.update(
+          _db.collection('adjustment_requests').doc(id),
+          {'notification_read': true},
+        );
+      }
+      await batch.commit();
+    } catch (error) {
+      debugPrint('Falha ao marcar notificacoes da conversa como lidas: $error');
+    } finally {
+      _notificationReadsInFlight.removeAll(unreadIds);
+    }
   }
 
   Future<void> _uploadAudio(String requestId,
@@ -280,6 +338,7 @@ class _ChatScreenState extends State<ChatScreen> {
       'title': title,
       'last_message': lastMessage,
       'last_time': DateTime.now().toIso8601String(),
+      'last_server_at': FieldValue.serverTimestamp(),
       'updated_at': DateTime.now().toIso8601String(),
     }, SetOptions(merge: true));
   }
@@ -297,8 +356,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final remaining = snap.docs
         .map((doc) => {'id': doc.id, ...doc.data()})
         .toList()
-      ..sort((a, b) =>
-          (b['timestamp'] as String).compareTo(a['timestamp'] as String));
+      ..sort((a, b) => compareChatMessages(b, a));
 
     if (remaining.isEmpty) {
       await _db
@@ -522,30 +580,39 @@ class _ChatScreenState extends State<ChatScreen> {
                 }
 
                 final messages = snapshot.data ?? [];
-                final showIntro = _showIntroTyping || _showIntroMessage;
+                final managerJustReplied =
+                    _hasManagerReplyAfterLastUserMessage(messages);
+                final showFollowUpOptions =
+                    _showFollowUpOptions && !managerJustReplied;
                 final showConfirmation =
-                    _showConfirmationTyping || _showConfirmation;
-                final introCount = showIntro ? 1 : 0;
-                final confirmationCount = showConfirmation ? 1 : 0;
+                    _showConfirmation && !managerJustReplied;
+                final introCount = _showIntroMessage ? 1 : 0;
+                final assistantCount =
+                    showFollowUpOptions || showConfirmation ? 1 : 0;
+                _reopenAfterManagerReply(messages);
+                unawaited(_markManagerNotificationsRead(messages));
                 WidgetsBinding.instance
                     .addPostFrameCallback((_) => _scrollToBottom());
                 return ListView.builder(
                   controller: _scrollController,
                   padding: const EdgeInsets.all(16),
-                  itemCount: messages.length + introCount + confirmationCount,
+                  itemCount: messages.length + introCount + assistantCount,
                   itemBuilder: (context, index) {
-                    if (showIntro && index == 0) {
-                      if (_showIntroTyping) return _buildTypingBubble();
+                    if (_showIntroMessage && index == 0) {
                       return _buildBotBubble();
                     }
 
                     final messageIndex = index - introCount;
-                    if (showConfirmation && messageIndex == messages.length) {
-                      if (_showConfirmationTyping) return _buildTypingBubble();
+                    if (messageIndex < messages.length) {
+                      return _buildMessageBubble(messages[messageIndex]);
+                    }
+                    if (showFollowUpOptions) {
+                      return _buildFollowUpOptions();
+                    }
+                    if (showConfirmation) {
                       return _buildConfirmationBubble();
                     }
-
-                    return _buildMessageBubble(messages[messageIndex]);
+                    return const SizedBox.shrink();
                   },
                 );
               },
@@ -577,31 +644,6 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Widget _buildTypingBubble() {
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.only(bottom: 12),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-        decoration: BoxDecoration(
-          color: Colors.grey.shade200,
-          borderRadius: const BorderRadius.only(
-            topLeft: Radius.circular(16),
-            topRight: Radius.circular(16),
-            bottomRight: Radius.circular(16),
-          ),
-        ),
-        child: Text(
-          'digitando${'.' * _typingDotCount}',
-          style: TextStyle(
-            color: Colors.grey.shade700,
-            fontStyle: FontStyle.italic,
-          ),
-        ),
-      ),
-    );
-  }
-
   Widget _buildConfirmationBubble() {
     return Align(
       alignment: Alignment.centerLeft,
@@ -622,14 +664,59 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Widget _buildFollowUpOptions() {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: Colors.grey.shade200,
+          borderRadius: const BorderRadius.only(
+            topLeft: Radius.circular(16),
+            topRight: Radius.circular(16),
+            bottomRight: Radius.circular(16),
+          ),
+        ),
+        constraints:
+            BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.88),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Deseja enviar mais alguma coisa ou encerrar o atendimento?',
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: _continueConversation,
+                  icon: const Icon(Icons.add_comment_outlined),
+                  label: const Text('ENVIAR MAIS'),
+                ),
+                FilledButton.icon(
+                  onPressed: _endConversation,
+                  style: FilledButton.styleFrom(backgroundColor: wineColor),
+                  icon: const Icon(Icons.check_circle_outline),
+                  label: const Text('ENCERRAR'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildMessageBubble(Map<String, dynamic> msg) {
     final audioSource = msg['audio_url'] ?? msg['audio_data_url'];
     final hasAudio = audioSource != null || msg['audio_upload_status'] != null;
     final isSending = msg['audio_upload_status'] == 'uploading';
     final hasError = msg['audio_upload_status'] == 'error';
     final isManagerMessage = msg['sender_role'] == 'admin';
-    final time =
-        DateTime.tryParse(msg['timestamp']?.toString() ?? '') ?? DateTime.now();
+    final time = chatMessageTime(msg);
 
     return Align(
       alignment:
@@ -737,7 +824,7 @@ class _ChatScreenState extends State<ChatScreen> {
                                 ? Colors.black87
                                 : Colors.white)),
                   const SizedBox(height: 4),
-                  Text(DateFormat('HH:mm').format(time),
+                  Text(DateFormat('HH:mm:ss').format(time),
                       style: TextStyle(
                           color: isManagerMessage
                               ? Colors.black54
@@ -806,6 +893,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _buildInputArea() {
     if (_isRecording) return _buildRecordingOverlay();
+    final inputEnabled = !_showFollowUpOptions && !_conversationEnded;
 
     return Container(
       padding: const EdgeInsets.all(8),
@@ -820,13 +908,19 @@ class _ChatScreenState extends State<ChatScreen> {
           children: [
             IconButton(
                 icon: const Icon(Icons.mic, color: wineColor),
-                onPressed: _startRecording),
+                onPressed: inputEnabled ? _startRecording : null),
             const SizedBox(width: 8),
             Expanded(
               child: TextField(
                 controller: _textController,
+                focusNode: _inputFocusNode,
+                enabled: inputEnabled,
                 decoration: InputDecoration(
-                  hintText: 'Digite o que precisa ajustar...',
+                  hintText: _conversationEnded
+                      ? 'Atendimento encerrado'
+                      : (_showFollowUpOptions
+                          ? 'Escolha uma opcao acima'
+                          : 'Digite o que precisa ajustar...'),
                   border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(24),
                       borderSide: BorderSide.none),
@@ -840,7 +934,7 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
             IconButton(
                 icon: const Icon(Icons.send, color: wineColor),
-                onPressed: _sendText),
+                onPressed: inputEnabled ? _sendText : null),
           ],
         ),
       ),

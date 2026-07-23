@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'dart:async';
 import '../services/api_service.dart';
 import 'team_records_screen.dart';
@@ -42,7 +43,7 @@ class _AdminScreenState extends State<AdminScreen> {
       return const Center(child: CircularProgressIndicator(color: wineColor));
 
     return DefaultTabController(
-      length: _isAdmin ? 4 : 3,
+      length: _isAdmin ? 5 : 4,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('PAINEL DO GESTOR',
@@ -56,6 +57,7 @@ class _AdminScreenState extends State<AdminScreen> {
               const Tab(icon: Icon(Icons.monitor_heart), text: 'Resumo'),
               const Tab(icon: Icon(Icons.people), text: 'Usuários'),
               const Tab(icon: Icon(Icons.list_alt), text: 'Registros'),
+              const Tab(icon: Icon(Icons.access_time), text: 'Liberações'),
               if (_isAdmin)
                 const Tab(
                     icon: Icon(Icons.add_circle_outline), text: 'Add Ponto'),
@@ -67,6 +69,7 @@ class _AdminScreenState extends State<AdminScreen> {
             const _TeamStatusTab(),
             const _UsersListTab(),
             TeamRecordsScreen(canEdit: _isAdmin),
+            _ScheduleApprovalsTab(isAdmin: _isAdmin),
             if (_isAdmin) const _ManualEntryTab(),
           ],
         ),
@@ -175,6 +178,530 @@ class _UsersListTabState extends State<_UsersListTab> {
           );
         },
       ),
+    );
+  }
+}
+
+class _ScheduleApprovalsTab extends StatefulWidget {
+  final bool isAdmin;
+
+  const _ScheduleApprovalsTab({required this.isAdmin});
+
+  @override
+  State<_ScheduleApprovalsTab> createState() => _ScheduleApprovalsTabState();
+}
+
+class _ScheduleApprovalsTabState extends State<_ScheduleApprovalsTab> {
+  static const wineColor = Color(0xFF8B0000);
+  final _apiService = ApiService();
+  final _searchController = TextEditingController();
+  List<Map<String, dynamic>> _requests = [];
+  bool _loading = true;
+  String? _decidingId;
+  String _view = 'pending';
+  String _historyStatus = 'all';
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+    _timer =
+        Timer.periodic(const Duration(seconds: 15), (_) => _load(silent: true));
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load({bool silent = false}) async {
+    if (!silent && mounted) setState(() => _loading = true);
+    try {
+      final requests = await _apiService.getScheduleApprovalRequests(
+          status: _view == 'pending' ? 'pending' : null);
+      if (mounted) setState(() => _requests = requests);
+    } catch (e) {
+      if (mounted && !silent) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Erro ao carregar liberações: $e'),
+          backgroundColor: wineColor,
+        ));
+      }
+    } finally {
+      if (mounted && !silent) setState(() => _loading = false);
+    }
+  }
+
+  String _formatTimestamp(dynamic value) {
+    final DateTime? parsed;
+    if (value is Timestamp) {
+      parsed = value.toDate();
+    } else if (value is DateTime) {
+      parsed = value;
+    } else {
+      parsed = DateTime.tryParse(value?.toString() ?? '');
+    }
+    if (parsed == null) return value?.toString() ?? '-';
+    return DateFormat('dd/MM/yyyy HH:mm:ss').format(parsed.toLocal());
+  }
+
+  List<Map<String, dynamic>> get _visibleRequests {
+    if (_view == 'pending') return _requests;
+    final query = _searchController.text.trim().toLowerCase();
+    return _requests.where((request) {
+      final status = request['status']?.toString() ?? '';
+      if (status == 'pending') return false;
+      if (_historyStatus != 'all' && status != _historyStatus) return false;
+      if (query.isEmpty) return true;
+      final searchable = [
+        request['user_name'],
+        request['user_email'],
+        request['notes'],
+        request['decided_by_name'],
+        request['decision_reason'],
+      ].map((value) => value?.toString().toLowerCase() ?? '').join(' ');
+      return searchable.contains(query);
+    }).toList();
+  }
+
+  Future<void> _changeView(String view) async {
+    if (_view == view) return;
+    setState(() {
+      _view = view;
+      _loading = true;
+    });
+    await _load();
+  }
+
+  Future<void> _decide(Map<String, dynamic> request, bool approve) async {
+    final reasonController = TextEditingController();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(approve ? 'Liberar horário?' : 'Recusar solicitação?'),
+        content: TextField(
+          controller: reasonController,
+          maxLines: 2,
+          decoration: const InputDecoration(
+            labelText: 'Observação (opcional)',
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancelar')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+                backgroundColor: approve ? Colors.green : wineColor),
+            child: Text(approve ? 'LIBERAR' : 'RECUSAR',
+                style: const TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    final id = request['id'].toString();
+    setState(() => _decidingId = id);
+    try {
+      await _apiService.decideScheduleApproval(
+        id,
+        approve: approve,
+        reason: reasonController.text.trim(),
+      );
+      await _load(silent: true);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content:
+              Text(approve ? 'Horário liberado.' : 'Solicitação recusada.'),
+          backgroundColor: approve ? Colors.green : wineColor,
+        ));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Erro ao decidir: $e'),
+          backgroundColor: wineColor,
+        ));
+      }
+    } finally {
+      if (mounted) setState(() => _decidingId = null);
+      reasonController.dispose();
+    }
+  }
+
+  Future<void> _openGlobalSettings() async {
+    await showDialog<void>(
+      context: context,
+      builder: (_) => const _GlobalScheduleDialog(),
+    );
+  }
+
+  Color _statusColor(String status) {
+    if (status == 'approved') return Colors.green;
+    if (status == 'rejected') return wineColor;
+    return Colors.orange.shade800;
+  }
+
+  String _statusLabel(String status) {
+    if (status == 'approved') return 'LIBERADA';
+    if (status == 'rejected') return 'RECUSADA';
+    return 'PENDENTE';
+  }
+
+  Widget _buildRequestCard(Map<String, dynamic> request) {
+    final schedule = request['schedule_snapshot'] is Map
+        ? Map<String, dynamic>.from(request['schedule_snapshot'] as Map)
+        : <String, dynamic>{};
+    final isStart = request['request_type'] == 'start_exception';
+    final status = request['status']?.toString() ?? 'pending';
+    final pending = status == 'pending';
+    final deciding = _decidingId == request['id'].toString();
+    final observation = request['notes']?.toString().trim() ?? '';
+    final decisionReason = request['decision_reason']?.toString().trim() ?? '';
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                CircleAvatar(
+                  backgroundColor: const Color(0x1A8B0000),
+                  child: Icon(isStart ? Icons.login : Icons.more_time,
+                      color: wineColor),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        request['user_name']?.toString() ?? 'Estagiário',
+                        style: const TextStyle(
+                            fontSize: 16, fontWeight: FontWeight.bold),
+                      ),
+                      Text(isStart
+                          ? 'Entrada fora do horário'
+                          : 'Continuar após o expediente'),
+                      if ((request['user_email']?.toString() ?? '').isNotEmpty)
+                        Text(
+                          request['user_email'].toString(),
+                          style:
+                              const TextStyle(fontSize: 12, color: Colors.grey),
+                        ),
+                    ],
+                  ),
+                ),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+                  decoration: BoxDecoration(
+                    color: _statusColor(status).withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    _statusLabel(status),
+                    style: TextStyle(
+                      color: _statusColor(status),
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text('Solicitado: ${_formatTimestamp(request['attempted_at'])}'),
+            Text(
+                'Horário efetivo: ${schedule['shift_start'] ?? '-'} - ${schedule['shift_end'] ?? '-'}'),
+            if (isStart)
+              Text(
+                  'Janela de entrada: ${schedule['start_allowed_from'] ?? '-'} - ${schedule['start_allowed_until'] ?? '-'}'),
+            const SizedBox(height: 12),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.blueGrey.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('OBSERVAÇÃO DO ESTAGIÁRIO',
+                      style:
+                          TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 5),
+                  Text(observation.isEmpty
+                      ? 'Pedido antigo sem observação.'
+                      : observation),
+                ],
+              ),
+            ),
+            if (!pending) ...[
+              const SizedBox(height: 12),
+              const Divider(),
+              Text('Decidido em: ${_formatTimestamp(request['decided_at'])}'),
+              Text('Gestor: ${request['decided_by_name']?.toString() ?? '-'}'),
+              if (decisionReason.isNotEmpty)
+                Text('Observação do gestor: $decisionReason'),
+            ],
+            if (pending) ...[
+              const SizedBox(height: 14),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed:
+                          deciding ? null : () => _decide(request, false),
+                      child: const Text('RECUSAR'),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: deciding ? null : () => _decide(request, true),
+                      style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green),
+                      child: deciding
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                  strokeWidth: 2, color: Colors.white))
+                          : const Text('LIBERAR',
+                              style: TextStyle(color: Colors.white)),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator(color: wineColor));
+    }
+    return RefreshIndicator(
+      onRefresh: _load,
+      color: wineColor,
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          if (widget.isAdmin) ...[
+            OutlinedButton.icon(
+              onPressed: _openGlobalSettings,
+              icon: const Icon(Icons.access_time),
+              label: const Text('EDITAR HORÁRIO GLOBAL DOS ESTAGIÁRIOS'),
+            ),
+            const SizedBox(height: 16),
+          ],
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: () => _changeView('pending'),
+                  icon: const Icon(Icons.pending_actions),
+                  label: const Text('PENDENTES'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor:
+                        _view == 'pending' ? wineColor : Colors.grey.shade200,
+                    foregroundColor:
+                        _view == 'pending' ? Colors.white : Colors.black87,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: () => _changeView('history'),
+                  icon: const Icon(Icons.storage_outlined),
+                  label: const Text('HISTÓRICO'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor:
+                        _view == 'history' ? wineColor : Colors.grey.shade200,
+                    foregroundColor:
+                        _view == 'history' ? Colors.white : Colors.black87,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          if (_view == 'history') ...[
+            TextField(
+              controller: _searchController,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                prefixIcon: Icon(Icons.search),
+                labelText: 'Buscar por estagiário, e-mail ou observação',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 10),
+            DropdownButtonFormField<String>(
+              initialValue: _historyStatus,
+              decoration: const InputDecoration(
+                labelText: 'Status',
+                border: OutlineInputBorder(),
+              ),
+              items: const [
+                DropdownMenuItem(value: 'all', child: Text('Todos')),
+                DropdownMenuItem(value: 'approved', child: Text('Liberadas')),
+                DropdownMenuItem(value: 'rejected', child: Text('Recusadas')),
+              ],
+              onChanged: (value) =>
+                  setState(() => _historyStatus = value ?? 'all'),
+            ),
+            const SizedBox(height: 16),
+          ],
+          Text(
+            _view == 'pending'
+                ? '${_visibleRequests.length} solicitação(ões) pendente(s)'
+                : '${_visibleRequests.length} pedido(s) no histórico',
+            style: const TextStyle(fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 12),
+          if (_visibleRequests.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 50),
+              child: Column(
+                children: [
+                  Icon(_view == 'pending' ? Icons.task_alt : Icons.storage,
+                      size: 52, color: Colors.grey),
+                  const SizedBox(height: 12),
+                  Text(_view == 'pending'
+                      ? 'Nenhuma liberação pendente.'
+                      : 'Nenhum pedido encontrado no histórico.'),
+                ],
+              ),
+            ),
+          ..._visibleRequests.map(_buildRequestCard),
+        ],
+      ),
+    );
+  }
+}
+
+class _GlobalScheduleDialog extends StatefulWidget {
+  const _GlobalScheduleDialog();
+
+  @override
+  State<_GlobalScheduleDialog> createState() => _GlobalScheduleDialogState();
+}
+
+class _GlobalScheduleDialogState extends State<_GlobalScheduleDialog> {
+  final _apiService = ApiService();
+  final Map<String, TextEditingController> _controllers = {};
+  bool _loading = true;
+  bool _saving = false;
+
+  static const _fields = {
+    'shift_start': 'Início do turno',
+    'shift_end': 'Fim do turno',
+    'start_allowed_from': 'Entrada permitida a partir de',
+    'start_allowed_until': 'Entrada permitida até',
+    'overtime_prompt_after': 'Bloquear tela após',
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final schedule = await _apiService.getGlobalWorkSchedule();
+      for (final field in _fields.keys) {
+        _controllers[field] =
+            TextEditingController(text: schedule[field]?.toString() ?? '');
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Erro: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    for (final controller in _controllers.values) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    setState(() => _saving = true);
+    try {
+      await _apiService.updateGlobalWorkSchedule({
+        for (final field in _fields.keys)
+          field: _controllers[field]!.text.trim(),
+        'timezone': 'America/Sao_Paulo',
+      });
+      if (mounted) Navigator.pop(context);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Erro ao salvar: $e'),
+          backgroundColor: const Color(0xFF8B0000),
+        ));
+      }
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Horário global dos estagiários'),
+      content: _loading
+          ? const SizedBox(
+              height: 100, child: Center(child: CircularProgressIndicator()))
+          : SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text('Use o formato 24 horas: HH:mm.'),
+                  const SizedBox(height: 12),
+                  for (final entry in _fields.entries) ...[
+                    TextField(
+                      controller: _controllers[entry.key],
+                      decoration: InputDecoration(labelText: entry.value),
+                      keyboardType: TextInputType.datetime,
+                    ),
+                    const SizedBox(height: 10),
+                  ],
+                ],
+              ),
+            ),
+      actions: [
+        TextButton(
+            onPressed: _saving ? null : () => Navigator.pop(context),
+            child: const Text('Cancelar')),
+        ElevatedButton(
+          onPressed: _loading || _saving ? null : _save,
+          child: const Text('Salvar'),
+        ),
+      ],
     );
   }
 }
@@ -695,9 +1222,16 @@ class UserEditDialog extends StatefulWidget {
 
 class _UserEditDialogState extends State<UserEditDialog> {
   late TextEditingController _nameController;
+  late TextEditingController _emailController;
+  late TextEditingController _cpfController;
+  late TextEditingController _passwordController;
   late TextEditingController _hoursController;
   late TextEditingController _jobTitleController;
+  final Map<String, TextEditingController> _scheduleControllers = {};
   late String _selectedRole;
+  bool _disabled = false;
+  bool _scheduleOverrideEnabled = false;
+  bool _obscurePassword = true;
   final _apiService = ApiService();
   bool _isSaving = false;
   bool _isDeleting = false;
@@ -707,12 +1241,36 @@ class _UserEditDialogState extends State<UserEditDialog> {
     super.initState();
     _nameController =
         TextEditingController(text: widget.user['name']?.toString() ?? '');
+    _emailController =
+        TextEditingController(text: widget.user['email']?.toString() ?? '');
+    _cpfController =
+        TextEditingController(text: widget.user['cpf']?.toString() ?? '');
+    _passwordController = TextEditingController();
     _hoursController =
         TextEditingController(text: widget.user['daily_hours'].toString());
-    _selectedRole = widget.user['role'];
+    final savedRole = widget.user['role']?.toString() ?? 'employee';
+    _selectedRole = savedRole == 'estagiario' ? 'intern' : savedRole;
     _jobTitleController = TextEditingController(
       text: _initialJobTitle(_selectedRole, widget.user['job_title']),
     );
+    _disabled = widget.user['disabled'] == true;
+    _scheduleOverrideEnabled =
+        widget.user['work_schedule_override_enabled'] == true;
+    final rawOverride = widget.user['work_schedule_override'];
+    final override = rawOverride is Map
+        ? Map<String, dynamic>.from(rawOverride)
+        : <String, dynamic>{};
+    const defaults = {
+      'shift_start': '13:30',
+      'shift_end': '19:30',
+      'start_allowed_from': '13:25',
+      'start_allowed_until': '19:25',
+      'overtime_prompt_after': '19:35',
+    };
+    for (final entry in defaults.entries) {
+      _scheduleControllers[entry.key] = TextEditingController(
+          text: override[entry.key]?.toString() ?? entry.value);
+    }
   }
 
   String _initialJobTitle(String role, dynamic savedTitle) {
@@ -722,11 +1280,31 @@ class _UserEditDialogState extends State<UserEditDialog> {
     return 'Aux. Geral';
   }
 
+  Widget _scheduleField(String key, String label) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: TextFormField(
+        controller: _scheduleControllers[key],
+        decoration: InputDecoration(
+          labelText: label,
+          helperText: 'Formato HH:mm',
+        ),
+        keyboardType: TextInputType.datetime,
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _nameController.dispose();
+    _emailController.dispose();
+    _cpfController.dispose();
+    _passwordController.dispose();
     _hoursController.dispose();
     _jobTitleController.dispose();
+    for (final controller in _scheduleControllers.values) {
+      controller.dispose();
+    }
     super.dispose();
   }
 
@@ -745,6 +1323,42 @@ class _UserEditDialogState extends State<UserEditDialog> {
                   labelStyle: TextStyle(color: Colors.grey)),
             ),
             const SizedBox(height: 16),
+            TextFormField(
+              controller: _emailController,
+              decoration: const InputDecoration(labelText: 'E-mail'),
+              keyboardType: TextInputType.emailAddress,
+            ),
+            const SizedBox(height: 16),
+            TextFormField(
+              controller: _cpfController,
+              decoration: const InputDecoration(labelText: 'CPF'),
+              keyboardType: TextInputType.number,
+            ),
+            const SizedBox(height: 16),
+            TextFormField(
+              controller: _passwordController,
+              obscureText: _obscurePassword,
+              decoration: InputDecoration(
+                labelText: 'Nova senha',
+                helperText: 'Deixe vazio para manter a senha atual.',
+                suffixIcon: IconButton(
+                  onPressed: () =>
+                      setState(() => _obscurePassword = !_obscurePassword),
+                  icon: Icon(_obscurePassword
+                      ? Icons.visibility_outlined
+                      : Icons.visibility_off_outlined),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            SwitchListTile.adaptive(
+              contentPadding: EdgeInsets.zero,
+              value: _disabled,
+              onChanged: (value) => setState(() => _disabled = value),
+              title: const Text('Conta desativada'),
+              subtitle: const Text('Impede o usuário de entrar no sistema.'),
+            ),
+            const Divider(height: 28),
             DropdownButtonFormField<String>(
               value: _selectedRole,
               dropdownColor: Theme.of(context).cardColor,
@@ -781,13 +1395,10 @@ class _UserEditDialogState extends State<UserEditDialog> {
             const SizedBox(height: 16),
             TextFormField(
               controller: _jobTitleController,
-              enabled: _selectedRole != 'intern',
-              decoration: InputDecoration(
+              decoration: const InputDecoration(
                 labelText: 'Função na folha',
-                helperText: _selectedRole == 'intern'
-                    ? 'Estagiarios usam sempre Estagiario'
-                    : 'Ex: Aux. Geral, Coordenador de Campo',
-                labelStyle: const TextStyle(color: Colors.grey),
+                helperText: 'Ex: Estagiário, Aux. Geral, Coordenador de Campo',
+                labelStyle: TextStyle(color: Colors.grey),
               ),
             ),
             const SizedBox(height: 16),
@@ -799,6 +1410,26 @@ class _UserEditDialogState extends State<UserEditDialog> {
               keyboardType:
                   const TextInputType.numberWithOptions(decimal: true),
             ),
+            if (_selectedRole == 'intern' || _selectedRole == 'estagiario') ...[
+              const Divider(height: 32),
+              SwitchListTile.adaptive(
+                contentPadding: EdgeInsets.zero,
+                value: _scheduleOverrideEnabled,
+                onChanged: (value) =>
+                    setState(() => _scheduleOverrideEnabled = value),
+                title: const Text('Horário individual'),
+                subtitle: const Text(
+                    'Quando desligado, usa o horário global dos estagiários.'),
+              ),
+              if (_scheduleOverrideEnabled) ...[
+                _scheduleField('shift_start', 'Início do turno'),
+                _scheduleField('shift_end', 'Fim do turno'),
+                _scheduleField(
+                    'start_allowed_from', 'Entrada permitida a partir de'),
+                _scheduleField('start_allowed_until', 'Entrada permitida até'),
+                _scheduleField('overtime_prompt_after', 'Bloquear tela após'),
+              ],
+            ],
           ],
         ),
       ),
@@ -831,10 +1462,20 @@ class _UserEditDialogState extends State<UserEditDialog> {
 
   Future<void> _save() async {
     final name = _nameController.text.trim();
-    if (name.isEmpty) {
+    final email = _emailController.text.trim();
+    final password = _passwordController.text.trim();
+    if (name.isEmpty || email.isEmpty || !email.contains('@')) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-            content: Text('Informe o nome do usuario.'),
+            content: Text('Informe um nome e um e-mail válidos.'),
+            backgroundColor: Color(0xFF8B0000)),
+      );
+      return;
+    }
+    if (password.isNotEmpty && password.length < 6) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('A nova senha deve ter pelo menos 6 caracteres.'),
             backgroundColor: Color(0xFF8B0000)),
       );
       return;
@@ -845,15 +1486,23 @@ class _UserEditDialogState extends State<UserEditDialog> {
       await _apiService.updateUserAdmin(
         widget.user['id'],
         name: name,
-        email: widget.user['email']?.toString() ?? '',
+        email: email,
         role: _selectedRole,
-        jobTitle: _selectedRole == 'intern'
-            ? 'Estagiario'
-            : (_jobTitleController.text.trim().isEmpty
-                ? 'Aux. Geral'
-                : _jobTitleController.text.trim()),
+        jobTitle: _jobTitleController.text.trim().isEmpty
+            ? (_selectedRole == 'intern' ? 'Estagiario' : 'Aux. Geral')
+            : _jobTitleController.text.trim(),
         dailyHours: double.tryParse(_hoursController.text) ?? 8.0,
-        cpf: widget.user['cpf']?.toString() ?? '',
+        cpf: _cpfController.text.trim(),
+        disabled: _disabled,
+        newPassword: password.isEmpty ? null : password,
+        workScheduleOverrideEnabled: _scheduleOverrideEnabled,
+        workScheduleOverride: _scheduleOverrideEnabled
+            ? {
+                for (final entry in _scheduleControllers.entries)
+                  entry.key: entry.value.text.trim(),
+                'timezone': 'America/Sao_Paulo',
+              }
+            : null,
       );
       widget.onSave();
       if (mounted) Navigator.pop(context);

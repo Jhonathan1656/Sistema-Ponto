@@ -3,6 +3,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
+import '../utils/chat_timestamp.dart';
 import 'chat_screen.dart';
 
 class UserChatListScreen extends StatefulWidget {
@@ -54,15 +55,15 @@ class _UserChatListScreenState extends State<UserChatListScreen> {
           .where(_matchesPeriodFilter)
           .toList();
 
-      conversations.sort((a, b) => (b['last_time'] as String? ?? '')
-          .compareTo(a['last_time'] as String? ?? ''));
+      conversations.sort(
+          (a, b) => chatConversationTime(b).compareTo(chatConversationTime(a)));
       return conversations;
     });
   }
 
   bool _matchesPeriodFilter(Map<String, dynamic> conv) {
-    final lastTime = DateTime.tryParse((conv['last_time'] ?? '').toString());
-    if (lastTime == null) return true;
+    final lastTime = chatConversationTime(conv);
+    if (lastTime.millisecondsSinceEpoch == 0) return true;
 
     final now = DateTime.now();
     final localLast = lastTime.toLocal();
@@ -266,8 +267,7 @@ class _UserChatListScreenState extends State<UserChatListScreen> {
                   separatorBuilder: (_, __) => const SizedBox(height: 8),
                   itemBuilder: (context, index) {
                     final conv = conversations[index];
-                    final lastTime =
-                        DateTime.tryParse((conv['last_time'] ?? '').toString());
+                    final lastTime = chatConversationTime(conv);
                     final title = (conv['title'] ?? 'Conversa').toString();
                     final subtitle = (conv['last_message'] ?? '').toString();
 
@@ -296,7 +296,7 @@ class _UserChatListScreenState extends State<UserChatListScreen> {
                         trailing: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            if (lastTime != null)
+                            if (lastTime.millisecondsSinceEpoch != 0)
                               Text(DateFormat('dd/MM HH:mm').format(lastTime),
                                   style: const TextStyle(fontSize: 11)),
                             if (_showTrash)

@@ -11,7 +11,6 @@ import 'package:intl/date_symbol_data_local.dart';
 import 'screens/login_screen.dart';
 import 'screens/main_screen.dart';
 import 'services/app_permission_service.dart';
-import 'services/api_service.dart';
 import 'services/notification_service.dart';
 import 'services/theme_service.dart';
 
@@ -287,51 +286,27 @@ class _PermissionGateState extends State<PermissionGate>
   }
 }
 
-class AuthGate extends StatefulWidget {
+class AuthGate extends StatelessWidget {
   const AuthGate({super.key});
 
   @override
-  State<AuthGate> createState() => _AuthGateState();
-}
-
-class _AuthGateState extends State<AuthGate> {
-  final ApiService _apiService = ApiService();
-  late final Future<bool> _hasCachedSession;
-
-  @override
-  void initState() {
-    super.initState();
-    _hasCachedSession = _apiService.hasCachedSession();
-  }
-
-  @override
   Widget build(BuildContext context) {
-    return FutureBuilder<bool>(
-      future: _hasCachedSession,
-      builder: (context, cachedSnapshot) {
-        return StreamBuilder<User?>(
-          stream: FirebaseAuth.instance.authStateChanges(),
-          builder: (context, authSnapshot) {
-            final isCheckingCache =
-                cachedSnapshot.connectionState != ConnectionState.done;
-            final isCheckingAuth =
-                authSnapshot.connectionState == ConnectionState.waiting;
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, authSnapshot) {
+        if (authSnapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(
+            body: Center(
+              child: CircularProgressIndicator(color: Color(0xFF8B0000)),
+            ),
+          );
+        }
 
-            if (isCheckingCache && isCheckingAuth) {
-              return const Scaffold(
-                body: Center(
-                  child: CircularProgressIndicator(color: Color(0xFF8B0000)),
-                ),
-              );
-            }
+        if (authSnapshot.data != null) {
+          return const MainScreen();
+        }
 
-            if (authSnapshot.data != null || cachedSnapshot.data == true) {
-              return const MainScreen();
-            }
-
-            return const LoginScreen();
-          },
-        );
+        return const LoginScreen();
       },
     );
   }

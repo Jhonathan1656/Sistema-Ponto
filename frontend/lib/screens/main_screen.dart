@@ -7,7 +7,6 @@ import 'profile_screen.dart';
 import '../services/api_service.dart';
 import '../services/app_permission_service.dart';
 import '../services/notification_service.dart';
-import '../widgets/user_notification_bell.dart';
 
 class MainScreen extends StatefulWidget {
   const MainScreen({super.key});
@@ -27,6 +26,7 @@ class _MainScreenState extends State<MainScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       AppPermissionService.requestStartupPermissions();
     });
+    NotificationService.registerCurrentDevice();
     _loadUser();
   }
 
@@ -36,7 +36,6 @@ class _MainScreenState extends State<MainScreen> {
       setState(() {
         _isAdmin = user['role'] == 'admin' || user['role'] == 'manager';
       });
-      NotificationService.registerCurrentDevice();
     } catch (e) {
       debugPrint('Erro ao carregar usuário: $e');
     }
@@ -53,19 +52,9 @@ class _MainScreenState extends State<MainScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Stack(
-        children: [
-          IndexedStack(
-            index: _selectedIndex,
-            children: _screens,
-          ),
-          if (!_isAdmin)
-            Positioned(
-              top: MediaQuery.paddingOf(context).top + 10,
-              right: _selectedIndex == 0 ? 64 : 16,
-              child: const UserNotificationBell(),
-            ),
-        ],
+      body: IndexedStack(
+        index: _selectedIndex,
+        children: _screens,
       ),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _selectedIndex,

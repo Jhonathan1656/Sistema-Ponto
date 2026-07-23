@@ -2,6 +2,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
+import '../utils/chat_timestamp.dart';
 import 'admin_chat_detail_screen.dart';
 
 class AdminUserConversationsScreen extends StatefulWidget {
@@ -67,8 +68,7 @@ class _AdminUserConversationsScreenState
           conversationId == null ? null : _conversationMeta[conversationId];
       if (meta?['deleted'] == true) continue;
 
-      final timestamp = DateTime.tryParse(req['timestamp']?.toString() ?? '') ??
-          DateTime.now();
+      final timestamp = chatMessageTime(req);
       final isUnread = req['status'] == 'unread';
 
       grouped.putIfAbsent(groupId, () {

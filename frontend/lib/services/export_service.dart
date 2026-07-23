@@ -2,13 +2,28 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_saver/file_saver.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart' show Uint8List, kIsWeb;
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
+import 'app_config.dart';
+
 class ExportService {
-  static String get backendUrl =>
-      kIsWeb ? '${Uri.base.origin}/api' : 'http://localhost:8000';
+  static String get backendUrl => AppConfig.backendUrl;
+
+  Future<Map<String, String>> _authorizedHeaders() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) throw Exception('Usuario nao autenticado.');
+    final token = await user.getIdToken();
+    if (token == null || token.isEmpty) {
+      throw Exception('Nao foi possivel renovar sua sessao. Entre novamente.');
+    }
+    return {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer $token',
+    };
+  }
 
   Future<void> exportToExcel({
     required Map<String, dynamic> data,
@@ -30,12 +45,14 @@ class ExportService {
         'generate_from_scratch': data['generate_from_scratch'],
         'target_hours': data['target_hours'],
         'holidays': data['holidays'] ?? [],
+        if (data['period_start'] != null) 'period_start': data['period_start'],
+        if (data['period_end'] != null) 'period_end': data['period_end'],
         if (data['estag_rules'] != null) 'estag_rules': data['estag_rules'],
       });
 
       final response = await http.post(
         Uri.parse('$backendUrl/export-excel'),
-        headers: {'Content-Type': 'application/json'},
+        headers: await _authorizedHeaders(),
         body: body,
       );
 
@@ -98,12 +115,14 @@ class ExportService {
           'generate_from_scratch': r['generate_from_scratch'],
           'target_hours': r['target_hours'],
           'holidays': r['holidays'] ?? [],
+          if (r['period_start'] != null) 'period_start': r['period_start'],
+          if (r['period_end'] != null) 'period_end': r['period_end'],
         };
       }).toList();
 
       final response = await http.post(
         Uri.parse('$backendUrl/export-batch-html'),
-        headers: {'Content-Type': 'application/json'},
+        headers: await _authorizedHeaders(),
         body: json.encode(batchData),
       );
 
@@ -156,12 +175,14 @@ class ExportService {
           'generate_from_scratch': r['generate_from_scratch'],
           'target_hours': r['target_hours'],
           'holidays': r['holidays'] ?? [],
+          if (r['period_start'] != null) 'period_start': r['period_start'],
+          if (r['period_end'] != null) 'period_end': r['period_end'],
         };
       }).toList();
 
       final response = await http.post(
         Uri.parse('$backendUrl/export-batch'),
-        headers: {'Content-Type': 'application/json'},
+        headers: await _authorizedHeaders(),
         body: json.encode(batchData),
       );
 

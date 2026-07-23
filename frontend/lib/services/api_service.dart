@@ -8,9 +8,13 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
+import 'package:flutter/foundation.dart' show debugPrint, kIsWeb;
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'app_config.dart';
+import '../utils/chat_timestamp.dart';
+import '../utils/work_schedule_rules.dart';
 
 class AdjustmentRequestResult {
   final String id;
@@ -30,13 +34,12 @@ class ApiService {
   final FirebaseStorage _storage = FirebaseStorage.instance;
   static const String _offlineRecordsKey = 'offline_time_records';
   static const String _cachedUserKey = 'cached_current_user';
-  static String get backendUrl =>
-      kIsWeb ? '${Uri.base.origin}/api' : 'http://localhost:8000';
+  static String get backendUrl => AppConfig.backendUrl;
 
   Future<Map<String, String>> _authorizedHeaders() async {
     final user = _auth.currentUser;
     if (user == null) throw Exception('Usuario nao autenticado.');
-    final token = await user.getIdToken(true);
+    final token = await user.getIdToken();
     if (token == null || token.isEmpty) {
       throw Exception('Nao foi possivel renovar sua sessao. Entre novamente.');
     }
@@ -110,6 +113,87 @@ class ApiService {
         jsonDecode(utf8.decode(response.bodyBytes)) as Map);
   }
 
+  Future<Map<String, dynamic>> _updateUserAdminInFirestore(
+    String userId, {
+    required String name,
+    required String email,
+    required String role,
+    required String jobTitle,
+    required double dailyHours,
+    required String cpf,
+    required bool disabled,
+    String? newPassword,
+    required bool workScheduleOverrideEnabled,
+    Map<String, dynamic>? workScheduleOverride,
+  }) async {
+    final admin = await getCurrentUser();
+    if (admin['role'] != 'admin') {
+      throw Exception('Apenas administradores podem editar usuarios.');
+    }
+
+    final userRef = _db.collection('users').doc(userId);
+    final snapshot = await userRef.get();
+    if (!snapshot.exists || snapshot.data() == null) {
+      throw Exception('Usuario nao encontrado.');
+    }
+    final current = snapshot.data()!;
+    final currentEmail =
+        (current['email'] ?? '').toString().trim().toLowerCase();
+    final requestedEmail = email.trim().toLowerCase();
+    if (requestedEmail != currentEmail) {
+      throw Exception(
+          'Para alterar o e-mail de login, configure a credencial Firebase Admin no servidor.');
+    }
+    if ((newPassword ?? '').trim().isNotEmpty) {
+      throw Exception(
+          'Para redefinir a senha, configure a credencial Firebase Admin no servidor.');
+    }
+    if (disabled != (current['disabled'] == true)) {
+      throw Exception(
+          'Para ativar ou desativar a conta, configure a credencial Firebase Admin no servidor.');
+    }
+
+    final updateData = <String, dynamic>{
+      'name': name.trim(),
+      'email': currentEmail,
+      'role': role,
+      'job_title': jobTitle.trim(),
+      'daily_hours': dailyHours,
+      'cpf': cpf.trim(),
+      'disabled': disabled,
+      'work_schedule_override_enabled': workScheduleOverrideEnabled,
+      'work_schedule_override':
+          workScheduleOverrideEnabled ? workScheduleOverride : null,
+      'updated_at': FieldValue.serverTimestamp(),
+      'last_admin_update_by_id': admin['id'],
+      'last_admin_update_by_name': admin['name'] ?? '',
+      'last_admin_update_by_email': admin['email'] ?? '',
+      'compatibility_mode': true,
+    };
+    final auditRef = _db.collection('system_audits').doc();
+    final batch = _db.batch();
+    batch.update(userRef, updateData);
+    batch.set(auditRef, {
+      'action': 'update_user_admin_compatibility',
+      'target_user_id': userId,
+      'admin_id': admin['id'],
+      'admin_name': admin['name'] ?? '',
+      'admin_email': admin['email'] ?? '',
+      'updated_fields': [
+        'name',
+        'role',
+        'job_title',
+        'daily_hours',
+        'cpf',
+        'work_schedule_override_enabled',
+        'work_schedule_override',
+      ],
+      'created_at': FieldValue.serverTimestamp(),
+    });
+    await batch.commit();
+    return {'status': 'success', 'id': userId, 'compatibility_mode': true};
+  }
+
   Future<Map<String, dynamic>> refreshSignatureDocument(
       String documentId) async {
     final response = await http
@@ -124,6 +208,19 @@ class ApiService {
     }
     return Map<String, dynamic>.from(
         jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
+  Future<void> deleteSignatureDocument(String documentId) async {
+    final response = await http
+        .delete(
+          Uri.parse('$backendUrl/admin/signature-documents/$documentId'),
+          headers: await _authorizedHeaders(),
+        )
+        .timeout(const Duration(seconds: 45));
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
   }
 
   Future<List<Map<String, dynamic>>> getSignatureNotifications() async {
@@ -166,6 +263,9 @@ class ApiService {
         'role',
         'job_title',
         'daily_hours',
+        'disabled',
+        'work_schedule_override_enabled',
+        'work_schedule_override',
       ])
         if (user[key] != null) key: user[key],
     };
@@ -210,6 +310,7 @@ class ApiService {
         'audio_url': null,
         'audio_upload_status': hasAudio ? 'uploading' : null,
         'timestamp': DateTime.now().toIso8601String(),
+        'created_at': FieldValue.serverTimestamp(),
         'status': 'unread',
       });
 
@@ -363,12 +464,12 @@ class ApiService {
   }
 
   Future<List<Map<String, dynamic>>> getAllAdjustmentRequests() async {
-    final snap = await _db
-        .collection('adjustment_requests')
-        .orderBy('timestamp', descending: true)
-        .get();
+    final snap = await _db.collection('adjustment_requests').get();
 
-    return snap.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
+    final requests =
+        snap.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
+    requests.sort((a, b) => compareChatMessages(b, a));
+    return requests;
   }
 
   Stream<List<Map<String, dynamic>>> watchAdjustmentRequestsForUser(
@@ -380,8 +481,7 @@ class ApiService {
         .map((snap) {
       final requests =
           snap.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
-      requests.sort((a, b) =>
-          (a['timestamp'] as String).compareTo(b['timestamp'] as String));
+      requests.sort(compareChatMessages);
       return requests;
     });
   }
@@ -596,12 +696,34 @@ class ApiService {
   Future<int> syncOfflineRecords() async {
     final pendingRecords = await getOfflineRecords();
     if (pendingRecords.isEmpty) return 0;
+    final cachedUser = await getCachedCurrentUser();
+    final cachedRole = (cachedUser?['role'] ?? '').toString().toLowerCase();
+    final isIntern =
+        cachedRole.contains('intern') || cachedRole.contains('estag');
 
     int syncedCount = 0;
     final failedRecords = <Map<String, dynamic>>[];
 
     for (final record in pendingRecords) {
       try {
+        final recordType = record['record_type']?.toString() ?? '';
+        if (isIntern &&
+            (recordType == 'check_in' || recordType == 'check_out')) {
+          final result = await createScheduleControlledPunch(
+            recordType: recordType,
+            timestamp: record['timestamp']?.toString(),
+            location: record['location']?.toString(),
+            notes: record['notes']?.toString(),
+            latitude: (record['latitude'] as num?)?.toDouble(),
+            longitude: (record['longitude'] as num?)?.toDouble(),
+          );
+          if (result['status'] == 'approval_required') {
+            throw Exception('Registro depende de liberacao do gestor.');
+          }
+          syncedCount++;
+          continue;
+        }
+
         final firestoreData = Map<String, dynamic>.from(record)
           ..remove('id')
           ..remove('offline')
@@ -724,6 +846,70 @@ class ApiService {
       'extra50': extra50,
       'extra100': extra100
     };
+  }
+
+  String _hhmm(DateTime dt) => DateFormat('HH:mm').format(dt);
+
+  // Constroi ate 3 sessoes de trabalho (pares entrada/saida) a partir dos marcos
+  // do dia. O modelo da folha tem 3 pares C-D / E-F / G-H, e as REFEICOES sao os
+  // intervalos ENTRE as sessoes (por isso ficam descontadas do total).
+  //   inicio/fim       -> check_in / check_out (turno)
+  //   almI/almF        -> Pausa 1 (almoco)
+  //   janI/janF        -> Pausa 2 (jantar)
+  // Regras (portadas do Pontocampo.py, ajustadas ao que foi combinado):
+  //   - Pausa deixada aberta (bateu inicio, esqueceu o fim) fecha com 1 hora.
+  //   - Almoco automatico 12:00-13:00 se nao registrado e o turno cobrir a janela.
+  //   - Jantar automatico 20:00-21:00 se nao registrado e o turno cobrir a janela.
+  List<List<DateTime>> _buildWorkSessions({
+    required DateTime? inicio,
+    required DateTime? fim,
+    DateTime? almI,
+    DateTime? almF,
+    DateTime? janI,
+    DateTime? janF,
+  }) {
+    if (inicio == null || fim == null) return [];
+    if (fim.isBefore(inicio)) fim = fim.add(const Duration(days: 1));
+
+    // Fecha refeicao deixada aberta com 1 hora.
+    if (almI != null && almF == null) almF = almI.add(const Duration(hours: 1));
+    if (janI != null && janF == null) janF = janI.add(const Duration(hours: 1));
+
+    final base = DateTime(inicio.year, inicio.month, inicio.day);
+
+    // Almoco automatico 12:00-13:00.
+    if (almI == null && almF == null) {
+      final ai = base.add(const Duration(hours: 12));
+      final af = base.add(const Duration(hours: 13));
+      if (!inicio.isAfter(ai) && !fim.isBefore(af)) {
+        almI = ai;
+        almF = af;
+      }
+    }
+    // Jantar automatico 20:00-21:00.
+    if (janI == null && janF == null) {
+      final ji = base.add(const Duration(hours: 20));
+      final jf = base.add(const Duration(hours: 21));
+      if (!inicio.isAfter(ji) && !fim.isBefore(jf)) {
+        janI = ji;
+        janF = jf;
+      }
+    }
+
+    final marks = <DateTime>[inicio, fim];
+    for (final m in [almI, almF, janI, janF]) {
+      if (m != null) marks.add(m);
+    }
+    marks.sort((a, b) => a.compareTo(b));
+
+    final sessions = <List<DateTime>>[];
+    for (int i = 0; i + 1 < marks.length; i += 2) {
+      final s = marks[i];
+      final e = marks[i + 1];
+      if (e.isAfter(s)) sessions.add([s, e]);
+    }
+    // O modelo suporta no maximo 3 sessoes (3 pares de colunas).
+    return sessions.length > 3 ? sessions.sublist(0, 3) : sessions;
   }
 
   // --- MÉTODOS DE DADOS ---
@@ -962,29 +1148,67 @@ class ApiService {
       dayRecords.sort((a, b) =>
           (a['timestamp'] as String).compareTo(b['timestamp'] as String));
 
-      double dNormal = 0, dExtras = 0, d50 = 0, d100 = 0;
-      String? checkIn, checkOut;
-      DateTime? lastIn;
-
-      for (var r in dayRecords) {
-        DateTime ts = _roundTime(DateTime.parse(r['timestamp']));
-        String type = r['record_type'];
-
-        if (type == 'check_in' || type == 'break_end') {
-          if (type == 'check_in') checkIn = DateFormat('HH:mm').format(ts);
-          lastIn = ts;
-        } else if (type == 'check_out' || type == 'break_start') {
-          if (type == 'check_out') checkOut = DateFormat('HH:mm').format(ts);
-          if (lastIn != null) {
-            var classification =
-                _classifyHours(lastIn, ts, user['role'] ?? 'employee');
-            dNormal += classification['normal']!;
-            dExtras += classification['extras']!;
-            d50 += classification['extra50']!;
-            d100 += classification['extra100']!;
-            lastIn = null;
-          }
+      // Marcos do dia. Pausa 1 (break_*) = almoco; Pausa 2 (entry_3/exit_3) = jantar.
+      DateTime? inicio, fim, almI, almF, janI, janF;
+      for (final r in dayRecords) {
+        final ts = _roundTime(DateTime.parse(r['timestamp'] as String));
+        switch (r['record_type']) {
+          case 'check_in':
+            inicio ??= ts;
+            break;
+          case 'check_out':
+            fim = ts; // ultimo check_out do dia
+            break;
+          case 'break_start':
+            almI ??= ts;
+            break;
+          case 'break_end':
+            almF ??= ts;
+            break;
+          case 'entry_3':
+            janI ??= ts;
+            break;
+          case 'exit_3':
+            janF ??= ts;
+            break;
         }
+      }
+
+      final sessions = _buildWorkSessions(
+        inicio: inicio,
+        fim: fim,
+        almI: almI,
+        almF: almF,
+        janI: janI,
+        janF: janF,
+      );
+
+      double dNormal = 0, dExtras = 0, d50 = 0, d100 = 0;
+      for (final s in sessions) {
+        final c = _classifyHours(s[0], s[1], user['role'] ?? 'employee');
+        dNormal += c['normal']!;
+        dExtras += c['extras']!;
+        d50 += c['extra50']!;
+        d100 += c['extra100']!;
+      }
+
+      // Mapeia ate 3 sessoes para os 3 pares de colunas (C-D / E-F / G-H).
+      String? colCheckIn, colCheckOut;
+      String? colBreakStart, colBreakEnd, colEntry3, colExit3;
+      if (sessions.isNotEmpty) {
+        colCheckIn = _hhmm(sessions[0][0]);
+        colCheckOut = _hhmm(sessions[0][1]);
+      } else if (inicio != null) {
+        // Turno aberto (sem saida): mostra so a entrada, sem contar horas.
+        colCheckIn = _hhmm(inicio);
+      }
+      if (sessions.length >= 2) {
+        colBreakStart = _hhmm(sessions[1][0]);
+        colBreakEnd = _hhmm(sessions[1][1]);
+      }
+      if (sessions.length >= 3) {
+        colEntry3 = _hhmm(sessions[2][0]);
+        colExit3 = _hhmm(sessions[2][1]);
       }
 
       totalN += dNormal;
@@ -993,8 +1217,12 @@ class ApiService {
       total100 += d100;
       dailyRecords.add({
         'date': date,
-        'check_in': checkIn,
-        'check_out': checkOut,
+        'check_in': colCheckIn,
+        'check_out': colCheckOut,
+        'break_start': colBreakStart,
+        'break_end': colBreakEnd,
+        'entry_3': colEntry3,
+        'exit_3': colExit3,
         'total_hours': dNormal + dExtras + d50 + d100,
         'regular_hours': dNormal,
         'overtime_hours': dExtras + d50 + d100,
@@ -1037,16 +1265,649 @@ class ApiService {
     required String jobTitle,
     required double dailyHours,
     required String cpf,
+    bool disabled = false,
+    String? newPassword,
+    bool workScheduleOverrideEnabled = false,
+    Map<String, dynamic>? workScheduleOverride,
   }) async {
-    await _db.collection('users').doc(userId.toString()).update({
-      'name': name,
-      'email': email,
-      'role': role,
-      'job_title': jobTitle,
-      'daily_hours': dailyHours,
-      'cpf': cpf,
+    final response = await http
+        .put(
+          Uri.parse('$backendUrl/admin/users/${userId.toString()}'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'name': name,
+            'email': email,
+            'role': role,
+            'job_title': jobTitle,
+            'daily_hours': dailyHours,
+            'cpf': cpf,
+            'disabled': disabled,
+            'new_password': newPassword,
+            'work_schedule_override_enabled': workScheduleOverrideEnabled,
+            'work_schedule_override': workScheduleOverride,
+          }),
+        )
+        .timeout(const Duration(seconds: 45));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.statusCode == 404 || response.statusCode >= 500) {
+        return _updateUserAdminInFirestore(
+          userId.toString(),
+          name: name,
+          email: email,
+          role: role,
+          jobTitle: jobTitle,
+          dailyHours: dailyHours,
+          cpf: cpf,
+          disabled: disabled,
+          newPassword: newPassword,
+          workScheduleOverrideEnabled: workScheduleOverrideEnabled,
+          workScheduleOverride: workScheduleOverride,
+        );
+      }
+      throw Exception(_apiError(response));
+    }
+    return Map<String, dynamic>.from(
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
+  Future<List<Map<String, dynamic>>> getUserNotifications() async {
+    final response = await http
+        .get(
+          Uri.parse('$backendUrl/notifications'),
+          headers: await _authorizedHeaders(),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.statusCode == 404 || response.statusCode >= 500) {
+        final user = _auth.currentUser;
+        if (user == null) return [];
+        final snapshot = await _db
+            .collection('user_notifications')
+            .where('user_id', isEqualTo: user.uid)
+            .get();
+        final notifications = snapshot.docs
+            .map((doc) => {'id': doc.id, ...doc.data()})
+            .toList()
+          ..sort((a, b) =>
+              _firestoreCreatedAt(b).compareTo(_firestoreCreatedAt(a)));
+        return notifications;
+      }
+      throw Exception(_apiError(response));
+    }
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes)) as List;
+    return decoded
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .toList();
+  }
+
+  Future<void> markUserNotificationsRead() async {
+    final response = await http
+        .post(
+          Uri.parse('$backendUrl/notifications/read'),
+          headers: await _authorizedHeaders(),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.statusCode == 404 || response.statusCode >= 500) {
+        final user = _auth.currentUser;
+        if (user == null) return;
+        final snapshot = await _db
+            .collection('user_notifications')
+            .where('user_id', isEqualTo: user.uid)
+            .get();
+        final batch = _db.batch();
+        for (final doc in snapshot.docs) {
+          if (doc.data()['is_read'] != true) {
+            batch.update(doc.reference, {
+              'is_read': true,
+              'read_at': FieldValue.serverTimestamp(),
+            });
+          }
+        }
+        await batch.commit();
+        return;
+      }
+      throw Exception(_apiError(response));
+    }
+  }
+
+  Future<Map<String, dynamic>> getEffectiveWorkSchedule() async {
+    final response = await http
+        .get(
+          Uri.parse('$backendUrl/work-schedule/effective'),
+          headers: await _authorizedHeaders(),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.statusCode == 404 || response.statusCode >= 500) {
+        return _getEffectiveWorkScheduleFromFirestore();
+      }
+      throw Exception(_apiError(response));
+    }
+    return Map<String, dynamic>.from(
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
+  Future<Map<String, dynamic>> createScheduleControlledPunch({
+    required String recordType,
+    String? timestamp,
+    String? location,
+    String? notes,
+    double? latitude,
+    double? longitude,
+    bool closeAtScheduledEnd = false,
+  }) async {
+    final response = await http
+        .post(
+          Uri.parse('$backendUrl/work-schedule/punch'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'record_type': recordType,
+            'timestamp': timestamp,
+            'location': location,
+            'notes': notes,
+            'latitude': latitude,
+            'longitude': longitude,
+            'close_at_scheduled_end': closeAtScheduledEnd,
+          }),
+        )
+        .timeout(const Duration(seconds: 30));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.statusCode == 404 || response.statusCode >= 500) {
+        return _createScheduleControlledPunchInFirestore(
+          recordType: recordType,
+          timestamp: timestamp,
+          location: location,
+          notes: notes,
+          latitude: latitude,
+          longitude: longitude,
+          closeAtScheduledEnd: closeAtScheduledEnd,
+        );
+      }
+      throw Exception(_apiError(response));
+    }
+    return Map<String, dynamic>.from(
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
+  Future<Map<String, dynamic>> createScheduleApprovalRequest({
+    required String requestType,
+    required String attemptedAt,
+    String? shiftStartAt,
+    String? location,
+    String? notes,
+    double? latitude,
+    double? longitude,
+  }) async {
+    final observation = notes?.trim() ?? '';
+    if (observation.isEmpty) {
+      throw Exception('Informe uma observacao explicando a solicitacao.');
+    }
+    if (observation.length > 500) {
+      throw Exception('A observacao deve ter no maximo 500 caracteres.');
+    }
+    final response = await http
+        .post(
+          Uri.parse('$backendUrl/work-schedule/approval-requests'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'request_type': requestType,
+            'attempted_at': attemptedAt,
+            'shift_start_at': shiftStartAt,
+            'location': location,
+            'notes': observation,
+            'latitude': latitude,
+            'longitude': longitude,
+          }),
+        )
+        .timeout(const Duration(seconds: 30));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.statusCode == 404 || response.statusCode >= 500) {
+        return _createScheduleApprovalRequestInFirestore(
+          requestType: requestType,
+          attemptedAt: attemptedAt,
+          shiftStartAt: shiftStartAt,
+          location: location,
+          notes: observation,
+          latitude: latitude,
+          longitude: longitude,
+        );
+      }
+      throw Exception(_apiError(response));
+    }
+    return Map<String, dynamic>.from(
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
+  Future<List<Map<String, dynamic>>> getScheduleApprovalRequests(
+      {String? status}) async {
+    final uri = Uri.parse('$backendUrl/admin/work-schedule/approval-requests')
+        .replace(queryParameters: status == null ? null : {'status': status});
+    final response = await http
+        .get(uri, headers: await _authorizedHeaders())
+        .timeout(const Duration(seconds: 30));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.statusCode == 404 || response.statusCode >= 500) {
+        return _getScheduleApprovalRequestsFromFirestore(status: status);
+      }
+      throw Exception(_apiError(response));
+    }
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes)) as List;
+    return decoded
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .toList();
+  }
+
+  Future<void> decideScheduleApproval(
+    String requestId, {
+    required bool approve,
+    String? reason,
+  }) async {
+    final action = approve ? 'approve' : 'reject';
+    final response = await http
+        .post(
+          Uri.parse(
+              '$backendUrl/admin/work-schedule/approval-requests/$requestId/$action'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'reason': reason}),
+        )
+        .timeout(const Duration(seconds: 30));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.statusCode == 404 || response.statusCode >= 500) {
+        await _decideScheduleApprovalInFirestore(
+          requestId,
+          approve: approve,
+          reason: reason,
+        );
+        return;
+      }
+      throw Exception(_apiError(response));
+    }
+  }
+
+  Future<Map<String, dynamic>> getGlobalWorkSchedule() async {
+    final response = await http
+        .get(
+          Uri.parse('$backendUrl/admin/work-schedule/settings'),
+          headers: await _authorizedHeaders(),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.statusCode == 404 || response.statusCode >= 500) {
+        return _getGlobalWorkScheduleFromFirestore();
+      }
+      throw Exception(_apiError(response));
+    }
+    return Map<String, dynamic>.from(
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
+  Future<Map<String, dynamic>> updateGlobalWorkSchedule(
+      Map<String, dynamic> schedule) async {
+    final response = await http
+        .put(
+          Uri.parse('$backendUrl/admin/work-schedule/settings'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode(schedule),
+        )
+        .timeout(const Duration(seconds: 30));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.statusCode == 404 || response.statusCode >= 500) {
+        await _db
+            .collection('work_schedule_settings')
+            .doc('intern_default')
+            .set({
+          ...schedule,
+          'updated_at': FieldValue.serverTimestamp(),
+          'updated_by_id': _auth.currentUser?.uid,
+        });
+        return schedule;
+      }
+      throw Exception(_apiError(response));
+    }
+    return Map<String, dynamic>.from(
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
+  static const Map<String, dynamic> _defaultInternSchedule = {
+    'shift_start': '13:30',
+    'shift_end': '19:30',
+    'start_allowed_from': '13:25',
+    'start_allowed_until': '19:25',
+    'overtime_prompt_after': '19:35',
+    'timezone': 'America/Sao_Paulo',
+  };
+
+  DateTime _scheduleTime(DateTime day, dynamic value) {
+    final parts = value.toString().split(':');
+    return DateTime(
+      day.year,
+      day.month,
+      day.day,
+      int.tryParse(parts.first) ?? 0,
+      parts.length > 1 ? int.tryParse(parts[1]) ?? 0 : 0,
+    );
+  }
+
+  DateTime _firestoreCreatedAt(Map<String, dynamic> item) {
+    final value = item['created_at'];
+    if (value is Timestamp) return value.toDate();
+    return DateTime.tryParse(value?.toString() ?? '') ??
+        DateTime.fromMillisecondsSinceEpoch(0);
+  }
+
+  Future<Map<String, dynamic>> _getGlobalWorkScheduleFromFirestore() async {
+    try {
+      final snapshot = await _db
+          .collection('work_schedule_settings')
+          .doc('intern_default')
+          .get();
+      if (snapshot.exists && snapshot.data() != null) {
+        return {..._defaultInternSchedule, ...snapshot.data()!};
+      }
+    } catch (e) {
+      debugPrint('Horario global remoto indisponivel, usando padrao: $e');
+    }
+    return Map<String, dynamic>.from(_defaultInternSchedule);
+  }
+
+  Future<Map<String, dynamic>> _getEffectiveWorkScheduleFromFirestore() async {
+    final user = await getCurrentUser();
+    final override = user['work_schedule_override'];
+    final overrideEnabled =
+        user['work_schedule_override_enabled'] == true && override is Map;
+    final schedule = overrideEnabled
+        ? {..._defaultInternSchedule, ...Map<String, dynamic>.from(override)}
+        : await _getGlobalWorkScheduleFromFirestore();
+
+    final now = DateTime.now();
+    final dayKey = DateFormat('yyyy-MM-dd').format(now);
+    Map<String, dynamic>? overtimeRequest;
+    Map<String, dynamic>? startRequest;
+    try {
+      final snapshot = await _db
+          .collection('work_schedule_approval_requests')
+          .where('user_id', isEqualTo: user['id'])
+          .get();
+      final requests = snapshot.docs
+          .map((doc) => {'id': doc.id, ...doc.data()})
+          .where((item) => item['day_key'] == dayKey)
+          .toList()
+        ..sort(
+            (a, b) => _firestoreCreatedAt(b).compareTo(_firestoreCreatedAt(a)));
+      for (final item in requests) {
+        if (item['request_type'] == 'overtime' && overtimeRequest == null) {
+          overtimeRequest = item;
+        }
+        if (item['request_type'] == 'start_exception' && startRequest == null) {
+          startRequest = item;
+        }
+      }
+    } catch (e) {
+      debugPrint('Solicitacoes de horario indisponiveis no Firestore: $e');
+    }
+    return {
+      'schedule': schedule,
+      'source': overrideEnabled ? 'user_override' : 'global',
+      'server_now': now.toIso8601String(),
+      'overtime_request': overtimeRequest,
+      'start_request': startRequest,
+      'compatibility_mode': true,
+    };
+  }
+
+  Future<Map<String, dynamic>> _createScheduleControlledPunchInFirestore({
+    required String recordType,
+    String? timestamp,
+    String? location,
+    String? notes,
+    double? latitude,
+    double? longitude,
+    bool closeAtScheduledEnd = false,
+  }) async {
+    final user = await getCurrentUser();
+    final state = await _getEffectiveWorkScheduleFromFirestore();
+    final schedule = Map<String, dynamic>.from(state['schedule'] as Map);
+    var attempted = DateTime.tryParse(timestamp ?? '') ?? DateTime.now();
+    final records = (await getTimeRecords(userId: user['id']))
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .toList()
+      ..sort((a, b) =>
+          a['timestamp'].toString().compareTo(b['timestamp'].toString()));
+    Map<String, dynamic>? openShift;
+    for (final record in records) {
+      if (record['record_type'] == 'check_in') {
+        openShift = record;
+      } else if (record['record_type'] == 'check_out') {
+        openShift = null;
+      }
+    }
+
+    if (recordType == 'check_in') {
+      if (openShift != null) throw Exception('Ja existe um turno aberto.');
+      if (!isInternStartWithinSchedule(attempted, schedule)) {
+        return {
+          'status': 'approval_required',
+          'request_type': 'start_exception',
+          'reason': isInternWorkday(attempted)
+              ? 'outside_start_window'
+              : 'non_working_day',
+          'attempted_at': attempted.toIso8601String(),
+          'schedule': schedule,
+        };
+      }
+    } else if (recordType == 'check_out') {
+      if (openShift == null) throw Exception('Nao existe turno aberto.');
+      final shiftStart = DateTime.parse(openShift['timestamp'].toString());
+      final scheduledEnd = _scheduleTime(shiftStart, schedule['shift_end']);
+      if (closeAtScheduledEnd) {
+        if (scheduledEnd.isBefore(shiftStart)) {
+          throw Exception(
+              'A entrada ocorreu depois do fim programado. Encerre no horario real.');
+        }
+        attempted = scheduledEnd;
+      } else {
+        final threshold =
+            _scheduleTime(shiftStart, schedule['overtime_prompt_after']);
+        final overtime = state['overtime_request'];
+        if (!attempted.isBefore(threshold) &&
+            (overtime is! Map || overtime['status'] != 'approved')) {
+          return {
+            'status': 'approval_required',
+            'request_type': 'overtime',
+            'attempted_at': attempted.toIso8601String(),
+            'schedule': schedule,
+          };
+        }
+      }
+    }
+
+    final data = {
+      'user_id': user['id'],
+      'record_type': recordType,
+      'location': location ?? 'App',
+      'notes': notes,
+      'timestamp': attempted.toIso8601String(),
+      'latitude': latitude,
+      'longitude': longitude,
+      'schedule_controlled': true,
+      'schedule_snapshot': schedule,
+      'compatibility_mode': true,
+      'created_at': FieldValue.serverTimestamp(),
+    };
+    final ref = await _db.collection('time_records').add(data);
+    return {'status': 'created', 'id': ref.id, ...data};
+  }
+
+  Future<Map<String, dynamic>> _createScheduleApprovalRequestInFirestore({
+    required String requestType,
+    required String attemptedAt,
+    String? shiftStartAt,
+    String? location,
+    String? notes,
+    double? latitude,
+    double? longitude,
+  }) async {
+    final observation = notes?.trim() ?? '';
+    if (observation.isEmpty) {
+      throw Exception('Informe uma observacao explicando a solicitacao.');
+    }
+    if (observation.length > 500) {
+      throw Exception('A observacao deve ter no maximo 500 caracteres.');
+    }
+    final user = await getCurrentUser();
+    final state = await _getEffectiveWorkScheduleFromFirestore();
+    final attempted = DateTime.parse(attemptedAt);
+    final dayKey = DateFormat('yyyy-MM-dd').format(attempted);
+    final snapshot = await _db
+        .collection('work_schedule_approval_requests')
+        .where('user_id', isEqualTo: user['id'])
+        .get();
+    for (final doc in snapshot.docs) {
+      final data = doc.data();
+      if (data['request_type'] == requestType &&
+          data['day_key'] == dayKey &&
+          data['status'] == 'pending') {
+        return {
+          'status': 'existing',
+          'request': {'id': doc.id, ...data}
+        };
+      }
+    }
+    final data = {
+      'user_id': user['id'],
+      'user_name': user['name'] ?? user['email'] ?? user['id'],
+      'user_email': user['email'] ?? '',
+      'request_type': requestType,
+      'status': 'pending',
+      'attempted_at': attempted.toIso8601String(),
+      'shift_start_at': shiftStartAt,
+      'day_key': dayKey,
+      'location': location ?? 'App',
+      'notes': observation,
+      'latitude': latitude,
+      'longitude': longitude,
+      'schedule_snapshot': state['schedule'],
+      'compatibility_mode': true,
+      'created_at': FieldValue.serverTimestamp(),
+      'updated_at': FieldValue.serverTimestamp(),
+    };
+    final ref =
+        await _db.collection('work_schedule_approval_requests').add(data);
+    return {
+      'status': 'created',
+      'request': {'id': ref.id, ...data}
+    };
+  }
+
+  Future<List<Map<String, dynamic>>> _getScheduleApprovalRequestsFromFirestore(
+      {String? status}) async {
+    final snapshot =
+        await _db.collection('work_schedule_approval_requests').get();
+    final requests = snapshot.docs
+        .map((doc) => {'id': doc.id, ...doc.data()})
+        .where((item) => status == null || item['status'] == status)
+        .toList()
+      ..sort(
+          (a, b) => _firestoreCreatedAt(b).compareTo(_firestoreCreatedAt(a)));
+    return requests;
+  }
+
+  Future<void> _decideScheduleApprovalInFirestore(
+    String requestId, {
+    required bool approve,
+    String? reason,
+  }) async {
+    final manager = await getCurrentUser();
+    if (manager['role'] != 'admin' && manager['role'] != 'manager') {
+      throw Exception('Apenas gestores podem decidir liberacoes.');
+    }
+    final requestRef =
+        _db.collection('work_schedule_approval_requests').doc(requestId);
+    final snapshot = await requestRef.get();
+    if (!snapshot.exists || snapshot.data() == null) {
+      throw Exception('Solicitacao nao encontrada.');
+    }
+    final request = snapshot.data()!;
+    if (request['status'] != 'pending') {
+      throw Exception('Esta solicitacao ja foi decidida.');
+    }
+
+    final batch = _db.batch();
+    String? linkedRecordId;
+    if (approve && request['request_type'] == 'start_exception') {
+      final records = (await getTimeRecords(userId: request['user_id']))
+          .map((item) => Map<String, dynamic>.from(item as Map))
+          .toList()
+        ..sort((a, b) =>
+            a['timestamp'].toString().compareTo(b['timestamp'].toString()));
+      bool open = false;
+      for (final record in records) {
+        if (record['record_type'] == 'check_in') open = true;
+        if (record['record_type'] == 'check_out') open = false;
+      }
+      if (open) throw Exception('O usuario ja possui um turno aberto.');
+      final recordRef = _db.collection('time_records').doc();
+      linkedRecordId = recordRef.id;
+      batch.set(recordRef, {
+        'user_id': request['user_id'],
+        'record_type': 'check_in',
+        'location': request['location'] ?? 'App (aprovado)',
+        'notes':
+            request['notes'] ?? 'Entrada fora do horario aprovada pelo gestor',
+        'timestamp': request['attempted_at'],
+        'latitude': request['latitude'],
+        'longitude': request['longitude'],
+        'schedule_controlled': true,
+        'schedule_approval_request_id': requestId,
+        'approved_by_id': manager['id'],
+        'approved_by_name': manager['name'] ?? manager['email'],
+        'schedule_snapshot': request['schedule_snapshot'],
+        'compatibility_mode': true,
+        'created_at': FieldValue.serverTimestamp(),
+      });
+    }
+    batch.update(requestRef, {
+      'status': approve ? 'approved' : 'rejected',
+      'decision_reason': reason?.trim() ?? '',
+      'decided_by_id': manager['id'],
+      'decided_by_name': manager['name'] ?? manager['email'] ?? 'Gestor',
+      'decided_at': FieldValue.serverTimestamp(),
+      'linked_time_record_id': linkedRecordId,
+      'updated_at': FieldValue.serverTimestamp(),
     });
-    return {'status': 'success'};
+    await batch.commit();
+
+    try {
+      await _db.collection('user_notifications').add({
+        'user_id': request['user_id'],
+        'title': approve ? 'Horario liberado' : 'Horario nao liberado',
+        'body': approve
+            ? 'Sua solicitacao de horario foi liberada pelo gestor.'
+            : 'O gestor nao liberou sua solicitacao de horario.',
+        'type': 'schedule_decision',
+        'request_id': requestId,
+        'is_read': false,
+        'created_at': FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      debugPrint('Decisao salva, mas notificacao interna falhou: $e');
+    }
   }
 
   Future<void> deleteUserAdmin(dynamic userId) async {

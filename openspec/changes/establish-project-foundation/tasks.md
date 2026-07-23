@@ -20,5 +20,9 @@
 ## 4. Validation
 
 - [x] 4.1 Run OpenSpec validation for `establish-project-foundation`.
-- [ ] 4.2 Run lightweight project checks that are available locally, such as Python compile checks and Flutter analysis when dependencies are installed.
+- [x] 4.2 Run lightweight project checks that are available locally, such as Python compile checks and Flutter analysis when dependencies are installed.
 - [ ] 4.3 Archive the completed OpenSpec change so the new capabilities become baseline specs.
+- [x] 4.4 Validate that the notification bell is aligned in the Ponto app bar, appears only on that screen, and is available to administrative accounts.
+- [x] 4.5 Remove artificial typing delays from adjustment conversations and validate that management replies create and clear user notifications correctly.
+- [x] 4.6 Add the continue-or-close interaction after a user message, show the acknowledgement only after closing, and remove it when management replies.
+- [x] 4.7 Order chat messages and conversation previews by Firestore server timestamps, with legacy timestamp fallback and second-level display precision.

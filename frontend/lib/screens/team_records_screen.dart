@@ -368,6 +368,28 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
     );
   }
 
+  String _recordUserName(Map<String, dynamic> record) {
+    final directName = record['user_name'] ??
+        record['employee_name'] ??
+        record['name'] ??
+        record['full_name'];
+    if (directName != null && directName.toString().trim().isNotEmpty) {
+      return directName.toString().trim();
+    }
+
+    final userId = record['user_id']?.toString();
+    if (userId == null || userId.isEmpty) return 'Sem nome';
+
+    for (final user in _users) {
+      if (user is Map && user['id']?.toString() == userId) {
+        final name = user['name']?.toString().trim();
+        if (name != null && name.isNotEmpty) return name;
+      }
+    }
+
+    return 'Sem nome';
+  }
+
   Widget _buildRecordsList() {
     if (_records.isEmpty) {
       return const Center(
@@ -379,7 +401,9 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
       itemCount: _records.length,
       itemBuilder: (context, index) {
         final r = _records[index];
+        final record = Map<String, dynamic>.from(r as Map);
         final time = DateTime.parse(r['timestamp']);
+        final userName = _recordUserName(record);
         final isEditedByAdmin = r['edited_by_admin'] == true;
         final notes =
             r['notes']?.toString().replaceAll('Editado pelo admin', '').trim();
@@ -387,10 +411,30 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
         return Card(
           margin: const EdgeInsets.only(bottom: 8),
           child: ListTile(
-            title: Text(
-                r['record_type'].toString().replaceAll('_', ' ').toUpperCase(),
-                style:
-                    const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+            title: Row(
+              children: [
+                Text(
+                  r['record_type']
+                      .toString()
+                      .replaceAll('_', ' ')
+                      .toUpperCase(),
+                  style: const TextStyle(
+                      fontSize: 12, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(width: 12),
+                Flexible(
+                  child: Text(
+                    userName,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.grey,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
+            ),
             subtitle: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [

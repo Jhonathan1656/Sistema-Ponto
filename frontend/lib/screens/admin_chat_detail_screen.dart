@@ -8,6 +8,8 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import '../utils/chat_timestamp.dart';
+
 class AdminChatDetailScreen extends StatefulWidget {
   final String? conversationId;
   final String userId;
@@ -47,8 +49,7 @@ class _AdminChatDetailScreenState extends State<AdminChatDetailScreen> {
           .map((snap) {
         final requests =
             snap.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
-        requests.sort((a, b) =>
-            (a['timestamp'] as String).compareTo(b['timestamp'] as String));
+        requests.sort(compareChatMessages);
         return requests;
       });
     }
@@ -60,8 +61,7 @@ class _AdminChatDetailScreenState extends State<AdminChatDetailScreen> {
         .map((snap) {
       final requests =
           snap.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
-      requests.sort((a, b) =>
-          (a['timestamp'] as String).compareTo(b['timestamp'] as String));
+      requests.sort(compareChatMessages);
       return requests;
     });
   }
@@ -119,6 +119,7 @@ class _AdminChatDetailScreenState extends State<AdminChatDetailScreen> {
       'sender_role': 'admin',
       'message': message,
       'timestamp': now,
+      'created_at': FieldValue.serverTimestamp(),
       'status': 'read',
       'notification_read': false,
     });
@@ -128,8 +129,10 @@ class _AdminChatDetailScreenState extends State<AdminChatDetailScreen> {
       'user_name': widget.userName,
       'last_message': message,
       'last_time': now,
+      'last_server_at': FieldValue.serverTimestamp(),
       'updated_at': now,
       'status': 'open',
+      'closed_at': null,
       'deleted': false,
     }, SetOptions(merge: true));
   }
@@ -229,8 +232,7 @@ class _AdminChatDetailScreenState extends State<AdminChatDetailScreen> {
       BuildContext context, List<Map<String, dynamic>> requests) {
     final Map<String, List<Map<String, dynamic>>> byDay = {};
     for (var req in requests) {
-      final date = DateFormat('dd/MM/yyyy')
-          .format(DateTime.parse(req['timestamp'] as String));
+      final date = DateFormat('dd/MM/yyyy').format(chatMessageTime(req));
       byDay.putIfAbsent(date, () => []).add(req);
     }
 
@@ -243,8 +245,7 @@ class _AdminChatDetailScreenState extends State<AdminChatDetailScreen> {
       itemBuilder: (context, index) {
         final day = days[index];
         final dayRequests = byDay[day]!;
-        dayRequests.sort((a, b) =>
-            (a['timestamp'] as String).compareTo(b['timestamp'] as String));
+        dayRequests.sort(compareChatMessages);
 
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -275,12 +276,12 @@ class _AdminChatDetailScreenState extends State<AdminChatDetailScreen> {
     final audioSource = req['audio_url'] ?? req['audio_data_url'];
     final hasAudio = audioSource != null;
     final audioStatus = req['audio_upload_status'];
-    final timestamp = DateTime.parse(req['timestamp'] as String);
+    final timestamp = chatMessageTime(req);
     final uploadExpired = audioStatus == 'uploading' &&
         DateTime.now().difference(timestamp).inMinutes >= 5;
     final isAudioUploading = audioStatus == 'uploading' && !uploadExpired;
     final hasAudioError = audioStatus == 'error' || uploadExpired;
-    final time = DateFormat('HH:mm').format(timestamp);
+    final time = DateFormat('HH:mm:ss').format(timestamp);
     final isAdminReply = req['sender_role'] == 'admin';
 
     return Align(

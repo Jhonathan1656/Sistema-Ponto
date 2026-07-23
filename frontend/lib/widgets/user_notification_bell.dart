@@ -18,15 +18,17 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
   static const _wineColor = Color(0xFF8B0000);
   final _apiService = ApiService();
   List<Map<String, dynamic>> _documentNotifications = [];
+  List<Map<String, dynamic>> _userNotifications = [];
+  List<Map<String, dynamic>> _scheduleRequests = [];
   Timer? _pollTimer;
 
   @override
   void initState() {
     super.initState();
-    _loadDocumentNotifications();
+    _loadNotifications();
     _pollTimer = Timer.periodic(
       const Duration(seconds: 30),
-      (_) => _loadDocumentNotifications(),
+      (_) => _loadNotifications(),
     );
   }
 
@@ -36,12 +38,31 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
     super.dispose();
   }
 
-  Future<void> _loadDocumentNotifications() async {
+  Future<void> _loadNotifications() async {
+    final results = await Future.wait([
+      _apiService
+          .getSignatureNotifications()
+          .catchError((_) => <Map<String, dynamic>>[]),
+      _apiService
+          .getUserNotifications()
+          .catchError((_) => <Map<String, dynamic>>[]),
+    ]);
+    var scheduleRequests = <Map<String, dynamic>>[];
     try {
-      final notifications = await _apiService.getSignatureNotifications();
-      if (mounted) setState(() => _documentNotifications = notifications);
+      final user = await _apiService.getCurrentUser();
+      if (user['role'] == 'admin' || user['role'] == 'manager') {
+        scheduleRequests =
+            await _apiService.getScheduleApprovalRequests(status: 'pending');
+      }
     } catch (_) {
-      // O sino continua exibindo as mensagens mesmo se a API estiver offline.
+      // A fila continua disponivel na aba de liberacoes.
+    }
+    if (mounted) {
+      setState(() {
+        _documentNotifications = results[0];
+        _userNotifications = results[1];
+        _scheduleRequests = scheduleRequests;
+      });
     }
   }
 
@@ -66,6 +87,9 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
     final unreadDocuments = _documentNotifications
         .where((notification) => notification['is_read'] != 1)
         .toList();
+    final unreadUserNotifications = _userNotifications
+        .where((notification) => notification['is_read'] != true)
+        .toList();
 
     await showModalBottomSheet<void>(
       context: context,
@@ -78,7 +102,10 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
             children: [
               const Text('Notificações',
                   style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-              if (managerMessages.isEmpty && unreadDocuments.isEmpty)
+              if (managerMessages.isEmpty &&
+                  unreadDocuments.isEmpty &&
+                  unreadUserNotifications.isEmpty &&
+                  _scheduleRequests.isEmpty)
                 const Padding(
                   padding: EdgeInsets.symmetric(vertical: 28),
                   child: Center(child: Text('Nenhuma notificação nova.')),
@@ -95,7 +122,7 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
                           .collection('adjustment_requests')
                           .doc(message['id'])
                           .update({'notification_read': true});
-                      if (!context.mounted) return;
+                      if (!mounted || !context.mounted) return;
                       Navigator.pop(context);
                       Navigator.of(this.context).push(MaterialPageRoute(
                         builder: (_) => ChatScreen(
@@ -116,6 +143,30 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
                         Text(notification['title']?.toString() ?? 'Documento'),
                     subtitle: Text(notification['body']?.toString() ?? ''),
                   )),
+              ...unreadUserNotifications.map((notification) => ListTile(
+                    leading: CircleAvatar(
+                      backgroundColor: const Color(0x1A8B0000),
+                      child: Icon(
+                        notification['type'] == 'schedule_approval'
+                            ? Icons.approval_outlined
+                            : Icons.schedule_outlined,
+                        color: _wineColor,
+                      ),
+                    ),
+                    title: Text(notification['title']?.toString() ??
+                        'Atualizacao de horario'),
+                    subtitle: Text(notification['body']?.toString() ?? ''),
+                  )),
+              ..._scheduleRequests.map((request) => ListTile(
+                    leading: const CircleAvatar(
+                      backgroundColor: Color(0x1A8B0000),
+                      child: Icon(Icons.more_time, color: _wineColor),
+                    ),
+                    title: const Text('Liberação de horário pendente'),
+                    subtitle: Text(
+                      '${request['user_name'] ?? 'Estagiário'} • ${request['request_type'] == 'start_exception' ? 'entrada fora do horário' : 'continuar expediente'}',
+                    ),
+                  )),
             ],
           ),
         ),
@@ -124,8 +175,11 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
 
     if (unreadDocuments.isNotEmpty) {
       await _apiService.markSignatureNotificationsRead();
-      await _loadDocumentNotifications();
     }
+    if (unreadUserNotifications.isNotEmpty) {
+      await _apiService.markUserNotificationsRead();
+    }
+    await _loadNotifications();
   }
 
   @override
@@ -138,7 +192,13 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
         final unreadDocuments = _documentNotifications
             .where((notification) => notification['is_read'] != 1)
             .length;
-        final total = messages.length + unreadDocuments;
+        final unreadUserNotifications = _userNotifications
+            .where((notification) => notification['is_read'] != true)
+            .length;
+        final total = messages.length +
+            unreadDocuments +
+            unreadUserNotifications +
+            _scheduleRequests.length;
 
         return IconButton(
           tooltip: 'Notificações',

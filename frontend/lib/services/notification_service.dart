@@ -1,6 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter/foundation.dart' show debugPrint, debugPrintStack;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:intl/intl.dart';
 import 'package:timezone/data/latest_all.dart' as tz;
@@ -44,6 +45,16 @@ class NotificationService {
     enableVibration: true,
   );
 
+  static const AndroidNotificationChannel _workScheduleApprovalsChannel =
+      AndroidNotificationChannel(
+    'work_schedule_approvals',
+    'Liberações de horário',
+    description: 'Solicitações e decisões de liberação de horário.',
+    importance: Importance.max,
+    playSound: true,
+    enableVibration: true,
+  );
+
   static Future<void> initialize() async {
     tz.initializeTimeZones();
     tz.setLocalLocation(tz.getLocation('America/Sao_Paulo'));
@@ -68,6 +79,8 @@ class NotificationService {
     await androidPlugin?.createNotificationChannel(_breakChannel);
     await androidPlugin?.createNotificationChannel(_internReminderChannel);
     await androidPlugin?.createNotificationChannel(_signatureDocumentsChannel);
+    await androidPlugin
+        ?.createNotificationChannel(_workScheduleApprovalsChannel);
     await androidPlugin?.requestNotificationsPermission();
     await _configurePushNotifications();
   }
@@ -93,20 +106,28 @@ class NotificationService {
       FirebaseMessaging.onMessage.listen((message) {
         final notification = message.notification;
         if (notification == null) return;
+        final isScheduleNotification =
+            message.data['type']?.toString().startsWith('schedule_') == true;
+        final androidDetails = AndroidNotificationDetails(
+          isScheduleNotification
+              ? 'work_schedule_approvals'
+              : 'signature_documents',
+          isScheduleNotification
+              ? 'Liberações de horário'
+              : 'Documentos para assinatura',
+          channelDescription: isScheduleNotification
+              ? 'Solicitações e decisões de liberação de horário.'
+              : 'Avisos de documentos enviados pelo RH para assinatura.',
+          importance: Importance.max,
+          priority: Priority.high,
+        );
         _plugin.show(
           id: 1004,
           title: notification.title ?? 'Nova notificação',
           body: notification.body ?? '',
-          notificationDetails: const NotificationDetails(
-            android: AndroidNotificationDetails(
-              'signature_documents',
-              'Documentos para assinatura',
-              channelDescription:
-                  'Avisos de documentos enviados pelo RH para assinatura.',
-              importance: Importance.max,
-              priority: Priority.high,
-            ),
-            iOS: DarwinNotificationDetails(
+          notificationDetails: NotificationDetails(
+            android: androidDetails,
+            iOS: const DarwinNotificationDetails(
               presentAlert: true,
               presentBadge: true,
               presentSound: true,
@@ -114,8 +135,9 @@ class NotificationService {
           ),
         );
       });
-    } catch (_) {
-      // O push depende da configuração FCM do aplicativo instalado.
+    } catch (error, stackTrace) {
+      debugPrint('Falha ao configurar notificacoes push: $error');
+      debugPrintStack(stackTrace: stackTrace);
     }
   }
 
@@ -185,25 +207,28 @@ class NotificationService {
 
     await _plugin.show(
       id: _internReminderId,
-      title: 'Ponto aberto',
+      title: 'Decida como encerrar o expediente',
       body:
-          'Talvez voce tenha esquecido de fechar o ponto. Se ainda estiver trabalhando, pode ignorar.',
+          'Abra o app para fechar no horario programado ou pedir liberacao para continuar.',
       notificationDetails: details,
     );
   }
 
   static Future<void> scheduleInternOpenPointReminder(
-      DateTime reference) async {
-    final scheduledAt = DateTime(
-      reference.year,
-      reference.month,
-      reference.day,
-      19,
-      35,
-    );
+    DateTime reference, {
+    DateTime? scheduledAt,
+  }) async {
+    final effectiveScheduledAt = scheduledAt ??
+        DateTime(
+          reference.year,
+          reference.month,
+          reference.day,
+          19,
+          35,
+        );
 
     await cancelInternOpenPointReminder();
-    if (!scheduledAt.isAfter(reference)) return;
+    if (!effectiveScheduledAt.isAfter(reference)) return;
 
     const androidDetails = AndroidNotificationDetails(
       'intern_open_point_reminder',
@@ -231,10 +256,10 @@ class NotificationService {
 
     await _plugin.zonedSchedule(
       id: _internReminderId,
-      title: 'Ponto aberto',
+      title: 'Decida como encerrar o expediente',
       body:
-          'Talvez voce tenha esquecido de fechar o ponto. Se ainda estiver trabalhando, pode ignorar.',
-      scheduledDate: tz.TZDateTime.from(scheduledAt, tz.local),
+          'Abra o app para fechar no horario programado ou pedir liberacao para continuar.',
+      scheduledDate: tz.TZDateTime.from(effectiveScheduledAt, tz.local),
       notificationDetails: details,
       androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
     );

@@ -14,7 +14,8 @@ import secrets
 import logging
 from datetime import datetime, timedelta, time, date
 from calendar import monthrange
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import openpyxl
@@ -28,6 +29,13 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+
+from work_schedule_rules import (
+    DEFAULT_INTERN_WORK_SCHEDULE as RULES_DEFAULT_INTERN_WORK_SCHEDULE,
+    is_start_within_schedule,
+    time_on_day,
+    validate_work_schedule,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +51,14 @@ except ImportError:
     messaging = None
 
 # --- CONFIGURAÇÕES ---
-SECRET_KEY = os.getenv("SECRET_KEY", "sua-chave-secreta-aqui-mude-em-producao")
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+if not SECRET_KEY or SECRET_KEY in {
+    "sua-chave-secreta-aqui-mude-em-producao",
+    "sua-chave-secreta-super-segura-mude-isso",
+    "change-this-in-production",
+}:
+    logger.warning("SECRET_KEY ausente ou insegura; usando chave temporaria desta execucao.")
+    SECRET_KEY = secrets.token_urlsafe(32)
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 ZAPSIGN_API_TOKEN = os.getenv("ZAPSIGN_API_TOKEN", "")
@@ -60,6 +75,20 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/ponto.db")
 FIREBASE_WEB_API_KEY = os.getenv("FIREBASE_WEB_API_KEY", "")
 SHARED_ACCESS_TOKEN = os.getenv("SHARED_ACCESS_TOKEN", "")
 SHARED_ACCESS_COOKIE = "ponto_access"
+ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "sim",
+}
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "ALLOWED_ORIGINS",
+        "https://ponto.vmacengenharia.com,http://localhost:8080,http://127.0.0.1:8080",
+    ).split(",")
+    if origin.strip()
+]
 
 # Configurações de E-mail
 MAIL_USERNAME = "vmac.rh.01@gmail.com"
@@ -103,7 +132,12 @@ SUMMARY_ROW_VALUE = 43
 SUMMARY_ROW_FINAL = 44
 SUMMARY_START_COL = 2
 
-app = FastAPI(title="Ponto System API")
+app = FastAPI(
+    title="Ponto System API",
+    docs_url="/docs" if ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
+)
 security = HTTPBearer(auto_error=True)
 
 
@@ -162,7 +196,7 @@ async def access_check(request: Request):
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -255,13 +289,33 @@ def record_night_minutes(record: ExportRecord) -> int:
             total += night_minutes_between_str(start, end)
     return total
 
+def session_minutes(record: ExportRecord) -> int:
+    """Soma os minutos trabalhados nos 3 pares de colunas (C-D / E-F / G-H).
+    As refeicoes sao os intervalos entre as sessoes, entao ja ficam descontadas."""
+    total = 0
+    for ini, fim in (
+        (record.check_in, record.check_out),
+        (record.break_start, record.break_end),
+        (record.entry_3, record.exit_3),
+    ):
+        if ini and fim:
+            total += minutes_between_str(ini, fim)
+    return total
+
+def split_normal_extra(total_min: int) -> dict:
+    total_min = max(0, total_min)
+    if total_min <= 360:
+        return {"normal": total_min, "extras": 0}
+    return {"normal": 360, "extras": total_min - 360}
+
 def classify_estag_payroll(record: ExportRecord, record_date: date, holiday_days: set, rules: Optional[EstagRules]) -> dict:
-    mins = classify_day_minutes(record.check_in, record.check_out, record.break_start, record.break_end)
+    total = session_minutes(record)
+    mins = split_normal_extra(total)
     result = {"normal": 0, "extras": 0, "50": 0, "100": 0}
-    total = mins["normal"] + mins["extras"]
     rules = rules or EstagRules()
 
-    if record_date.weekday() == 6 or record_date.day in holiday_days:
+    is_holiday = record_date.day in holiday_days or record_date.isoformat() in holiday_days
+    if record_date.weekday() == 6 or is_holiday:
         if rules.sunday_100:
             result["100"] = total
         else:
@@ -289,12 +343,15 @@ def classify_estag_payroll(record: ExportRecord, record_date: date, holiday_days
     result["extras"] = mins["extras"]
     return result
 
-def generate_scratch_records(year: int, month: int, total_hours: float) -> List[ExportRecord]:
+def generate_scratch_records(year: int, month: int, total_hours: float, days: Optional[List[date]] = None) -> List[ExportRecord]:
     total_min = int(total_hours * 60)
     dias_uteis = []
-    num_days = monthrange(year, month)[1]
-    for d in range(1, num_days + 1):
-        dt = date(year, month, d)
+    if days is not None:
+        candidate = list(days)
+    else:
+        num_days = monthrange(year, month)[1]
+        candidate = [date(year, month, d) for d in range(1, num_days + 1)]
+    for dt in candidate:
         if dt.weekday() != 6: dias_uteis.append(dt)
 
     if not dias_uteis: return []
@@ -339,9 +396,100 @@ class ExportData(BaseModel):
     target_hours: Optional[float] = 210.0
     holidays: Optional[List[int]] = None
     estag_rules: Optional[EstagRules] = None
+    period_start: Optional[str] = None
+    period_end: Optional[str] = None
+    period_label: Optional[str] = None
+
+def export_period_dates(data: ExportData) -> List[date]:
+    if data.period_start and data.period_end:
+        start = datetime.fromisoformat(data.period_start[:10]).date()
+        end = datetime.fromisoformat(data.period_end[:10]).date()
+    else:
+        year = int(data.year)
+        month = int(data.month)
+        start = date(year, month, 1)
+        end = date(year, month, monthrange(year, month)[1])
+
+    if end < start:
+        raise ValueError("Periodo de fechamento invalido.")
+
+    dates = []
+    current = start
+    while current <= end:
+        dates.append(current)
+        current += timedelta(days=1)
+    return dates
+
+def export_period_label(data: ExportData) -> str:
+    if data.period_label:
+        return data.period_label
+    dates = export_period_dates(data)
+    if not dates:
+        return f"{data.month}/{data.year}"
+    if len(dates) == monthrange(int(data.year), int(data.month))[1] and dates[0].day == 1:
+        return f"{MONTH_NAMES.get(int(data.month), data.month)}/{data.year}"
+    return f"{dates[0].strftime('%d/%m/%Y')} a {dates[-1].strftime('%d/%m/%Y')}"
+
+def holiday_date_keys(data: ExportData) -> set:
+    days = set(data.holidays or [])
+    dates = export_period_dates(data)
+    keys = set()
+    for item in days:
+        if 1 <= item <= len(dates):
+            keys.add(dates[item - 1].isoformat())
+        for current in dates:
+            if current.day == item:
+                keys.add(current.isoformat())
+    return keys
 
 class DeleteUserRequest(BaseModel):
     user_id: str
+
+class AdminUserUpdateRequest(BaseModel):
+    name: str
+    email: str
+    role: str
+    job_title: str
+    daily_hours: float
+    cpf: str
+    disabled: bool = False
+    new_password: Optional[str] = None
+    work_schedule_override_enabled: bool = False
+    work_schedule_override: Optional[Dict[str, str]] = None
+
+class WorkScheduleConfigRequest(BaseModel):
+    shift_start: str = "13:30"
+    shift_end: str = "19:30"
+    start_allowed_from: str = "13:25"
+    start_allowed_until: str = "19:25"
+    overtime_prompt_after: str = "19:35"
+    timezone: str = "America/Sao_Paulo"
+
+class SchedulePunchRequest(BaseModel):
+    record_type: str
+    timestamp: Optional[str] = None
+    location: Optional[str] = None
+    notes: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    close_at_scheduled_end: bool = False
+
+class ScheduleApprovalCreateRequest(BaseModel):
+    request_type: str
+    attempted_at: Optional[str] = None
+    shift_start_at: Optional[str] = None
+    location: Optional[str] = None
+    notes: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+class ScheduleApprovalDecisionRequest(BaseModel):
+    reason: Optional[str] = None
+
+class AdminTimeRecordUpdateRequest(BaseModel):
+    new_timestamp: str
+    reason: str
+    notes: Optional[str] = None
 
 def init_firebase_admin():
     if firebase_admin is None:
@@ -368,7 +516,160 @@ def init_firebase_admin():
 
 def get_firestore_admin():
     init_firebase_admin()
-    return firestore.client()
+    try:
+        return firestore.client()
+    except Exception as exc:
+        if "default credentials" in str(exc).lower():
+            raise HTTPException(
+                status_code=503,
+                detail="Firebase Admin nao configurado; o cliente deve usar o modo autenticado compativel.",
+            ) from exc
+        raise
+
+DEFAULT_INTERN_WORK_SCHEDULE = RULES_DEFAULT_INTERN_WORK_SCHEDULE
+
+def _validate_work_schedule(raw: Optional[dict]) -> dict:
+    try:
+        return validate_work_schedule(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+def _resolve_effective_work_schedule(db, user_data: dict) -> dict:
+    if user_data.get("work_schedule_override_enabled") is True:
+        override = user_data.get("work_schedule_override")
+        if isinstance(override, dict):
+            return _validate_work_schedule(override)
+
+    settings_doc = db.collection("work_schedule_settings").document("intern_default").get()
+    settings = settings_doc.to_dict() if settings_doc.exists else None
+    return _validate_work_schedule(settings)
+
+def _parse_schedule_datetime(value: Optional[str], timezone_name: str) -> datetime:
+    if not value:
+        return datetime.now(ZoneInfo(timezone_name))
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Data/hora invalida.") from exc
+    timezone = ZoneInfo(timezone_name)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone)
+    return parsed.astimezone(timezone)
+
+def _time_on_day(day: date, hhmm: str, timezone_name: str) -> datetime:
+    return time_on_day(day, hhmm, timezone_name)
+
+def _is_start_within_schedule(attempted: datetime, schedule: dict) -> bool:
+    return is_start_within_schedule(attempted, schedule)
+
+def _is_intern_profile(user_data: dict) -> bool:
+    role = str(user_data.get("role") or "").lower()
+    job_title = str(user_data.get("job_title") or "").lower()
+    return "intern" in role or "estag" in role or "estag" in job_title
+
+def _approval_dict(snapshot) -> dict:
+    data = snapshot.to_dict() or {}
+    for key, value in list(data.items()):
+        if isinstance(value, datetime):
+            data[key] = value.isoformat()
+    return {"id": snapshot.id, **data}
+
+def _user_records_sorted(db, user_id: str) -> List[dict]:
+    snapshots = db.collection("time_records").where("user_id", "==", user_id).stream()
+    records = [{"id": item.id, **(item.to_dict() or {})} for item in snapshots]
+    records.sort(key=lambda item: str(item.get("timestamp") or ""))
+    return records
+
+def _open_shift_start(records: List[dict]) -> Optional[dict]:
+    last_check_in = None
+    for record in records:
+        record_type = record.get("record_type")
+        if record_type == "check_in":
+            last_check_in = record
+        elif record_type == "check_out":
+            last_check_in = None
+    return last_check_in
+
+def _find_schedule_request(
+    db,
+    user_id: str,
+    request_type: str,
+    day_key: str,
+    statuses: Optional[set] = None,
+) -> Optional[Any]:
+    candidates = db.collection("work_schedule_approval_requests").where(
+        "user_id", "==", user_id
+    ).stream()
+    matches = []
+    for item in candidates:
+        data = item.to_dict() or {}
+        if data.get("request_type") != request_type or data.get("day_key") != day_key:
+            continue
+        if statuses is not None and data.get("status") not in statuses:
+            continue
+        matches.append(item)
+    matches.sort(
+        key=lambda item: str((item.to_dict() or {}).get("created_at") or ""),
+        reverse=True,
+    )
+    return matches[0] if matches else None
+
+def _create_user_notification(
+    db,
+    user_id: str,
+    title: str,
+    body: str,
+    notification_type: str,
+    request_id: str,
+):
+    db.collection("user_notifications").document().set({
+        "user_id": user_id,
+        "title": title,
+        "body": body,
+        "type": notification_type,
+        "request_id": request_id,
+        "is_read": False,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+
+def _send_user_push(user_id: str, title: str, body: str, data: Optional[dict] = None):
+    if messaging is None:
+        return
+    try:
+        db = get_firestore_admin()
+        user_ref = db.collection("users").document(user_id)
+        user_doc = user_ref.get()
+        user_data = user_doc.to_dict() or {} if user_doc.exists else {}
+        tokens = [token for token in user_data.get("fcm_tokens", []) if isinstance(token, str) and token]
+        if not tokens:
+            return
+        response = messaging.send_each_for_multicast(messaging.MulticastMessage(
+            tokens=tokens,
+            notification=messaging.Notification(title=title, body=body),
+            data={key: str(value) for key, value in (data or {}).items()},
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    channel_id="work_schedule_approvals",
+                    icon="notification_icon",
+                    color="#8B0000",
+                ),
+            ),
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(aps=messaging.Aps(sound="default"))
+            ),
+        ))
+        invalid = []
+        for token, result in zip(tokens, response.responses):
+            if result.success or result.exception is None:
+                continue
+            code = getattr(result.exception, "code", "")
+            if code in {"registration-token-not-registered", "invalid-registration-token"}:
+                invalid.append(token)
+        if invalid:
+            user_ref.update({"fcm_tokens": firestore.ArrayRemove(invalid)})
+    except Exception as exc:
+        logger.warning("Falha ao enviar push de horario: %s", exc)
 
 def send_document_push_notification(user_id: str, title: str, body: str, document_id: str):
     """Envia o push aos aparelhos cadastrados pelo colaborador.
@@ -380,24 +681,44 @@ def send_document_push_notification(user_id: str, title: str, body: str, documen
         return
 
     try:
-        user_doc = get_firestore_admin().collection("users").document(user_id).get()
+        db = get_firestore_admin()
+        user_ref = db.collection("users").document(user_id)
+        user_doc = user_ref.get()
         user_data = user_doc.to_dict() or {} if user_doc.exists else {}
         tokens = [token for token in user_data.get("fcm_tokens", []) if isinstance(token, str) and token]
         if not tokens:
             logger.info("Push de documento sem aparelho cadastrado para o usuario %s", user_id)
             return
 
+        invalid_tokens = []
         for start in range(0, len(tokens), 500):
+            batch_tokens = tokens[start:start + 500]
             message = messaging.MulticastMessage(
-                tokens=tokens[start:start + 500],
+                tokens=batch_tokens,
                 notification=messaging.Notification(title=title, body=body),
                 data={"type": "signature_document", "document_id": document_id},
-                android=messaging.AndroidConfig(priority="high"),
+                android=messaging.AndroidConfig(
+                    priority="high",
+                    notification=messaging.AndroidNotification(
+                        channel_id="signature_documents",
+                        icon="notification_icon",
+                        color="#8B0000",
+                    ),
+                ),
                 apns=messaging.APNSConfig(
                     payload=messaging.APNSPayload(aps=messaging.Aps(sound="default"))
                 ),
             )
-            messaging.send_each_for_multicast(message)
+            response = messaging.send_each_for_multicast(message)
+            for token, item in zip(batch_tokens, response.responses):
+                if item.success or item.exception is None:
+                    continue
+                error_code = getattr(item.exception, "code", "")
+                if error_code in {"registration-token-not-registered", "invalid-registration-token"}:
+                    invalid_tokens.append(token)
+
+        if invalid_tokens:
+            user_ref.update({"fcm_tokens": firestore.ArrayRemove(invalid_tokens)})
     except Exception as exc:
         logger.warning("Falha ao enviar push de documento: %s", exc)
 
@@ -745,7 +1066,12 @@ def generate_excel_file(data: ExportData) -> str:
     ws = wb.active
 
     if data.generate_from_scratch:
-        data.daily_records = generate_scratch_records(int(data.year), int(data.month), data.target_hours or 210.0)
+        scratch_days = export_period_dates(data) if (data.period_start and data.period_end) else None
+        data.daily_records = generate_scratch_records(int(data.year), int(data.month), data.target_hours or 210.0, days=scratch_days)
+
+    period_dates = export_period_dates(data)
+    custom_period = bool(data.period_start and data.period_end)
+    row_by_date = {current.isoformat(): 9 + idx for idx, current in enumerate(period_dates[:31])}
 
     ws.cell(row=5, column=3).value = data.employee_name
     is_estagiario = "estagiario" in data.employee_role.lower() or "intern" in data.employee_role.lower()
@@ -758,19 +1084,35 @@ def generate_excel_file(data: ExportData) -> str:
 
     ws.cell(row=5, column=11).value = data.custom_work_hours or ("13:30 - 19:30" if is_estagiario else "-")
     ws.cell(row=6, column=9).value = data.custom_department or ("Processamento de Dados" if is_estagiario else "Campo")
+    if custom_period:
+        ws.cell(row=7, column=2).value = f"Fechamento: {export_period_label(data)}"
 
     total_bank = {"normal": 0, "extras": 0, "50": 0, "100": 0}
 
-    for d in range(1, 32):
-        row_idx = 8 + d
-        ws.cell(row=row_idx, column=9).value = f"=IFERROR(MOD(D{row_idx}-C{row_idx},1),0)+IFERROR(MOD(F{row_idx}-E{row_idx},1),0)+IFERROR(MOD(H{row_idx}-G{row_idx},1),0)"
+    for idx in range(31):
+        row_idx = 9 + idx
+        if custom_period:
+            current_date = period_dates[idx] if idx < len(period_dates) else None
+            ws.cell(row=row_idx, column=1).value = current_date.strftime("%d/%m") if current_date else None
+            ws.cell(row=row_idx, column=2).value = WEEKDAY_NAMES[current_date.weekday()] if current_date else None
+            for clear_col in range(3, 9):
+                ws.cell(row=row_idx, column=clear_col).value = None
+        # So conta o par se AMBAS as celulas (entrada e saida) estiverem preenchidas.
+        # Sem isso, um turno aberto (saida vazia) gera MOD(-entrada,1) = horas ate a meia-noite (bug do 10:30).
+        ws.cell(row=row_idx, column=9).value = (
+            f"=IF(OR(C{row_idx}=\"\",D{row_idx}=\"\"),0,MOD(D{row_idx}-C{row_idx},1))"
+            f"+IF(OR(E{row_idx}=\"\",F{row_idx}=\"\"),0,MOD(F{row_idx}-E{row_idx},1))"
+            f"+IF(OR(G{row_idx}=\"\",H{row_idx}=\"\"),0,MOD(H{row_idx}-G{row_idx},1))"
+        )
         ws.cell(row=row_idx, column=9).number_format = "[h]:mm"
 
-    holiday_days = set(data.holidays or [])
+    holiday_keys = holiday_date_keys(data)
 
     for record in data.daily_records:
-        day = datetime.fromisoformat(record.date).day
-        row_idx = 8 + day
+        record_date = datetime.fromisoformat(record.date).date()
+        row_idx = row_by_date.get(record_date.isoformat())
+        if row_idx is None:
+            continue
         if record.check_in: ws.cell(row=row_idx, column=3).value = record.check_in
         if record.check_out:
             val_out = record.check_out
@@ -778,10 +1120,14 @@ def generate_excel_file(data: ExportData) -> str:
             ws.cell(row=row_idx, column=4).value = val_out
         if record.break_start: ws.cell(row=row_idx, column=5).value = record.break_start
         if record.break_end: ws.cell(row=row_idx, column=6).value = record.break_end
+        if record.entry_3: ws.cell(row=row_idx, column=7).value = record.entry_3
+        if record.exit_3:
+            val_out3 = record.exit_3
+            if val_out3 == "00:00": val_out3 = "23:59"
+            ws.cell(row=row_idx, column=8).value = val_out3
 
         if is_estagiario and record.check_in and record.check_out:
-            record_date = datetime.fromisoformat(record.date).date()
-            payroll = classify_estag_payroll(record, record_date, holiday_days, data.estag_rules)
+            payroll = classify_estag_payroll(record, record_date, holiday_keys, data.estag_rules)
             total_bank["normal"] += payroll["normal"]
             total_bank["extras"] += payroll["extras"]
             total_bank["50"] += payroll["50"]
@@ -989,18 +1335,19 @@ def build_employee_html(data: ExportData, panel_id: str, visible: bool) -> tuple
     department = employee_department(data, is_estagiario)
 
     if data.generate_from_scratch:
-        data.daily_records = generate_scratch_records(year, month, data.target_hours or 210.0)
+        scratch_days = export_period_dates(data) if (data.period_start and data.period_end) else None
+        data.daily_records = generate_scratch_records(year, month, data.target_hours or 210.0, days=scratch_days)
 
-    holiday_days = set(data.holidays or [])
-    records_by_day = {datetime.fromisoformat(r.date).day: r for r in data.daily_records}
+    period_dates = export_period_dates(data)
+    holiday_keys = holiday_date_keys(data)
+    records_by_date = {datetime.fromisoformat(r.date).date().isoformat(): r for r in data.daily_records}
     totals = {"days": 0, "total": 0, "normal": 0, "extra_contract": 0, "he50": 0, "he100": 0, "noc_real": 0, "noc_ficto": 0}
     rows = []
 
-    for day in range(1, monthrange(year, month)[1] + 1):
-        current_date = date(year, month, day)
-        record = records_by_day.get(day)
+    for index, current_date in enumerate(period_dates, start=1):
+        record = records_by_date.get(current_date.isoformat())
         classes = []
-        is_holiday = day in holiday_days
+        is_holiday = current_date.isoformat() in holiday_keys
         if is_holiday:
             classes.append("feriado")
         elif current_date.weekday() == 5:
@@ -1032,7 +1379,7 @@ def build_employee_html(data: ExportData, panel_id: str, visible: bool) -> tuple
 
         rows.append(f"""
 <tr class="{' '.join(classes)}">
-  <td>{day}</td><td>{WEEKDAY_NAMES[current_date.weekday()]}</td>
+  <td>{current_date.strftime('%d/%m')}</td><td>{WEEKDAY_NAMES[current_date.weekday()]}</td>
   <td>{esc(record.check_in if record else '')}</td><td>{esc(record.check_out if record else '')}</td>
   <td>{esc(record.break_start if record else '')}</td><td>{esc(record.break_end if record else '')}</td>
   <td>{esc(record.entry_3 if record else '')}</td><td>{esc(record.exit_3 if record else '')}</td>
@@ -1136,8 +1483,7 @@ def generate_batch_html_file(data_list: List[ExportData]) -> str:
         raise ValueError("Nenhum colaborador para exportar.")
 
     first = data_list[0]
-    month_num = int(first.month)
-    month_label = f"{MONTH_NAMES.get(month_num, first.month)}/{first.year}"
+    month_label = export_period_label(first)
     tabs = []
     panels = []
     summaries = []
@@ -1191,7 +1537,10 @@ function showTab(id){{
     return tmp.name
 
 @app.post("/export-excel")
-async def export_excel(data: ExportData):
+async def export_excel(
+    data: ExportData,
+    user=Depends(require_authenticated_user),
+):
     try:
         file_path = generate_excel_file(data)
         return FileResponse(file_path, filename=excel_download_filename(data), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1199,7 +1548,10 @@ async def export_excel(data: ExportData):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/export-batch")
-async def export_batch(data_list: List[ExportData]):
+async def export_batch(
+    data_list: List[ExportData],
+    user=Depends(require_authenticated_user),
+):
     try:
         temp_dir = tempfile.mkdtemp()
         zip_path = os.path.join(temp_dir, "folhas_ponto.zip")
@@ -1213,7 +1565,10 @@ async def export_batch(data_list: List[ExportData]):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/export-batch-html")
-async def export_batch_html(data_list: List[ExportData]):
+async def export_batch_html(
+    data_list: List[ExportData],
+    user=Depends(require_authenticated_user),
+):
     try:
         file_path = generate_batch_html_file(data_list)
         first = data_list[0]
@@ -1230,7 +1585,8 @@ async def send_assistant_message(
     employee_name: str = Form(...),
     employee_email: str = Form(...),
     message: str = Form(...),
-    audio: Optional[UploadFile] = File(None)
+    audio: Optional[UploadFile] = File(None),
+    user=Depends(require_authenticated_user),
 ):
     try:
         body = f"""
@@ -1445,6 +1801,27 @@ async def refresh_signature_document(
     )
     return updated_document
 
+@app.delete("/admin/signature-documents/{document_id}")
+async def delete_signature_document(
+    document_id: str,
+    admin=Depends(require_admin_user),
+):
+    data = get_signature_document(document_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Documento nao encontrado.")
+
+    with signature_db_connection() as connection:
+        connection.execute(
+            "DELETE FROM signature_notifications WHERE document_id = ?",
+            (document_id,),
+        )
+        connection.execute(
+            "DELETE FROM signature_documents WHERE id = ?",
+            (document_id,),
+        )
+
+    return {"status": "success"}
+
 @app.post("/zapsign/webhook")
 async def zapsign_webhook(request: Request):
     if ZAPSIGN_WEBHOOK_SECRET:
@@ -1477,6 +1854,503 @@ async def zapsign_webhook(request: Request):
         updated_document, previous_status, updated_document.get("status", ""),
     )
     return {"status": "success"}
+
+@app.get("/work-schedule/effective")
+async def get_effective_work_schedule_endpoint(user=Depends(require_authenticated_user)):
+    db = get_firestore_admin()
+    schedule = _resolve_effective_work_schedule(db, user)
+    timezone_name = schedule["timezone"]
+    now = datetime.now(ZoneInfo(timezone_name))
+    day_key = now.date().isoformat()
+    overtime = _find_schedule_request(
+        db,
+        user["id"],
+        "overtime",
+        day_key,
+        {"pending", "approved", "rejected"},
+    )
+    start_request = _find_schedule_request(
+        db,
+        user["id"],
+        "start_exception",
+        day_key,
+        {"pending", "approved", "rejected"},
+    )
+    return {
+        "schedule": schedule,
+        "source": "user_override"
+        if user.get("work_schedule_override_enabled") is True
+        else "global",
+        "server_now": now.isoformat(),
+        "overtime_request": _approval_dict(overtime) if overtime else None,
+        "start_request": _approval_dict(start_request) if start_request else None,
+    }
+
+@app.get("/admin/work-schedule/settings")
+async def get_global_work_schedule_endpoint(admin=Depends(require_admin_user)):
+    db = get_firestore_admin()
+    settings_doc = db.collection("work_schedule_settings").document("intern_default").get()
+    return _validate_work_schedule(settings_doc.to_dict() if settings_doc.exists else None)
+
+@app.put("/admin/work-schedule/settings")
+async def update_global_work_schedule_endpoint(
+    payload: WorkScheduleConfigRequest,
+    admin=Depends(require_admin_user),
+):
+    if admin.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode alterar o horario global.")
+    schedule = _validate_work_schedule(payload.model_dump())
+    db = get_firestore_admin()
+    ref = db.collection("work_schedule_settings").document("intern_default")
+    previous = ref.get()
+    ref.set({
+        **schedule,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "updated_by_id": admin["id"],
+        "updated_by_name": admin.get("name", ""),
+    })
+    db.collection("system_audits").document().set({
+        "action": "update_global_intern_schedule",
+        "admin_id": admin["id"],
+        "admin_name": admin.get("name", ""),
+        "before": previous.to_dict() if previous.exists else DEFAULT_INTERN_WORK_SCHEDULE,
+        "after": schedule,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+    return schedule
+
+@app.post("/work-schedule/punch")
+async def schedule_controlled_punch_endpoint(
+    payload: SchedulePunchRequest,
+    user=Depends(require_authenticated_user),
+):
+    allowed_types = {"check_in", "check_out"}
+    if payload.record_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Tipo de ponto nao suportado neste fluxo.")
+
+    db = get_firestore_admin()
+    schedule = _resolve_effective_work_schedule(db, user)
+    timezone_name = schedule["timezone"]
+    attempted = _parse_schedule_datetime(payload.timestamp, timezone_name)
+    server_now = datetime.now(ZoneInfo(timezone_name))
+    if abs((server_now - attempted).total_seconds()) > 15 * 60 and not payload.close_at_scheduled_end:
+        raise HTTPException(status_code=400, detail="O horario informado esta muito distante do relogio do servidor.")
+
+    records = _user_records_sorted(db, user["id"])
+    open_shift = _open_shift_start(records)
+    if payload.record_type == "check_in":
+        if open_shift is not None:
+            raise HTTPException(status_code=409, detail="Ja existe um turno aberto.")
+        if _is_intern_profile(user):
+            if not _is_start_within_schedule(attempted, schedule):
+                return {
+                    "status": "approval_required",
+                    "request_type": "start_exception",
+                    "reason": (
+                        "non_working_day"
+                        if attempted.weekday() > 4
+                        else "outside_start_window"
+                    ),
+                    "attempted_at": attempted.isoformat(),
+                    "schedule": schedule,
+                }
+    else:
+        if open_shift is None:
+            raise HTTPException(status_code=409, detail="Nao existe turno aberto.")
+        shift_started = _parse_schedule_datetime(str(open_shift.get("timestamp")), timezone_name)
+        scheduled_end = _time_on_day(shift_started.date(), schedule["shift_end"], timezone_name)
+        if payload.close_at_scheduled_end:
+            if scheduled_end < shift_started:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A entrada ocorreu depois do fim programado; solicite liberacao para continuar e encerre no horario real.",
+                )
+            attempted = scheduled_end
+        elif _is_intern_profile(user):
+            overtime_threshold = _time_on_day(shift_started.date(), schedule["overtime_prompt_after"], timezone_name)
+            if attempted >= overtime_threshold:
+                approval = _find_schedule_request(
+                    db,
+                    user["id"],
+                    "overtime",
+                    shift_started.date().isoformat(),
+                    {"approved"},
+                )
+                if approval is None:
+                    return {
+                        "status": "approval_required",
+                        "request_type": "overtime",
+                        "attempted_at": attempted.isoformat(),
+                        "schedule": schedule,
+                    }
+
+    record_ref = db.collection("time_records").document()
+    record = {
+        "user_id": user["id"],
+        "record_type": payload.record_type,
+        "location": payload.location or "App",
+        "notes": payload.notes,
+        "timestamp": attempted.isoformat(),
+        "latitude": payload.latitude,
+        "longitude": payload.longitude,
+        "schedule_controlled": _is_intern_profile(user),
+        "schedule_snapshot": schedule if _is_intern_profile(user) else None,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }
+    record_ref.set(record)
+    return {"status": "created", "id": record_ref.id, **record}
+
+@app.post("/work-schedule/approval-requests")
+async def create_schedule_approval_request_endpoint(
+    payload: ScheduleApprovalCreateRequest,
+    user=Depends(require_authenticated_user),
+):
+    if not _is_intern_profile(user):
+        raise HTTPException(status_code=400, detail="Esta autorizacao e exclusiva para estagiarios.")
+    if payload.request_type not in {"start_exception", "overtime"}:
+        raise HTTPException(status_code=400, detail="Tipo de solicitacao invalido.")
+    observation = (payload.notes or "").strip()
+    if not observation:
+        raise HTTPException(
+            status_code=400,
+            detail="Informe uma observacao explicando o motivo da solicitacao.",
+        )
+    if len(observation) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="A observacao deve ter no maximo 500 caracteres.",
+        )
+
+    db = get_firestore_admin()
+    schedule = _resolve_effective_work_schedule(db, user)
+    attempted = _parse_schedule_datetime(payload.attempted_at, schedule["timezone"])
+    server_now = datetime.now(ZoneInfo(schedule["timezone"]))
+    if abs((server_now - attempted).total_seconds()) > 15 * 60:
+        raise HTTPException(
+            status_code=400,
+            detail="O horario da solicitacao esta muito distante do relogio do servidor.",
+        )
+    day_key = attempted.date().isoformat()
+    existing = _find_schedule_request(
+        db, user["id"], payload.request_type, day_key, {"pending"}
+    )
+    if existing is not None:
+        return {"status": "existing", "request": _approval_dict(existing)}
+
+    if payload.request_type == "start_exception":
+        if _is_start_within_schedule(attempted, schedule):
+            raise HTTPException(status_code=400, detail="Este horario nao precisa de autorizacao.")
+
+    request_ref = db.collection("work_schedule_approval_requests").document()
+    request_data = {
+        "user_id": user["id"],
+        "user_name": user.get("name") or user.get("email") or user["id"],
+        "user_email": user.get("email", ""),
+        "request_type": payload.request_type,
+        "status": "pending",
+        "attempted_at": attempted.isoformat(),
+        "shift_start_at": payload.shift_start_at,
+        "day_key": day_key,
+        "location": payload.location or "App",
+        "notes": observation,
+        "latitude": payload.latitude,
+        "longitude": payload.longitude,
+        "schedule_snapshot": schedule,
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }
+    request_ref.set(request_data)
+
+    title = "Liberacao de horario solicitada"
+    kind_label = "entrada fora do horario" if payload.request_type == "start_exception" else "continuacao apos o horario"
+    body = (
+        f"{request_data['user_name']} solicitou {kind_label} as "
+        f"{attempted.strftime('%H:%M:%S')}. Motivo: {observation}"
+    )
+    managers = db.collection("users").stream()
+    for manager in managers:
+        manager_data = manager.to_dict() or {}
+        if manager_data.get("role") not in {"admin", "manager"}:
+            continue
+        _create_user_notification(db, manager.id, title, body, "schedule_approval", request_ref.id)
+        _send_user_push(manager.id, title, body, {
+            "type": "schedule_approval",
+            "request_id": request_ref.id,
+        })
+    return {"status": "created", "request": {"id": request_ref.id, **request_data}}
+
+@app.get("/admin/work-schedule/approval-requests")
+async def list_schedule_approval_requests_endpoint(
+    status: Optional[str] = None,
+    admin=Depends(require_admin_user),
+):
+    db = get_firestore_admin()
+    snapshots = db.collection("work_schedule_approval_requests").stream()
+    requests = []
+    for item in snapshots:
+        data = item.to_dict() or {}
+        if status and data.get("status") != status:
+            continue
+        requests.append(_approval_dict(item))
+    requests.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return requests
+
+@app.get("/notifications")
+async def list_user_notifications_endpoint(user=Depends(require_authenticated_user)):
+    db = get_firestore_admin()
+    snapshots = db.collection("user_notifications").where(
+        "user_id", "==", user["id"]
+    ).stream()
+    notifications = [_approval_dict(item) for item in snapshots]
+    notifications.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return notifications[:100]
+
+@app.post("/notifications/read")
+async def mark_user_notifications_read_endpoint(user=Depends(require_authenticated_user)):
+    db = get_firestore_admin()
+    snapshots = db.collection("user_notifications").where(
+        "user_id", "==", user["id"]
+    ).stream()
+    batch = db.batch()
+    count = 0
+    for item in snapshots:
+        data = item.to_dict() or {}
+        if data.get("is_read") is True:
+            continue
+        batch.update(item.reference, {"is_read": True, "read_at": firestore.SERVER_TIMESTAMP})
+        count += 1
+    if count:
+        batch.commit()
+    return {"status": "success", "updated": count}
+
+@app.post("/admin/work-schedule/approval-requests/{request_id}/approve")
+async def approve_schedule_request_endpoint(
+    request_id: str,
+    payload: ScheduleApprovalDecisionRequest,
+    admin=Depends(require_admin_user),
+):
+    db = get_firestore_admin()
+    request_ref = db.collection("work_schedule_approval_requests").document(request_id)
+    snapshot = request_ref.get()
+    if not snapshot.exists:
+        raise HTTPException(status_code=404, detail="Solicitacao nao encontrada.")
+    data = snapshot.to_dict() or {}
+    if data.get("status") == "approved":
+        return {"status": "approved", "request": _approval_dict(snapshot)}
+    if data.get("status") != "pending":
+        raise HTTPException(status_code=409, detail="Esta solicitacao ja foi decidida.")
+
+    linked_record_id = data.get("linked_time_record_id")
+    if data.get("request_type") == "start_exception":
+        records = _user_records_sorted(db, data["user_id"])
+        if _open_shift_start(records) is not None:
+            raise HTTPException(status_code=409, detail="O usuario ja possui um turno aberto.")
+        record_ref = db.collection("time_records").document()
+        record_ref.set({
+            "user_id": data["user_id"],
+            "record_type": "check_in",
+            "location": data.get("location") or "App (aprovado)",
+            "notes": data.get("notes") or "Entrada fora do horario aprovada pelo gestor",
+            "timestamp": data["attempted_at"],
+            "latitude": data.get("latitude"),
+            "longitude": data.get("longitude"),
+            "schedule_controlled": True,
+            "schedule_approval_request_id": request_id,
+            "approved_by_id": admin["id"],
+            "approved_by_name": admin.get("name", ""),
+            "schedule_snapshot": data.get("schedule_snapshot"),
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+        linked_record_id = record_ref.id
+
+    request_ref.update({
+        "status": "approved",
+        "decision_reason": (payload.reason or "").strip(),
+        "decided_by_id": admin["id"],
+        "decided_by_name": admin.get("name") or admin.get("email") or "Gestor",
+        "decided_at": firestore.SERVER_TIMESTAMP,
+        "linked_time_record_id": linked_record_id,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    })
+    title = "Horario liberado"
+    body = "Sua entrada foi liberada pelo gestor." if data.get("request_type") == "start_exception" else "A continuacao do expediente foi liberada pelo gestor."
+    _create_user_notification(db, data["user_id"], title, body, "schedule_decision", request_id)
+    _send_user_push(data["user_id"], title, body, {
+        "type": "schedule_decision",
+        "request_id": request_id,
+        "status": "approved",
+    })
+    return {"status": "approved", "linked_time_record_id": linked_record_id}
+
+@app.post("/admin/work-schedule/approval-requests/{request_id}/reject")
+async def reject_schedule_request_endpoint(
+    request_id: str,
+    payload: ScheduleApprovalDecisionRequest,
+    admin=Depends(require_admin_user),
+):
+    db = get_firestore_admin()
+    request_ref = db.collection("work_schedule_approval_requests").document(request_id)
+    snapshot = request_ref.get()
+    if not snapshot.exists:
+        raise HTTPException(status_code=404, detail="Solicitacao nao encontrada.")
+    data = snapshot.to_dict() or {}
+    if data.get("status") != "pending":
+        raise HTTPException(status_code=409, detail="Esta solicitacao ja foi decidida.")
+    request_ref.update({
+        "status": "rejected",
+        "decision_reason": (payload.reason or "").strip(),
+        "decided_by_id": admin["id"],
+        "decided_by_name": admin.get("name") or admin.get("email") or "Gestor",
+        "decided_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    })
+    title = "Horario nao liberado"
+    body = "O gestor nao liberou esta solicitacao de horario."
+    _create_user_notification(db, data["user_id"], title, body, "schedule_decision", request_id)
+    _send_user_push(data["user_id"], title, body, {
+        "type": "schedule_decision",
+        "request_id": request_id,
+        "status": "rejected",
+    })
+    return {"status": "rejected"}
+
+@app.put("/admin/users/{user_id}")
+async def update_user_admin_endpoint(
+    user_id: str,
+    payload: AdminUserUpdateRequest,
+    admin=Depends(require_admin_user),
+):
+    if admin.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode atualizar usuarios.")
+
+    target_id = user_id.strip()
+    if not target_id:
+        raise HTTPException(status_code=400, detail="Usuario invalido.")
+
+    allowed_roles = {"admin", "manager", "employee", "intern", "estagiario"}
+    role = payload.role.strip()
+    if role not in allowed_roles:
+        raise HTTPException(status_code=400, detail="Cargo invalido.")
+
+    db = get_firestore_admin()
+    user_ref = db.collection("users").document(target_id)
+    target_doc = user_ref.get()
+    if not target_doc.exists:
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado.")
+
+    override = None
+    if payload.work_schedule_override_enabled:
+        if not payload.work_schedule_override:
+            raise HTTPException(status_code=400, detail="Informe o horario individual completo.")
+        override = _validate_work_schedule(payload.work_schedule_override)
+
+    new_email = payload.email.strip().lower()
+    if not new_email or "@" not in new_email:
+        raise HTTPException(status_code=400, detail="E-mail invalido.")
+    new_password = (payload.new_password or "").strip()
+    if new_password and len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="A nova senha deve ter pelo menos 6 caracteres.")
+
+    try:
+        auth_update = {
+            "email": new_email,
+            "disabled": payload.disabled,
+        }
+        if new_password:
+            auth_update["password"] = new_password
+        firebase_auth.update_user(target_id, **auth_update)
+    except firebase_auth.EmailAlreadyExistsError as exc:
+        raise HTTPException(status_code=409, detail="Este e-mail ja esta em uso.") from exc
+    except firebase_auth.UserNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Conta nao encontrada no Firebase Authentication.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Falha ao atualizar a conta: {str(exc)}") from exc
+
+    update_data = {
+        "name": payload.name.strip(),
+        "email": new_email,
+        "role": role,
+        "job_title": payload.job_title.strip(),
+        "daily_hours": payload.daily_hours,
+        "cpf": payload.cpf.strip(),
+        "disabled": payload.disabled,
+        "work_schedule_override_enabled": payload.work_schedule_override_enabled,
+        "work_schedule_override": override,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "last_admin_update_by_id": admin["id"],
+        "last_admin_update_by_name": admin.get("name", ""),
+        "last_admin_update_by_email": admin.get("email", ""),
+    }
+    user_ref.update(update_data)
+    db.collection("system_audits").document().set({
+        "action": "update_user_admin",
+        "target_user_id": target_id,
+        "admin_id": admin["id"],
+        "admin_name": admin.get("name", ""),
+        "admin_email": admin.get("email", ""),
+        "updated_fields": [
+            "name", "email", "role", "job_title", "daily_hours", "cpf",
+            "disabled", "work_schedule_override_enabled", "work_schedule_override",
+            *( ["password"] if new_password else [] ),
+        ],
+        "password_was_reset": bool(new_password),
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+    return {"status": "success", "id": target_id}
+
+@app.patch("/admin/time-records/{record_id}")
+async def update_time_record_admin_endpoint(
+    record_id: str,
+    payload: AdminTimeRecordUpdateRequest,
+    admin=Depends(require_admin_user),
+):
+    if admin.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode editar registros de ponto.")
+    if not payload.reason.strip():
+        raise HTTPException(status_code=400, detail="Informe o motivo da edicao.")
+
+    db = get_firestore_admin()
+    record_ref = db.collection("time_records").document(record_id)
+    audit_ref = db.collection("time_record_audits").document()
+
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def update_in_transaction(transaction):
+        snapshot = record_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            raise HTTPException(status_code=404, detail="Registro de ponto nao encontrado.")
+
+        old_data = snapshot.to_dict() or {}
+        transaction.update(record_ref, {
+            "timestamp": payload.new_timestamp,
+            "notes": payload.notes or "",
+            "updated_at": firestore.SERVER_TIMESTAMP,
+            "edited_by_admin": True,
+            "admin_edit_message": "Editado pelo admin",
+            "last_admin_edit_reason": payload.reason,
+            "last_admin_edit_by_id": admin["id"],
+            "last_admin_edit_by_name": admin.get("name") or admin.get("email") or "Admin",
+            "last_admin_edit_at": firestore.SERVER_TIMESTAMP,
+        })
+        transaction.set(audit_ref, {
+            "record_id": record_id,
+            "record_user_id": old_data.get("user_id"),
+            "record_type": old_data.get("record_type"),
+            "old_timestamp": old_data.get("timestamp"),
+            "new_timestamp": payload.new_timestamp,
+            "old_notes": old_data.get("notes"),
+            "new_notes": payload.notes or "",
+            "reason": payload.reason,
+            "admin_id": admin["id"],
+            "admin_name": admin.get("name", ""),
+            "admin_email": admin.get("email", ""),
+            "edited_at": firestore.SERVER_TIMESTAMP,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+
+    update_in_transaction(transaction)
+    return {"status": "success", "id": record_id}
 
 @app.delete("/admin/users/{user_id}")
 async def delete_user_admin_endpoint(

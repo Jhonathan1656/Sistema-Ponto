@@ -35,6 +35,22 @@ class _ExportDialogState extends State<ExportDialog> {
 
   DateTime _selectedDate = DateTime.now();
 
+  // Periodo de fechamento personalizado (ex.: dia 29 de um mes ate 28 do outro).
+  bool _customPeriod = false;
+  DateTime? _periodStart;
+  DateTime? _periodEnd;
+
+  DateTime _defaultPeriodEnd() =>
+      DateTime(_selectedDate.year, _selectedDate.month, 28);
+
+  DateTime _defaultPeriodStart() {
+    final end = _defaultPeriodEnd();
+    final lastDayPrev =
+        DateTime(end.year, end.month, 1).subtract(const Duration(days: 1));
+    final day = lastDayPrev.day < 29 ? lastDayPrev.day : 29;
+    return DateTime(lastDayPrev.year, lastDayPrev.month, day);
+  }
+
   @override
   void initState() {
     super.initState();
@@ -73,6 +89,12 @@ class _ExportDialogState extends State<ExportDialog> {
     }
   }
 
+  void _showError(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(msg), backgroundColor: const Color(0xFF8B0000)));
+  }
+
   Future<void> _handleExport() async {
     final holidays = await _askHolidayDays();
     if (holidays == null) return;
@@ -84,15 +106,36 @@ class _ExportDialogState extends State<ExportDialog> {
       if (estagRules == null) return;
     }
 
+    final bool usePeriod =
+        _customPeriod && _periodStart != null && _periodEnd != null;
+    if (_customPeriod && !usePeriod) {
+      _showError('Escolha a data de inicio e de fim do periodo.');
+      return;
+    }
+    if (usePeriod && _periodEnd!.isBefore(_periodStart!)) {
+      _showError('A data final deve ser igual ou depois da inicial.');
+      return;
+    }
+
     setState(() => _isProcessing = true);
     try {
-      final month = _selectedDate.month.toString().padLeft(2, '0');
-      final year = _selectedDate.year.toString();
-      final start = DateTime(_selectedDate.year, _selectedDate.month, 1)
+      // Quando ha periodo, o mes/ano de referencia (nome do arquivo) e o do FIM.
+      final DateTime refDate = usePeriod ? _periodEnd! : _selectedDate;
+      final month = refDate.month.toString().padLeft(2, '0');
+      final year = refDate.year.toString();
+      final start = (usePeriod
+              ? DateTime(
+                  _periodStart!.year, _periodStart!.month, _periodStart!.day)
+              : DateTime(_selectedDate.year, _selectedDate.month, 1))
           .toIso8601String();
-      final end =
-          DateTime(_selectedDate.year, _selectedDate.month + 1, 0, 23, 59, 59)
-              .toIso8601String();
+      final end = (usePeriod
+              ? DateTime(_periodEnd!.year, _periodEnd!.month, _periodEnd!.day,
+                  23, 59, 59)
+              : DateTime(
+                  _selectedDate.year, _selectedDate.month + 1, 0, 23, 59, 59))
+          .toIso8601String();
+      final String? periodStart = usePeriod ? start : null;
+      final String? periodEnd = usePeriod ? end : null;
 
       if (widget.isScratch) {
         // Modo Avulso (Do 0)
@@ -108,6 +151,8 @@ class _ExportDialogState extends State<ExportDialog> {
           'generate_from_scratch': true,
           'target_hours': double.tryParse(_targetHoursController.text) ?? 210.0,
           'holidays': holidays,
+          'period_start': periodStart,
+          'period_end': periodEnd,
         };
 
         await _exportService.exportToExcel(
@@ -134,6 +179,8 @@ class _ExportDialogState extends State<ExportDialog> {
               'generate_from_scratch': false,
               'target_hours': _exportTargetHours(user),
               'holidays': holidays,
+              'period_start': periodStart,
+              'period_end': periodEnd,
             });
           }
           if (widget.htmlOnly) {
@@ -161,6 +208,8 @@ class _ExportDialogState extends State<ExportDialog> {
               'generate_from_scratch': false,
               'target_hours': _exportTargetHours(user),
               'holidays': holidays,
+              'period_start': periodStart,
+              'period_end': periodEnd,
               if (estagRules != null) 'estag_rules': estagRules,
             },
             month: month,
@@ -494,6 +543,7 @@ class _ExportDialogState extends State<ExportDialog> {
                 Expanded(child: _buildYearDropdown()),
               ],
             ),
+            _buildCustomPeriodSection(),
             if (widget.isScratch) ...[
               const SizedBox(height: 12),
               _buildTextField(_roleController, 'Função'),
@@ -590,6 +640,99 @@ class _ExportDialogState extends State<ExportDialog> {
               }
             });
           },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCustomPeriodSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          dense: true,
+          value: _customPeriod,
+          activeThumbColor: const Color(0xFF8B0000),
+          title: const Text('Período de fechamento personalizado',
+              style: TextStyle(color: Colors.white, fontSize: 13)),
+          subtitle: const Text('Ex.: dia 29 de um mês até 28 do outro',
+              style: TextStyle(color: Colors.grey, fontSize: 11)),
+          onChanged: (val) {
+            setState(() {
+              _customPeriod = val;
+              if (val) {
+                _periodStart ??= _defaultPeriodStart();
+                _periodEnd ??= _defaultPeriodEnd();
+              }
+            });
+          },
+        ),
+        if (_customPeriod)
+          Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 4),
+            child: Row(
+              children: [
+                Expanded(
+                  child: _buildPeriodField(
+                    label: 'Início',
+                    date: _periodStart,
+                    onPick: (d) => setState(() => _periodStart = d),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _buildPeriodField(
+                    label: 'Fim',
+                    date: _periodEnd,
+                    onPick: (d) => setState(() => _periodEnd = d),
+                  ),
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildPeriodField({
+    required String label,
+    required DateTime? date,
+    required ValueChanged<DateTime> onPick,
+  }) {
+    final text = date == null
+        ? '--/--/----'
+        : '${date.day.toString().padLeft(2, '0')}/'
+            '${date.month.toString().padLeft(2, '0')}/${date.year}';
+    return InkWell(
+      onTap: () async {
+        final picked = await showDatePicker(
+          context: context,
+          initialDate: date ?? _selectedDate,
+          firstDate: DateTime(2023, 1, 1),
+          lastDate: DateTime(2027, 12, 31),
+          locale: const Locale('pt', 'BR'),
+        );
+        if (picked != null) onPick(picked);
+      },
+      child: InputDecorator(
+        decoration: InputDecoration(
+          labelText: label,
+          labelStyle: const TextStyle(color: Colors.grey),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: const BorderSide(color: Colors.white24),
+          ),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(text, style: const TextStyle(color: Colors.white)),
+            const Icon(Icons.calendar_today, color: Colors.grey, size: 16),
+          ],
         ),
       ),
     );

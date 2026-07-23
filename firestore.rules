@@ -1,0 +1,166 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid))
+             .data.role in ['admin', 'manager'];
+    }
+
+    function isSystemAdmin() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid))
+             .data.role == 'admin';
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+
+      allow create: if isOwner(userId)
+        && request.resource.data.role in ['employee', 'intern'];
+
+      allow update: if isAdmin()
+        || (isOwner(userId)
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['fcm_tokens', 'fcm_token_updated_at']));
+
+      allow delete: if isAdmin();
+    }
+
+    match /user_audits/{auditId} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    match /time_records/{recordId} {
+      allow read: if isSignedIn()
+        && (resource.data.user_id == request.auth.uid || isAdmin());
+
+      allow create: if isSignedIn()
+        && (request.resource.data.user_id == request.auth.uid || isAdmin());
+
+      allow update, delete: if isAdmin();
+    }
+
+    match /time_record_audits/{auditId} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    match /adjustment_conversations/{conversationId} {
+      allow create: if isSignedIn()
+        && (request.resource.data.user_id == request.auth.uid || isAdmin());
+
+      allow read, update, delete: if isSignedIn()
+        && (resource.data.user_id == request.auth.uid || isAdmin());
+    }
+
+    match /adjustment_requests/{requestId} {
+      allow create: if isSignedIn()
+        && (request.resource.data.user_id == request.auth.uid || isAdmin());
+
+      allow read, update, delete: if isSignedIn()
+        && (resource.data.user_id == request.auth.uid || isAdmin());
+    }
+
+    match /signature_documents/{documentId} {
+      allow read: if isSignedIn()
+        && (resource.data.user_id == request.auth.uid || isAdmin());
+
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Configuração global: todos precisam ler o horário efetivo,
+    // mas somente administrador pode alterá-lo.
+    match /work_schedule_settings/{settingId} {
+      allow read: if isSignedIn();
+      allow create, update, delete: if isSystemAdmin();
+    }
+
+    // Estagiário cria e consulta a própria solicitação.
+    // Gestores e administradores consultam a fila e registram a decisão.
+    match /work_schedule_approval_requests/{requestId} {
+      allow create: if isSignedIn()
+        && request.resource.data.user_id == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.request_type in ['start_exception', 'overtime']
+        && request.resource.data.keys().hasAll([
+          'user_id',
+          'user_name',
+          'request_type',
+          'status',
+          'notes',
+          'attempted_at',
+          'day_key',
+          'schedule_snapshot',
+          'created_at',
+          'updated_at'
+        ])
+        && request.resource.data.notes is string
+        && request.resource.data.notes.size() > 0
+        && request.resource.data.notes.size() <= 500;
+
+      allow read: if isSignedIn()
+        && (resource.data.user_id == request.auth.uid || isAdmin());
+
+      allow update: if isAdmin()
+        && resource.data.status == 'pending'
+        && request.resource.data.status in ['approved', 'rejected']
+        && request.resource.data.decided_by_id == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status',
+          'decision_reason',
+          'decided_by_id',
+          'decided_by_name',
+          'decided_at',
+          'linked_time_record_id',
+          'updated_at'
+        ]);
+
+      allow delete: if isAdmin();
+    }
+
+    // Gestores criam o aviso de decisão; o destinatário só pode ler
+    // e alterar os campos de confirmação de leitura.
+    match /user_notifications/{notificationId} {
+      allow create: if isAdmin()
+        && request.resource.data.user_id is string
+        && request.resource.data.title is string
+        && request.resource.data.body is string
+        && request.resource.data.type is string
+        && request.resource.data.is_read == false;
+
+      allow read: if isSignedIn()
+        && resource.data.user_id == request.auth.uid;
+
+      allow update: if isSignedIn()
+        && resource.data.user_id == request.auth.uid
+        && request.resource.data.user_id == resource.data.user_id
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['is_read', 'read_at']);
+
+      allow delete: if isAdmin();
+    }
+
+    match /system_audits/{auditId} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
