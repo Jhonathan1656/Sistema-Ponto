@@ -98,7 +98,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _checkAutoActions(DateTime now) {
-    // 1. Fechamento automatico de pausa apos 1h30 aberta.
+    // 1. Fechamento automatico de pausa apos 3h aberta.
     if (_todayRecords.isNotEmpty && !_isAutoClosingBreak) {
       final last = _todayRecords.last;
       if (last['record_type'] == 'break_start' ||
@@ -106,7 +106,7 @@ class _HomeScreenState extends State<HomeScreen> {
         final startTime = DateTime.parse(last['timestamp']);
         final diff = now.difference(startTime).inMinutes;
 
-        if (diff >= 90) {
+        if (diff >= 180) {
           _autoCloseBreak(last['record_type'], startTime);
         }
       }
@@ -137,7 +137,7 @@ class _HomeScreenState extends State<HomeScreen> {
       await _apiService.createTimeRecord(
         recordType: returnType,
         timestamp: autoTime,
-        notes: "Retorno automatico (pausa excedeu 1h30; ajustado para 1h)",
+        notes: "Retorno automatico (pausa excedeu 3h; ajustado para 1h)",
         location: "Sistema (Auto)",
       );
       await NotificationService.showBreakAutoClosed(closedAt: closedAt);
@@ -148,7 +148,7 @@ class _HomeScreenState extends State<HomeScreen> {
           builder: (context) => AlertDialog(
             title: const Text('Pausa Encerrada'),
             content: const Text(
-                'Sua pausa excedeu 1h30 e foi fechada automaticamente com 1 hora de pausa.'),
+                'Sua pausa excedeu 3h e foi fechada automaticamente com 1 hora de pausa.'),
             actions: [
               TextButton(
                   onPressed: () => Navigator.pop(context),

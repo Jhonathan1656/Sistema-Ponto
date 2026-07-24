@@ -721,6 +721,7 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
   List<Map<String, dynamic>> _summaries = [];
   String _statusFilter = 'all';
   String _roleFilter = 'all';
+  bool _showInactive = false;
   Timer? _timer;
 
   String _statusFilterLabel() {
@@ -1057,31 +1058,145 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
             ],
           ),
           const SizedBox(height: 16),
-          const Text(
-            'STATUS DA EQUIPE',
-            style: TextStyle(
-                color: Colors.grey,
-                fontSize: 11,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 1.1),
+          ..._buildTeamSection(filteredSummaries),
+        ],
+      ),
+    );
+  }
+
+  /// Secao "foco nos ativos": cartoes so para quem esta trabalhando ou em
+  /// pausa; inativos ficam recolhidos numa linha que expande no toque.
+  List<Widget> _buildTeamSection(List<Map<String, dynamic>> summaries) {
+    const activeKeys = {'working', 'paused', 'paused_overdue'};
+    final active =
+        summaries.where((s) => activeKeys.contains(s['status_key'])).toList();
+    final inactive =
+        summaries.where((s) => !activeKeys.contains(s['status_key'])).toList();
+
+    // Se o filtro de status aponta para inativos, mostra-os sem recolher.
+    final forceInactive = _statusFilter == 'done' || _statusFilter == 'none';
+    final doneCount =
+        inactive.where((s) => s['status_key'] == 'done').length;
+    final noneCount =
+        inactive.where((s) => s['status_key'] == 'none').length;
+
+    final parts = <String>[
+      if (doneCount > 0) '$doneCount ${doneCount == 1 ? 'encerrado' : 'encerrados'}',
+      if (noneCount > 0) '$noneCount sem ponto hoje',
+    ];
+
+    return [
+      const Text(
+        'ATIVOS AGORA',
+        style: TextStyle(
+            color: Colors.grey,
+            fontSize: 11,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 1.1),
+      ),
+      const SizedBox(height: 12),
+      if (active.isEmpty)
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(vertical: 22),
+          decoration: BoxDecoration(
+            color: Theme.of(context).cardColor,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.grey.withOpacity(0.2)),
           ),
-          const SizedBox(height: 12),
-          SizedBox(
-            height: 188,
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              itemCount: filteredSummaries.length,
-              separatorBuilder: (_, __) => const SizedBox(width: 12),
-              itemBuilder: (context, index) =>
-                  _buildEmployeeStatusCard(filteredSummaries[index]),
+          child: const Column(
+            children: [
+              Icon(Icons.bedtime_outlined, color: Colors.grey, size: 26),
+              SizedBox(height: 6),
+              Text('Ninguém batendo ponto agora',
+                  style: TextStyle(color: Colors.grey, fontSize: 13)),
+            ],
+          ),
+        )
+      else
+        SizedBox(
+          height: 188,
+          child: ListView.separated(
+            scrollDirection: Axis.horizontal,
+            itemCount: active.length,
+            separatorBuilder: (_, __) => const SizedBox(width: 12),
+            itemBuilder: (context, index) =>
+                _buildEmployeeStatusCard(active[index]),
+          ),
+        ),
+      if (inactive.isNotEmpty) ...[
+        const SizedBox(height: 16),
+        if (!forceInactive)
+          InkWell(
+            onTap: () => setState(() => _showInactive = !_showInactive),
+            borderRadius: BorderRadius.circular(8),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+              child: Row(
+                children: [
+                  Icon(
+                    _showInactive ? Icons.expand_less : Icons.expand_more,
+                    size: 20,
+                    color: Colors.grey,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    parts.join(' · '),
+                    style: const TextStyle(color: Colors.grey, fontSize: 13),
+                  ),
+                ],
+              ),
             ),
           ),
-          const SizedBox(height: 20),
-          ...filteredSummaries
-              .where((summary) =>
-                  summary['status_key'] == 'working' ||
-                  summary['status_key'] == 'paused_overdue')
-              .map(_buildPriorityRow),
+        if (forceInactive || _showInactive)
+          ...inactive.map(_buildCompactInactiveRow),
+      ],
+    ];
+  }
+
+  Widget _buildCompactInactiveRow(Map<String, dynamic> summary) {
+    final color = summary['status_color'] as Color;
+    final lastTime = summary['last_time'] as DateTime?;
+    final worked = summary['worked'] as Duration;
+    final isDone = summary['status_key'] == 'done';
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 4),
+      child: Row(
+        children: [
+          Container(
+            width: 8,
+            height: 8,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              summary['name'],
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 14),
+            ),
+          ),
+          Text(
+            summary['status_label'],
+            style: TextStyle(color: color, fontSize: 12),
+          ),
+          if (isDone) ...[
+            const SizedBox(width: 12),
+            Text(
+              _formatDuration(worked),
+              style: const TextStyle(
+                  fontSize: 13, fontWeight: FontWeight.bold),
+            ),
+          ],
+          if (lastTime != null) ...[
+            const SizedBox(width: 12),
+            Text(
+              DateFormat('HH:mm').format(lastTime),
+              style: const TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+          ],
         ],
       ),
     );
@@ -1173,41 +1288,6 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
     );
   }
 
-  Widget _buildPriorityRow(Map<String, dynamic> summary) {
-    final color = summary['status_color'] as Color;
-    final worked = summary['worked'] as Duration;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Theme.of(context).cardColor,
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Row(
-        children: [
-          Icon(
-              summary['pause_overdue'] == true
-                  ? Icons.warning_amber
-                  : Icons.work,
-              color: color),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(summary['name'],
-                    style: const TextStyle(fontWeight: FontWeight.bold)),
-                Text(summary['status_label'],
-                    style: TextStyle(color: color, fontSize: 12)),
-              ],
-            ),
-          ),
-          Text(_formatDuration(worked),
-              style: const TextStyle(fontWeight: FontWeight.bold)),
-        ],
-      ),
-    );
-  }
 }
 
 class UserEditDialog extends StatefulWidget {
