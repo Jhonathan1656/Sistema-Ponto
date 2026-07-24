@@ -43,13 +43,14 @@ logger = logging.getLogger(__name__)
 try:
     import firebase_admin
     from firebase_admin import auth as firebase_auth
-    from firebase_admin import credentials, firestore, messaging
+    from firebase_admin import credentials, firestore, messaging, storage
 except ImportError:
     firebase_admin = None
     firebase_auth = None
     credentials = None
     firestore = None
     messaging = None
+    storage = None
 
 # --- CONFIGURAÇÕES ---
 SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
@@ -1098,13 +1099,154 @@ async def _auto_close_breaks_loop() -> None:
         except Exception as exc:
             print(f"[auto-close] loop: {exc}")
 
+# --- JOB: backup diario (Firestore + SQLite) ---
+# Firestore no plano Spark nao tem backup gerenciado; este job exporta tudo,
+# guarda local (host, via bind mount) e envia copia off-machine ao Storage.
+
+_BACKUP_DIR = "/app/data/backups"
+_BACKUP_RETENTION = 14
+_BACKUP_MIN_INTERVAL = timedelta(hours=20)      # nao repete se ja ha um recente
+_BACKUP_CHECK_INTERVAL_SECONDS = 6 * 3600        # confere a cada 6h
+_BACKUP_STORAGE_PREFIX = "backups/"
+_BACKUP_STORAGE_BUCKET = os.getenv(
+    "FIREBASE_STORAGE_BUCKET", "ponto-vmac.firebasestorage.app"
+)
+
+def _json_default(obj):
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, bytes):
+        return base64.b64encode(obj).decode("ascii")
+    return str(obj)
+
+def _export_firestore(db) -> dict:
+    dump = {}
+    for coll in db.collections():
+        dump[coll.id] = [
+            {"id": doc.id, **(doc.to_dict() or {})} for doc in coll.stream()
+        ]
+    return dump
+
+def _local_backups() -> List[str]:
+    try:
+        return sorted(
+            f for f in os.listdir(_BACKUP_DIR)
+            if f.startswith("backup-") and f.endswith(".zip")
+        )
+    except FileNotFoundError:
+        return []
+
+def _rotate_local_backups():
+    for old in _local_backups()[:-_BACKUP_RETENTION]:
+        try:
+            os.remove(os.path.join(_BACKUP_DIR, old))
+        except OSError:
+            pass
+
+def _upload_backup_to_storage(path: str, name: str) -> str:
+    if storage is None:
+        return "storage indisponivel"
+    try:
+        bucket = storage.bucket(_BACKUP_STORAGE_BUCKET)
+        bucket.blob(_BACKUP_STORAGE_PREFIX + name).upload_from_filename(path)
+        remote = sorted(
+            (b for b in bucket.list_blobs(prefix=_BACKUP_STORAGE_PREFIX)
+             if b.name.endswith(".zip")),
+            key=lambda b: b.name,
+        )
+        for old in remote[:-_BACKUP_RETENTION]:
+            try:
+                old.delete()
+            except Exception:
+                pass
+        return "ok"
+    except Exception as exc:
+        return f"falha: {exc}"
+
+def _run_backup(force: bool = False) -> dict:
+    try:
+        db = get_firestore_admin()
+    except Exception as exc:
+        return {"status": "skip", "reason": f"firestore indisponivel: {exc}"}
+
+    os.makedirs(_BACKUP_DIR, exist_ok=True)
+    if not force:
+        existing = _local_backups()
+        if existing:
+            newest = os.path.getmtime(os.path.join(_BACKUP_DIR, existing[-1]))
+            if datetime.now().timestamp() - newest < _BACKUP_MIN_INTERVAL.total_seconds():
+                return {"status": "skip", "reason": "backup recente ja existe"}
+
+    stamp = datetime.now(ZoneInfo(_AUTO_CLOSE_TZ)).strftime("%Y%m%d-%H%M%S")
+    name = f"backup-{stamp}.zip"
+    zip_path = os.path.join(_BACKUP_DIR, name)
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        fs_dump = _export_firestore(db)
+        fs_path = os.path.join(tmp_dir, "firestore.json")
+        with open(fs_path, "w", encoding="utf-8") as handle:
+            json.dump(fs_dump, handle, ensure_ascii=False, default=_json_default)
+
+        sqlite_path = os.path.join(tmp_dir, "ponto.db")
+        source = sqlite3.connect(DATABASE_PATH)
+        try:
+            source.execute("VACUUM INTO ?", (sqlite_path,))
+        except Exception:
+            shutil.copy(DATABASE_PATH, sqlite_path)  # fallback
+        finally:
+            source.close()
+
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(fs_path, "firestore.json")
+            if os.path.exists(sqlite_path):
+                archive.write(sqlite_path, "ponto.db")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    upload = _upload_backup_to_storage(zip_path, name)
+    _rotate_local_backups()
+    counts = {k: len(v) for k, v in fs_dump.items()}
+    size = os.path.getsize(zip_path)
+    print(f"[backup] {name} ({size} bytes) upload={upload} colecoes={counts}")
+    return {"status": "ok", "file": name, "bytes": size,
+            "upload": upload, "collections": counts}
+
+async def _backup_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(_run_backup)
+        except Exception as exc:
+            print(f"[backup] loop: {exc}")
+        await asyncio.sleep(_BACKUP_CHECK_INTERVAL_SECONDS)
+
 @app.on_event("startup")
 async def _start_background_jobs() -> None:
     asyncio.create_task(_auto_close_breaks_loop())
+    asyncio.create_task(_backup_loop())
 
 @app.on_event("startup")
 def initialize_local_tables():
     init_signature_documents_table()
+
+@app.post("/admin/backup/run")
+async def run_backup_endpoint(admin=Depends(require_admin_user)):
+    result = await asyncio.to_thread(_run_backup, True)
+    if result.get("status") != "ok":
+        raise HTTPException(status_code=503, detail=result.get("reason", "falha no backup"))
+    return result
+
+@app.get("/admin/backup/list")
+async def list_backups_endpoint(admin=Depends(require_admin_user)):
+    out = []
+    for name in sorted(_local_backups(), reverse=True):
+        path = os.path.join(_BACKUP_DIR, name)
+        out.append({
+            "file": name,
+            "bytes": os.path.getsize(path),
+            "modified": datetime.fromtimestamp(os.path.getmtime(path)).isoformat(),
+        })
+    return {"retention": _BACKUP_RETENTION, "bucket": _BACKUP_STORAGE_BUCKET,
+            "backups": out}
 
 def delete_query_in_batches(db, query, batch_size: int = 300) -> int:
     deleted = 0
