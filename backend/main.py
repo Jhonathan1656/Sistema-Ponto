@@ -556,6 +556,17 @@ def _parse_schedule_datetime(value: Optional[str], timezone_name: str) -> dateti
         return parsed.replace(tzinfo=timezone)
     return parsed.astimezone(timezone)
 
+def _local_iso(dt: datetime) -> str:
+    """Hora de parede local, sem offset, para gravar em time_records.
+
+    O app agrupa e exibe pontos em hora local; guardar sem tzinfo mantem o
+    banco num unico formato (ingenuo-local) e evita o desalinhamento de fuso.
+    `dt` deve estar no fuso local (vindo de _parse_schedule_datetime).
+    """
+    if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt.isoformat()
+
 def _time_on_day(day: date, hhmm: str, timezone_name: str) -> datetime:
     return time_on_day(day, hhmm, timezone_name)
 
@@ -1951,7 +1962,7 @@ async def schedule_controlled_punch_endpoint(
                         if attempted.weekday() > 4
                         else "outside_start_window"
                     ),
-                    "attempted_at": attempted.isoformat(),
+                    "attempted_at": _local_iso(attempted),
                     "schedule": schedule,
                 }
     else:
@@ -1980,7 +1991,7 @@ async def schedule_controlled_punch_endpoint(
                     return {
                         "status": "approval_required",
                         "request_type": "overtime",
-                        "attempted_at": attempted.isoformat(),
+                        "attempted_at": _local_iso(attempted),
                         "schedule": schedule,
                     }
 
@@ -1990,7 +2001,7 @@ async def schedule_controlled_punch_endpoint(
         "record_type": payload.record_type,
         "location": payload.location or "App",
         "notes": payload.notes,
-        "timestamp": attempted.isoformat(),
+        "timestamp": _local_iso(attempted),
         "latitude": payload.latitude,
         "longitude": payload.longitude,
         "schedule_controlled": _is_intern_profile(user),
@@ -2048,7 +2059,7 @@ async def create_schedule_approval_request_endpoint(
         "user_email": user.get("email", ""),
         "request_type": payload.request_type,
         "status": "pending",
-        "attempted_at": attempted.isoformat(),
+        "attempted_at": _local_iso(attempted),
         "shift_start_at": payload.shift_start_at,
         "day_key": day_key,
         "location": payload.location or "App",
