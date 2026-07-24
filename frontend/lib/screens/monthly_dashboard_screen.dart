@@ -44,7 +44,11 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
   void initState() {
     super.initState();
     final now = DateTime.now();
-    _month = DateTime(now.year, now.month);
+    // O periodo fecha no dia 28. A partir do dia 29 ja estamos no periodo
+    // do mes seguinte.
+    _month = now.day >= 29
+        ? DateTime(now.year, now.month + 1)
+        : DateTime(now.year, now.month);
     _load();
   }
 
@@ -54,8 +58,9 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
       _error = null;
     });
     try {
-      final start = DateTime(_month.year, _month.month, 1);
-      final end = DateTime(_month.year, _month.month + 1, 0, 23, 59, 59);
+      final start = _periodStart;
+      final end = DateTime(
+          _periodEnd.year, _periodEnd.month, _periodEnd.day, 23, 59, 59);
       final data = await _apiService.exportTimesheet(
         startDate: start.toIso8601String(),
         endDate: end.toIso8601String(),
@@ -85,18 +90,22 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
 
   // --- DERIVADOS ---
 
-  int get _daysInMonth => DateTime(_month.year, _month.month + 1, 0).day;
+  /// Periodo da folha: 29 do mes anterior ate 28 do mes de referencia.
+  /// O construtor do DateTime normaliza casos como "29 de fevereiro".
+  DateTime get _periodStart => DateTime(_month.year, _month.month - 1, 29);
+  DateTime get _periodEnd => DateTime(_month.year, _month.month, 28);
+  int get _periodDays => _periodEnd.difference(_periodStart).inDays + 1;
+  DateTime _dateAt(int index) => _periodStart.add(Duration(days: index));
 
-  /// Meta do mes = carga diaria x dias uteis (seg-sex).
+  /// Meta do periodo = carga diaria x dias/semana x 4 semanas.
+  /// Estagiario trabalha 5 dias/semana; demais cargos, 6.
   double get _target {
     final daily =
         double.tryParse('${widget.user['daily_hours'] ?? 8}') ?? 8.0;
-    var business = 0;
-    for (var d = 1; d <= _daysInMonth; d++) {
-      final wd = DateTime(_month.year, _month.month, d).weekday;
-      if (wd <= DateTime.friday) business++;
-    }
-    return daily * business;
+    final role = '${widget.user['role'] ?? ''}'.toLowerCase();
+    final isIntern = role.contains('intern') || role.contains('estag');
+    final daysPerWeek = isIntern ? 5 : 6;
+    return daily * daysPerWeek * 4;
   }
 
   double _num(dynamic v) => v is num ? v.toDouble() : (double.tryParse('$v') ?? 0);
@@ -137,9 +146,8 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
         (a, b) => _num(a['total_hours']) >= _num(b['total_hours']) ? a : b);
   }
 
-  Map<String, dynamic>? _dayFor(int day) {
-    final key = DateFormat('yyyy-MM-dd')
-        .format(DateTime(_month.year, _month.month, day));
+  Map<String, dynamic>? _recordForDate(DateTime date) {
+    final key = DateFormat('yyyy-MM-dd').format(date);
     for (final d in _days) {
       if (d['date'] == key) return d;
     }
@@ -241,23 +249,35 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
   Widget _buildMonthSwitcher() {
     final label = DateFormat('MMMM yyyy', 'pt_BR').format(_month);
     final now = DateTime.now();
-    final isFuture = _month.isAfter(DateTime(now.year, now.month));
+    // Periodo atual: a partir do dia 29 ja conta o mes seguinte.
+    final currentPeriod = now.day >= 29
+        ? DateTime(now.year, now.month + 1)
+        : DateTime(now.year, now.month);
+    final isFuture = !_month.isBefore(currentPeriod);
+    final range =
+        '${DateFormat('dd/MM').format(_periodStart)} – ${DateFormat('dd/MM').format(_periodEnd)}';
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
         IconButton(
           onPressed: () => _shiftMonth(-1),
           icon: const Icon(Icons.chevron_left),
-          tooltip: 'Mês anterior',
+          tooltip: 'Período anterior',
         ),
-        Text(
-          '${label[0].toUpperCase()}${label.substring(1)}',
-          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        Column(
+          children: [
+            Text(
+              '${label[0].toUpperCase()}${label.substring(1)}',
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            Text(range,
+                style: const TextStyle(fontSize: 11, color: Color(0xFF898781))),
+          ],
         ),
         IconButton(
           onPressed: isFuture ? null : () => _shiftMonth(1),
           icon: const Icon(Icons.chevron_right),
-          tooltip: 'Próximo mês',
+          tooltip: 'Próximo período',
         ),
       ],
     );
@@ -342,7 +362,7 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
 
     final tiles = [
       _StatTile('DIAS TRABALHADOS', '${_worked.length}',
-          'de $_daysInMonth dias'),
+          'de $_periodDays dias'),
       _StatTile('MÉDIA POR DIA', _hm(_avgPerDay), 'nos dias com registro'),
       _StatTile('HORAS EXTRAS', _hm(_extras), '50% + 100%'),
       _StatTile('ENTRADA MÉDIA', entrada, 'horário típico'),
@@ -396,8 +416,8 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
   /// Barras empilhadas: uma por dia do mes, decompostas em normal / 50 / 100.
   Widget _buildDailyChart(_VizPalette viz) {
     var maxY = 0.0;
-    for (var d = 1; d <= _daysInMonth; d++) {
-      final rec = _dayFor(d);
+    for (var i = 0; i < _periodDays; i++) {
+      final rec = _recordForDate(_dateAt(i));
       if (rec != null) {
         final t = _num(rec['total_hours']);
         if (t > maxY) maxY = t;
@@ -429,9 +449,8 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
               BarChartData(
                 maxY: maxY,
                 alignment: BarChartAlignment.spaceBetween,
-                barGroups: List.generate(_daysInMonth, (i) {
-                  final day = i + 1;
-                  final rec = _dayFor(day);
+                barGroups: List.generate(_periodDays, (i) {
+                  final rec = _recordForDate(_dateAt(i));
                   final normal = rec == null ? 0.0 : _num(rec['regular_hours']);
                   final x50 = rec == null ? 0.0 : _num(rec['extra_50']);
                   final x100 = rec == null ? 0.0 : _num(rec['extra_100']);
@@ -454,7 +473,7 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
                   push(x100, viz.extra100);
 
                   return BarChartGroupData(
-                    x: day,
+                    x: i,
                     barRods: [
                       BarChartRodData(
                         toY: total > 0 ? total : 0,
@@ -497,11 +516,18 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
                       showTitles: true,
                       reservedSize: 20,
                       getTitlesWidget: (v, meta) {
-                        final d = v.toInt();
-                        if (d != 1 && d % 5 != 0) return const SizedBox.shrink();
+                        final i = v.toInt();
+                        if (i < 0 || i >= _periodDays) {
+                          return const SizedBox.shrink();
+                        }
+                        final day = _dateAt(i).day;
+                        // Rotula o inicio do periodo, viradas de mes e multiplos de 5.
+                        if (i != 0 && day != 1 && day % 5 != 0) {
+                          return const SizedBox.shrink();
+                        }
                         return Padding(
                           padding: const EdgeInsets.only(top: 6),
-                          child: Text('$d',
+                          child: Text('$day',
                               style: TextStyle(color: viz.muted, fontSize: 9)),
                         );
                       },
@@ -517,17 +543,19 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
                         : const Color(0xFF0B0B0B),
                     tooltipRoundedRadius: 8,
                     getTooltipItem: (group, gi, rod, ri) {
-                      final rec = _dayFor(group.x);
+                      final date = _dateAt(group.x);
+                      final dayLabel = DateFormat('dd/MM').format(date);
+                      final rec = _recordForDate(date);
                       if (rec == null || rod.toY <= 0) {
                         return BarTooltipItem(
-                          'Dia ${group.x}\nsem registro',
+                          '$dayLabel\nsem registro',
                           const TextStyle(color: Colors.white, fontSize: 11),
                         );
                       }
                       final n = _num(rec['regular_hours']);
                       final a = _num(rec['extra_50']);
                       final b = _num(rec['extra_100']);
-                      final buf = StringBuffer('Dia ${group.x} · ${_hm(rod.toY)}');
+                      final buf = StringBuffer('$dayLabel · ${_hm(rod.toY)}');
                       buf.write('\nNormal ${_hm(n)}');
                       if (a > 0) buf.write('\nExtra 50% ${_hm(a)}');
                       if (b > 0) buf.write('\nExtra 100% ${_hm(b)}');
@@ -644,7 +672,7 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
           _highlight(
             Icons.event_available,
             'Dias com registro',
-            '${_worked.length} de $_daysInMonth',
+            '${_worked.length} de $_periodDays',
           ),
           _highlight(
             Icons.speed,
