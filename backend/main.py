@@ -1220,19 +1220,24 @@ _BACKUP_EMAIL_INTERVAL = timedelta(days=7)
 _BACKUP_EMAIL_MARKER = os.path.join(_BACKUP_DIR, ".last_email")
 
 def _encrypt_backup(zip_path: str, out_path: str) -> bool:
+    # Fernet (AES) em blob opaco. O Gmail bloqueia zip cifrado (reconhece a
+    # assinatura do arquivo), mas entrega um binario sem formato reconhecivel.
+    # Restaurar: backend/restore_backup.py com a BACKUP_ZIP_PASSWORD.
     try:
-        import pyzipper
+        import base64
+        import hashlib
+        from cryptography.fernet import Fernet
     except Exception as exc:
-        print(f"[backup-email] pyzipper indisponivel: {exc}")
+        print(f"[backup-email] cryptography indisponivel: {exc}")
         return False
     try:
-        with pyzipper.AESZipFile(
-            out_path, "w",
-            compression=pyzipper.ZIP_DEFLATED,
-            encryption=pyzipper.WZ_AES,
-        ) as archive:
-            archive.setpassword(_BACKUP_ZIP_PASSWORD.encode("utf-8"))
-            archive.write(zip_path, os.path.basename(zip_path))
+        key = base64.urlsafe_b64encode(
+            hashlib.sha256(_BACKUP_ZIP_PASSWORD.encode("utf-8")).digest()
+        )
+        with open(zip_path, "rb") as handle:
+            token = Fernet(key).encrypt(handle.read())
+        with open(out_path, "wb") as handle:
+            handle.write(token)
         return True
     except Exception as exc:
         print(f"[backup-email] falha ao cifrar: {exc}")
@@ -1247,7 +1252,7 @@ def _send_backup_email() -> str:
     if not backups:
         return "sem backup para enviar"
     latest = os.path.join(_BACKUP_DIR, backups[-1])
-    enc_path = latest + ".enc.zip"
+    enc_path = latest + ".enc"
     if not _encrypt_backup(latest, enc_path):
         return "falha ao cifrar"
 
@@ -1259,13 +1264,15 @@ def _send_backup_email() -> str:
         msg["From"] = MAIL_FROM
         msg["To"] = _BACKUP_EMAIL
         msg.set_content(
-            "Backup semanal do sistema de ponto em anexo (zip cifrado).\n"
-            "Abra com a senha definida em BACKUP_ZIP_PASSWORD no servidor.\n"
+            "Backup semanal do sistema de ponto em anexo (arquivo .enc cifrado).\n"
+            "Para restaurar: backend/restore_backup.py <arquivo.enc>, informando a\n"
+            "BACKUP_ZIP_PASSWORD do servidor. Gera de volta o .zip com\n"
+            "firestore.json + ponto.db.\n"
             "Contem dados pessoais; guarde com cuidado."
         )
         with open(enc_path, "rb") as handle:
             msg.add_attachment(
-                handle.read(), maintype="application", subtype="zip",
+                handle.read(), maintype="application", subtype="octet-stream",
                 filename=os.path.basename(enc_path),
             )
         with smtplib.SMTP(MAIL_SERVER, MAIL_PORT, timeout=60) as server:
