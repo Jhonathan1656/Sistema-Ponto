@@ -1211,10 +1211,95 @@ def _run_backup(force: bool = False) -> dict:
     return {"status": "ok", "file": name, "bytes": size,
             "upload": upload, "collections": counts}
 
+# Copia off-machine por email (semanal). O Storage exige plano pago; o email
+# reusa o SMTP ja configurado. O anexo vai cifrado (AES) por conter dados
+# pessoais.
+_BACKUP_EMAIL = os.getenv("BACKUP_EMAIL", MAIL_USERNAME)
+_BACKUP_ZIP_PASSWORD = os.getenv("BACKUP_ZIP_PASSWORD", "")
+_BACKUP_EMAIL_INTERVAL = timedelta(days=7)
+_BACKUP_EMAIL_MARKER = os.path.join(_BACKUP_DIR, ".last_email")
+
+def _encrypt_backup(zip_path: str, out_path: str) -> bool:
+    try:
+        import pyzipper
+    except Exception as exc:
+        print(f"[backup-email] pyzipper indisponivel: {exc}")
+        return False
+    try:
+        with pyzipper.AESZipFile(
+            out_path, "w",
+            compression=pyzipper.ZIP_DEFLATED,
+            encryption=pyzipper.WZ_AES,
+        ) as archive:
+            archive.setpassword(_BACKUP_ZIP_PASSWORD.encode("utf-8"))
+            archive.write(zip_path, os.path.basename(zip_path))
+        return True
+    except Exception as exc:
+        print(f"[backup-email] falha ao cifrar: {exc}")
+        return False
+
+def _send_backup_email() -> str:
+    if not _BACKUP_ZIP_PASSWORD:
+        return "sem senha configurada (BACKUP_ZIP_PASSWORD)"
+    if not MAIL_PASSWORD or MAIL_PASSWORD == "mude-me":
+        return "SMTP nao configurado"
+    backups = _local_backups()
+    if not backups:
+        return "sem backup para enviar"
+    latest = os.path.join(_BACKUP_DIR, backups[-1])
+    enc_path = latest + ".enc.zip"
+    if not _encrypt_backup(latest, enc_path):
+        return "falha ao cifrar"
+
+    import smtplib
+    from email.message import EmailMessage
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = f"Backup Ponto VMac - {backups[-1]}"
+        msg["From"] = MAIL_FROM
+        msg["To"] = _BACKUP_EMAIL
+        msg.set_content(
+            "Backup semanal do sistema de ponto em anexo (zip cifrado).\n"
+            "Abra com a senha definida em BACKUP_ZIP_PASSWORD no servidor.\n"
+            "Contem dados pessoais; guarde com cuidado."
+        )
+        with open(enc_path, "rb") as handle:
+            msg.add_attachment(
+                handle.read(), maintype="application", subtype="zip",
+                filename=os.path.basename(enc_path),
+            )
+        with smtplib.SMTP(MAIL_SERVER, MAIL_PORT, timeout=60) as server:
+            server.starttls()
+            server.login(MAIL_USERNAME, MAIL_PASSWORD)
+            server.send_message(msg)
+        return "ok"
+    except Exception as exc:
+        return f"falha no envio: {exc}"
+    finally:
+        try:
+            os.remove(enc_path)
+        except OSError:
+            pass
+
+def _maybe_email_backup() -> None:
+    try:
+        if os.path.exists(_BACKUP_EMAIL_MARKER):
+            last = os.path.getmtime(_BACKUP_EMAIL_MARKER)
+            if datetime.now().timestamp() - last < _BACKUP_EMAIL_INTERVAL.total_seconds():
+                return
+        result = _send_backup_email()
+        print(f"[backup-email] {result}")
+        if result == "ok":
+            with open(_BACKUP_EMAIL_MARKER, "w") as handle:
+                handle.write(datetime.now().isoformat())
+    except Exception as exc:
+        print(f"[backup-email] erro: {exc}")
+
 async def _backup_loop() -> None:
     while True:
         try:
             await asyncio.to_thread(_run_backup)
+            await asyncio.to_thread(_maybe_email_backup)
         except Exception as exc:
             print(f"[backup] loop: {exc}")
         await asyncio.sleep(_BACKUP_CHECK_INTERVAL_SECONDS)
@@ -1234,6 +1319,14 @@ async def run_backup_endpoint(admin=Depends(require_admin_user)):
     if result.get("status") != "ok":
         raise HTTPException(status_code=503, detail=result.get("reason", "falha no backup"))
     return result
+
+@app.post("/admin/backup/email")
+async def email_backup_endpoint(admin=Depends(require_admin_user)):
+    await asyncio.to_thread(_run_backup, True)
+    result = await asyncio.to_thread(_send_backup_email)
+    if result != "ok":
+        raise HTTPException(status_code=503, detail=result)
+    return {"status": "ok", "sent_to": _BACKUP_EMAIL}
 
 @app.get("/admin/backup/list")
 async def list_backups_endpoint(admin=Depends(require_admin_user)):

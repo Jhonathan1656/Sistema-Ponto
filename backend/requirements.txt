@@ -10,4 +10,5 @@ openpyxl==3.1.2
 python-dotenv==1.0.0
 firebase-admin==6.5.0
 fastapi-mail
+pyzipper==0.3.6
 httpx==0.28.1
