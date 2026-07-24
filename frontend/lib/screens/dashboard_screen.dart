@@ -290,8 +290,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 ),
               ],
             ),
-            child: const Icon(Icons.auto_graph_rounded,
-                color: wineColor, size: 20),
+            // Variante base do icone: as variantes rounded/sharp nem sempre
+            // tem glifo na MaterialIcons empacotada e saem em branco.
+            child: const Center(
+              child: Icon(Icons.auto_graph, color: wineColor, size: 22),
+            ),
           ),
         ),
       ),
