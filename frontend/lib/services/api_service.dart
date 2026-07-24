@@ -693,6 +693,13 @@ class ApiService {
     );
   }
 
+  /// Descarta a fila offline local. Escape para registros que nunca
+  /// sincronizam (ex.: entrada de estagiario fora da janela) e ficam
+  /// reaparecendo a cada leitura.
+  Future<void> clearOfflineRecords() async {
+    await _replaceOfflineRecords([]);
+  }
+
   Future<int> syncOfflineRecords() async {
     final pendingRecords = await getOfflineRecords();
     if (pendingRecords.isEmpty) return 0;

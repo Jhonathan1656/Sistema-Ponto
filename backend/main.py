@@ -1,4 +1,5 @@
 import os
+import asyncio
 import random
 import shutil
 import tempfile
@@ -1006,6 +1007,100 @@ def create_signed_notification_if_needed(document: dict, previous_status: str, c
         f"{document.get('user_name', 'O colaborador')} assinou \"{document.get('title', 'o documento')}\".",
         document.get("id", ""),
     )
+
+# --- JOB: fechamento automatico de pausa (paridade com a regra do app) ---
+# Garante o fechamento mesmo com o app/site fechado, o que a regra do cliente
+# (que so roda com a tela aberta) nao cobre.
+
+_AUTO_CLOSE_TZ = "America/Sao_Paulo"
+_AUTO_CLOSE_INTERVAL_SECONDS = 300        # varre a cada 5 min
+_AUTO_CLOSE_AFTER = timedelta(hours=3)    # pausa aberta ha 3h
+_AUTO_CLOSE_DURATION = timedelta(hours=1)  # fecha 1h apos o inicio
+_AUTO_CLOSE_MAX_AGE = timedelta(days=2)   # ignora pausas antigas demais
+
+def _to_local_naive(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return _parse_schedule_datetime(value, _AUTO_CLOSE_TZ).replace(tzinfo=None)
+    except Exception:
+        return None
+
+def _run_auto_close_breaks() -> None:
+    try:
+        db = get_firestore_admin()
+    except Exception:
+        return  # Firestore indisponivel; tenta na proxima rodada
+
+    now = datetime.now(ZoneInfo(_AUTO_CLOSE_TZ)).replace(tzinfo=None)
+    try:
+        users = list(db.collection("users").stream())
+    except Exception as exc:
+        print(f"[auto-close] falha ao listar usuarios: {exc}")
+        return
+
+    for user in users:
+        uid = user.id
+        try:
+            records = _user_records_sorted(db, uid)
+        except Exception:
+            continue
+        if not records:
+            continue
+        last = records[-1]
+        ltype = last.get("record_type")
+        if ltype not in ("break_start", "entry_3"):
+            continue
+        start = _to_local_naive(last.get("timestamp"))
+        if start is None:
+            continue
+        age = now - start
+        if age < _AUTO_CLOSE_AFTER or age > _AUTO_CLOSE_MAX_AGE:
+            continue
+
+        close_type = "break_end" if ltype == "break_start" else "exit_3"
+        close_at = start + _AUTO_CLOSE_DURATION
+        # ID deterministico: rodar de novo grava o mesmo doc (idempotente).
+        doc_id = f"autoclose_{last.get('id')}"
+        try:
+            # Rechecagem curta contra corrida com o fechamento do cliente.
+            fresh = _user_records_sorted(db, uid)
+            if not fresh or fresh[-1].get("id") != last.get("id"):
+                continue
+            db.collection("time_records").document(doc_id).set({
+                "user_id": uid,
+                "record_type": close_type,
+                "timestamp": _local_iso(close_at),
+                "location": "Sistema (Auto)",
+                "notes": "Retorno automatico (pausa excedeu 3h; ajustado para 1h) [servidor]",
+                "auto_closed": True,
+                "created_at": firestore.SERVER_TIMESTAMP,
+            })
+            _create_user_notification(
+                db, uid, "Pausa encerrada",
+                "Sua pausa excedeu 3h e foi fechada automaticamente com 1 hora de pausa.",
+                "break_auto_closed", "",
+            )
+            _send_user_push(
+                uid, "Pausa encerrada",
+                "Sua pausa excedeu 3h e foi fechada automaticamente.",
+                {"type": "break_auto_closed"},
+            )
+            print(f"[auto-close] pausa fechada para {uid} (inicio {last.get('timestamp')})")
+        except Exception as exc:
+            print(f"[auto-close] falha ao fechar pausa de {uid}: {exc}")
+
+async def _auto_close_breaks_loop() -> None:
+    while True:
+        await asyncio.sleep(_AUTO_CLOSE_INTERVAL_SECONDS)
+        try:
+            await asyncio.to_thread(_run_auto_close_breaks)
+        except Exception as exc:
+            print(f"[auto-close] loop: {exc}")
+
+@app.on_event("startup")
+async def _start_background_jobs() -> None:
+    asyncio.create_task(_auto_close_breaks_loop())
 
 @app.on_event("startup")
 def initialize_local_tables():

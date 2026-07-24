@@ -29,6 +29,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Map<String, dynamic>? _user;
   bool _isAutoClosingBreak = false;
   bool _isSyncingOffline = false;
+  bool _punchInFlight = false;
   int _pendingOfflineRecordsCount = 0;
   DateTime? _lastOfflineSyncAttempt;
   String? _lastInternReminderDate;
@@ -389,6 +390,10 @@ class _HomeScreenState extends State<HomeScreen> {
     String? notes,
     String? location,
   }) async {
+    // Trava de reentrada: evita duplo-registro por toque duplo no botao.
+    if (_punchInFlight) return;
+    setState(() => _punchInFlight = true);
+
     if (type == 'check_in' &&
         _todayRecords.any((r) => r['record_type'] == 'check_out')) {
       final confirm = await showDialog<bool>(
@@ -411,7 +416,10 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
         ),
       );
-      if (confirm != true) return;
+      if (confirm != true) {
+        setState(() => _punchInFlight = false);
+        return;
+      }
     }
 
     setState(() => _isLoading = true);
@@ -479,7 +487,12 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (e) {
       _showError('Erro ao registrar: $e');
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _punchInFlight = false;
+        });
+      }
     }
   }
 
@@ -846,6 +859,35 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Future<void> _confirmDiscardOffline() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Descartar pendências?'),
+        content: Text(
+            'Isso apaga os $_pendingOfflineRecordsCount registro(s) que ainda '
+            'não sincronizaram. Use apenas se eles estiverem presos ou forem '
+            'inválidos — os pontos descartados não serão enviados.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar', style: TextStyle(color: Colors.grey)),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Descartar', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+    await _apiService.clearOfflineRecords();
+    if (!mounted) return;
+    setState(() => _pendingOfflineRecordsCount = 0);
+    _showSuccess('Pendências offline descartadas.');
+  }
+
   Widget _buildOfflineSyncBanner(ThemeData theme) {
     return Container(
       width: double.infinity,
@@ -874,6 +916,12 @@ class _HomeScreenState extends State<HomeScreen> {
                 ? null
                 : () => _trySyncOfflineRecords(showMessage: true),
             child: const Text('Sincronizar'),
+          ),
+          IconButton(
+            onPressed: _isSyncingOffline ? null : _confirmDiscardOffline,
+            icon: const Icon(Icons.delete_outline, size: 20),
+            color: Colors.orange,
+            tooltip: 'Descartar pendências',
           ),
         ],
       ),
@@ -1024,7 +1072,8 @@ class _HomeScreenState extends State<HomeScreen> {
             width: double.infinity,
             height: 50,
             child: ElevatedButton(
-              onPressed: () => _registerPunch(breakAction!),
+              onPressed:
+                  _punchInFlight ? null : () => _registerPunch(breakAction!),
               style: ElevatedButton.styleFrom(
                   backgroundColor: wineColor,
                   foregroundColor: Colors.white,
@@ -1055,7 +1104,8 @@ class _HomeScreenState extends State<HomeScreen> {
         width: double.infinity,
         height: 44,
         child: OutlinedButton(
-          onPressed: () => _registerPunch('check_out'),
+          onPressed:
+              _punchInFlight ? null : () => _registerPunch('check_out'),
           style: buttonStyle,
           child: const Text(
             'FINALIZAR EXPEDIENTE',
@@ -1071,7 +1121,8 @@ class _HomeScreenState extends State<HomeScreen> {
         children: [
           Expanded(
             child: OutlinedButton(
-              onPressed: () => _registerPunch('check_out'),
+              onPressed:
+              _punchInFlight ? null : () => _registerPunch('check_out'),
               style: buttonStyle.copyWith(
                 shape: WidgetStateProperty.all(
                   const RoundedRectangleBorder(
