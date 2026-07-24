@@ -362,7 +362,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     final last = _todayRecords.last;
     final time =
-        DateFormat('HH:mm:ss').format(DateTime.parse(last['timestamp']));
+        DateFormat('HH:mm:ss').format(DateTime.parse(last['timestamp']).toLocal());
     _lastActionTime = "desde $time";
 
     switch (last['record_type']) {
@@ -582,7 +582,7 @@ class _HomeScreenState extends State<HomeScreen> {
       (record) => record['record_type'] == 'check_in',
     );
     if (lastCheckInIndex >= 0) {
-      return DateTime.parse(_todayRecords[lastCheckInIndex]['timestamp']);
+      return DateTime.parse(_todayRecords[lastCheckInIndex]['timestamp']).toLocal();
     }
     // Turno que comecou em um dia anterior e nunca foi fechado.
     return _carriedOpenShiftStart;
@@ -1142,7 +1142,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildHistoryItem(dynamic record, ThemeData theme, bool isDark) {
     final time =
-        DateFormat('HH:mm:ss').format(DateTime.parse(record['timestamp']));
+        DateFormat('HH:mm:ss').format(DateTime.parse(record['timestamp']).toLocal());
     final type = record['record_type'];
     final isOffline = record['offline'] == true;
 

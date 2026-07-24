@@ -1151,7 +1151,7 @@ class ApiService {
       // Marcos do dia. Pausa 1 (break_*) = almoco; Pausa 2 (entry_3/exit_3) = jantar.
       DateTime? inicio, fim, almI, almF, janI, janF;
       for (final r in dayRecords) {
-        final ts = _roundTime(DateTime.parse(r['timestamp'] as String));
+        final ts = _roundTime(DateTime.parse(r['timestamp'] as String).toLocal());
         switch (r['record_type']) {
           case 'check_in':
             inicio ??= ts;

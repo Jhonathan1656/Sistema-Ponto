@@ -149,8 +149,10 @@ class _HistoryScreenState extends State<HistoryScreen> {
       separatorBuilder: (_, __) => const SizedBox(height: 12),
       itemBuilder: (context, index) {
         final r = _records[index];
-        final time = DateFormat('HH:mm:ss').format(DateTime.parse(r['timestamp']));
-        final date = DateFormat('dd/MM/yyyy').format(DateTime.parse(r['timestamp']));
+        final time =
+            DateFormat('HH:mm:ss').format(DateTime.parse(r['timestamp']).toLocal());
+        final date =
+            DateFormat('dd/MM/yyyy').format(DateTime.parse(r['timestamp']).toLocal());
         
         return Container(
           padding: const EdgeInsets.all(16),

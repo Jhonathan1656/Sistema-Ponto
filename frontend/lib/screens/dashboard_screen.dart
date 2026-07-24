@@ -128,7 +128,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     DateTime? lastBreakStart;
 
     for (var r in rawRecords) {
-      final DateTime ts = DateTime.parse(r['timestamp']);
+      final DateTime ts = DateTime.parse(r['timestamp']).toLocal();
       final int h = ts.hour;
       if (h >= 24) continue;
 

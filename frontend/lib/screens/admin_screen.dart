@@ -904,7 +904,7 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
     final lastRecord = records.isNotEmpty ? records.last : null;
     final lastType = lastRecord?['record_type']?.toString();
     final lastTime =
-        lastRecord != null ? DateTime.parse(lastRecord['timestamp']) : null;
+        lastRecord != null ? DateTime.parse(lastRecord['timestamp']).toLocal() : null;
 
     String statusKey = 'none';
     String statusLabel = 'Sem ponto hoje';

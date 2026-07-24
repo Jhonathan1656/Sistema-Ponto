@@ -100,7 +100,7 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
   }
 
   Future<void> _showEditRecordDialog(Map<String, dynamic> record) async {
-    DateTime selectedDateTime = DateTime.parse(record['timestamp']);
+    DateTime selectedDateTime = DateTime.parse(record['timestamp']).toLocal();
     final notesController =
         TextEditingController(text: record['notes']?.toString() ?? '');
     final reasonController = TextEditingController();
@@ -402,7 +402,7 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
       itemBuilder: (context, index) {
         final r = _records[index];
         final record = Map<String, dynamic>.from(r as Map);
-        final time = DateTime.parse(r['timestamp']);
+        final time = DateTime.parse(r['timestamp']).toLocal();
         final userName = _recordUserName(record);
         final isEditedByAdmin = r['edited_by_admin'] == true;
         final notes =
