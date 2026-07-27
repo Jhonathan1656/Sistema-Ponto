@@ -1014,10 +1014,13 @@ def create_signed_notification_if_needed(document: dict, previous_status: str, c
 # (que so roda com a tela aberta) nao cobre.
 
 _AUTO_CLOSE_TZ = "America/Sao_Paulo"
-_AUTO_CLOSE_INTERVAL_SECONDS = 300        # varre a cada 5 min
+_AUTO_CLOSE_INTERVAL_SECONDS = 900        # varre a cada 15 min
 _AUTO_CLOSE_AFTER = timedelta(hours=3)    # pausa aberta ha 3h
 _AUTO_CLOSE_DURATION = timedelta(hours=1)  # fecha 1h apos o inicio
 _AUTO_CLOSE_MAX_AGE = timedelta(days=2)   # ignora pausas antigas demais
+# So le registros recentes: no plano Spark ler o historico inteiro a cada
+# rodada estoura a cota diaria de leituras (foi o que derrubou a auth).
+_AUTO_CLOSE_WINDOW = timedelta(hours=10)
 
 def _to_local_naive(value: Optional[str]) -> Optional[datetime]:
     if not value:
@@ -1034,20 +1037,30 @@ def _run_auto_close_breaks() -> None:
         return  # Firestore indisponivel; tenta na proxima rodada
 
     now = datetime.now(ZoneInfo(_AUTO_CLOSE_TZ)).replace(tzinfo=None)
+    window_start = (now - _AUTO_CLOSE_WINDOW).isoformat()
     try:
-        users = list(db.collection("users").stream())
+        # Consulta de campo unico (indice automatico, sem indice composto):
+        # so os registros recentes de todos os usuarios de uma vez.
+        recent = list(
+            db.collection("time_records")
+            .where("timestamp", ">=", window_start)
+            .stream()
+        )
     except Exception as exc:
-        print(f"[auto-close] falha ao listar usuarios: {exc}")
+        print(f"[auto-close] falha na consulta: {exc}")
         return
 
-    for user in users:
-        uid = user.id
-        try:
-            records = _user_records_sorted(db, uid)
-        except Exception:
-            continue
-        if not records:
-            continue
+    by_user: Dict[str, List[dict]] = {}
+    for doc in recent:
+        data = doc.to_dict() or {}
+        uid = data.get("user_id")
+        if uid:
+            by_user.setdefault(uid, []).append({"id": doc.id, **data})
+
+    for uid, records in by_user.items():
+        records.sort(key=lambda item: str(item.get("timestamp") or ""))
+        # O ultimo registro na janela e o ultimo do usuario (a janela e o
+        # trecho mais recente); se o cliente ja fechou, aparece aqui.
         last = records[-1]
         ltype = last.get("record_type")
         if ltype not in ("break_start", "entry_3"):
@@ -1064,10 +1077,6 @@ def _run_auto_close_breaks() -> None:
         # ID deterministico: rodar de novo grava o mesmo doc (idempotente).
         doc_id = f"autoclose_{last.get('id')}"
         try:
-            # Rechecagem curta contra corrida com o fechamento do cliente.
-            fresh = _user_records_sorted(db, uid)
-            if not fresh or fresh[-1].get("id") != last.get("id"):
-                continue
             db.collection("time_records").document(doc_id).set({
                 "user_id": uid,
                 "record_type": close_type,
