@@ -1043,16 +1043,38 @@ class ApiService {
     final targetUid = userId ?? currentUserId;
     var records = <Map<String, dynamic>>[];
 
+    // Consulta com filtro de data no Firestore: le so a janela pedida, nao o
+    // historico inteiro. Reduz drasticamente as leituras (chave para caber na
+    // cota). Exige indice composto user_id + timestamp (firestore.indexes.json).
+    Query<Map<String, dynamic>> query =
+        _db.collection('time_records').where('user_id', isEqualTo: targetUid);
+    if (startDate != null) {
+      query = query.where('timestamp', isGreaterThanOrEqualTo: startDate);
+    }
+    if (endDate != null) {
+      query = query.where('timestamp', isLessThanOrEqualTo: endDate);
+    }
+
     try {
-      final snapshot = await _db
-          .collection('time_records')
-          .where('user_id', isEqualTo: targetUid)
-          .get()
-          .timeout(const Duration(seconds: 10));
+      final snapshot = await query.get().timeout(const Duration(seconds: 10));
       records =
           snapshot.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
     } catch (e) {
-      debugPrint('Pontos online indisponiveis, usando registros offline: $e');
+      // Sem o indice composto (FAILED_PRECONDITION) ou outra falha: cai para a
+      // consulta simples por usuario. Le mais, mas nao quebra; o filtro de data
+      // em memoria abaixo garante o mesmo resultado.
+      debugPrint('Consulta por data indisponivel, usando fallback: $e');
+      try {
+        final snapshot = await _db
+            .collection('time_records')
+            .where('user_id', isEqualTo: targetUid)
+            .get()
+            .timeout(const Duration(seconds: 10));
+        records =
+            snapshot.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
+      } catch (e2) {
+        debugPrint('Pontos online indisponiveis, usando registros offline: $e2');
+      }
     }
 
     if (targetUid == currentUserId) {
@@ -1691,9 +1713,14 @@ class ApiService {
     final state = await _getEffectiveWorkScheduleFromFirestore();
     final schedule = Map<String, dynamic>.from(state['schedule'] as Map);
     var attempted = DateTime.tryParse(timestamp ?? '') ?? DateTime.now();
-    final records = (await getTimeRecords(userId: user['id']))
-        .map((item) => Map<String, dynamic>.from(item as Map))
-        .toList()
+    // Turno aberto ha mais de 14 dias e dado quebrado; limitar a janela evita
+    // ler o historico inteiro so para detectar o turno em aberto.
+    final scanFrom =
+        DateTime.now().subtract(const Duration(days: 14)).toIso8601String();
+    final records =
+        (await getTimeRecords(userId: user['id'], startDate: scanFrom))
+            .map((item) => Map<String, dynamic>.from(item as Map))
+            .toList()
       ..sort((a, b) =>
           a['timestamp'].toString().compareTo(b['timestamp'].toString()));
     Map<String, dynamic>? openShift;
@@ -1858,9 +1885,12 @@ class ApiService {
     final batch = _db.batch();
     String? linkedRecordId;
     if (approve && request['request_type'] == 'start_exception') {
-      final records = (await getTimeRecords(userId: request['user_id']))
-          .map((item) => Map<String, dynamic>.from(item as Map))
-          .toList()
+      final scanFrom =
+          DateTime.now().subtract(const Duration(days: 14)).toIso8601String();
+      final records =
+          (await getTimeRecords(userId: request['user_id'], startDate: scanFrom))
+              .map((item) => Map<String, dynamic>.from(item as Map))
+              .toList()
         ..sort((a, b) =>
             a['timestamp'].toString().compareTo(b['timestamp'].toString()));
       bool open = false;

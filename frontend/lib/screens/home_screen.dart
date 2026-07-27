@@ -84,14 +84,17 @@ class _HomeScreenState extends State<HomeScreen> {
       _checkAutoActions(now);
       if (_user != null &&
           (_lastOfflineSyncAttempt == null ||
-              now.difference(_lastOfflineSyncAttempt!).inSeconds >= 30)) {
+              now.difference(_lastOfflineSyncAttempt!).inSeconds >= 60)) {
         _lastOfflineSyncAttempt = now;
         unawaited(_trySyncOfflineRecords());
       }
+      // Refresh de fundo espacado (90s): cada refresh le pontos do Firestore.
+      // A meta de 30s deixava as leituras muito altas para a cota gratuita.
+      // Bater ponto ja recarrega na hora; o pull-to-refresh tambem.
       if (_isInternUser &&
           !_refreshingSchedule &&
           (_lastScheduleRefresh == null ||
-              now.difference(_lastScheduleRefresh!).inSeconds >= 15)) {
+              now.difference(_lastScheduleRefresh!).inSeconds >= 90)) {
         _lastScheduleRefresh = now;
         unawaited(_refreshWorkSchedule(refreshRecords: true));
       }
