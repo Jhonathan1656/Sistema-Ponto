@@ -6,7 +6,9 @@ services:
     env_file:
       - ./backend/.env
     environment:
-      - SECRET_KEY=sua-chave-secreta-super-segura-mude-isso
+      # SECRET_KEY fica so no backend/.env: o que esta aqui em "environment"
+      # vence o env_file, e o valor de exemplo fazia o backend sortear uma
+      # chave nova a cada restart (derrubando os cookies de acesso).
       - DATABASE_URL=sqlite:////app/data/ponto.db
       - DATABASE_PATH=/app/data/ponto.db
     volumes:
