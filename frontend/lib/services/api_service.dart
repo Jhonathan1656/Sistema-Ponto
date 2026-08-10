@@ -13,6 +13,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_config.dart';
+import 'session_service.dart';
 import '../utils/chat_timestamp.dart';
 import '../utils/work_schedule_rules.dart';
 
@@ -191,6 +192,7 @@ class ApiService {
       'created_at': FieldValue.serverTimestamp(),
     });
     await batch.commit();
+    invalidateUsersCache();
     return {'status': 'success', 'id': userId, 'compatibility_mode': true};
   }
 
@@ -559,6 +561,7 @@ class ApiService {
       };
       await _cacheCurrentUser(
           Map<String, dynamic>.from(response['user'] as Map));
+      await SessionService.saveCredentials(email, password);
       return response;
     } on FirebaseAuthException catch (e) {
       // Mapeamento de erros amigáveis para o usuário
@@ -614,8 +617,10 @@ class ApiService {
         'created_at': FieldValue.serverTimestamp(),
       };
       await _db.collection('users').doc(result.user!.uid).set(userData);
+      invalidateUsersCache();
       final user = {'id': result.user!.uid, ...userData};
       await _cacheCurrentUser(user);
+      await SessionService.saveCredentials(email, password);
       return user;
     } on FirebaseAuthException catch (e) {
       throw Exception('Registro falhou: ${e.message}');
@@ -657,6 +662,9 @@ class ApiService {
   Future<void> clearToken() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_cachedUserKey);
+    // Precisa vir antes do signOut: e o unico ponto que encerra a sessao
+    // permanente, senao o app se relogaria sozinho na proxima abertura.
+    await SessionService.clearCredentials();
     await _auth.signOut();
   }
 
@@ -952,6 +960,13 @@ class ApiService {
       if (userId != null && userId != currentUserId) 'created_by_admin': true,
     };
 
+    // Id gerado localmente ANTES de escrever. O timeout abaixo nao cancela a
+    // escrita: o SDK do Firestore continua tentando em background. Se a fila
+    // offline usasse outro id, o mesmo toque viraria dois registros iguais
+    // (era a origem das pausas duplicadas no mesmo segundo). Com id fixo, a
+    // sincronizacao offline regrava o mesmo documento.
+    final docRef = _db.collection('time_records').doc();
+
     try {
       if (currentUser == null) {
         throw Exception('Sem sessao online.');
@@ -960,7 +975,7 @@ class ApiService {
         throw Exception('Sem conexao de rede.');
       }
 
-      final docRef = await _db.collection('time_records').add({
+      await docRef.set({
         ...recordData,
         'created_at': FieldValue.serverTimestamp(),
       }).timeout(const Duration(seconds: 10));
@@ -969,7 +984,7 @@ class ApiService {
       if (userId != null && userId != currentUserId) rethrow;
 
       final offlineRecord = {
-        'id': 'offline_${now.microsecondsSinceEpoch}',
+        'id': docRef.id,
         ...recordData,
         'offline': true,
         'sync_status': 'pending',
@@ -1078,9 +1093,13 @@ class ApiService {
     }
 
     if (targetUid == currentUserId) {
+      // Um registro da fila offline pode ja ter chegado ao servidor (a escrita
+      // continua em background depois do timeout). Como ambos usam o mesmo id,
+      // ignorar os que ja vieram do Firestore evita mostrar o ponto em dobro.
+      final knownIds = records.map((record) => record['id']).toSet();
       final offlineRecords = await getOfflineRecords();
-      records.addAll(
-          offlineRecords.where((record) => record['user_id'] == targetUid));
+      records.addAll(offlineRecords.where((record) =>
+          record['user_id'] == targetUid && !knownIds.contains(record['id'])));
     }
 
     records.sort((a, b) =>
@@ -1279,11 +1298,36 @@ class ApiService {
 
   // --- MÉTODOS DE ADMIN ---
 
-  Future<List<dynamic>> getUsers() async {
+  // Cache do quadro de pessoal. A lista muda algumas vezes por mes, mas era
+  // relida inteira em toda abertura de tela de gestao (resumo, registros,
+  // documentos, dash). Estatico de proposito: cada tela cria seu ApiService.
+  static List<dynamic>? _cachedUsers;
+  static DateTime? _cachedUsersAt;
+  static const Duration _usersCacheTtl = Duration(minutes: 5);
+
+  /// Descarta o cache do quadro de pessoal. Chamado apos criar, editar ou
+  /// remover usuario, para a proxima leitura vir do servidor.
+  static void invalidateUsersCache() {
+    _cachedUsers = null;
+    _cachedUsersAt = null;
+  }
+
+  Future<List<dynamic>> getUsers({bool forceRefresh = false}) async {
+    final cached = _cachedUsers;
+    final cachedAt = _cachedUsersAt;
+    if (!forceRefresh &&
+        cached != null &&
+        cachedAt != null &&
+        DateTime.now().difference(cachedAt) < _usersCacheTtl) {
+      return cached;
+    }
     QuerySnapshot snapshot = await _db.collection('users').get();
-    return snapshot.docs
+    final users = snapshot.docs
         .map((doc) => {'id': doc.id, ...doc.data() as Map<String, dynamic>})
         .toList();
+    _cachedUsers = users;
+    _cachedUsersAt = DateTime.now();
+    return users;
   }
 
   Future<Map<String, dynamic>> updateUserAdmin(
@@ -1338,6 +1382,7 @@ class ApiService {
       }
       throw Exception(_apiError(response));
     }
+    invalidateUsersCache();
     return Map<String, dynamic>.from(
         jsonDecode(utf8.decode(response.bodyBytes)) as Map);
   }
@@ -1353,9 +1398,11 @@ class ApiService {
       if (response.statusCode == 404 || response.statusCode >= 500) {
         final user = _auth.currentUser;
         if (user == null) return [];
+        // So as nao lidas: e o unico que o sininho exibe, e a colecao so cresce.
         final snapshot = await _db
             .collection('user_notifications')
             .where('user_id', isEqualTo: user.uid)
+            .where('is_read', isEqualTo: false)
             .get();
         final notifications = snapshot.docs
             .map((doc) => {'id': doc.id, ...doc.data()})
@@ -1383,18 +1430,19 @@ class ApiService {
       if (response.statusCode == 404 || response.statusCode >= 500) {
         final user = _auth.currentUser;
         if (user == null) return;
+        // Le so o que precisa mudar, em vez da caixa inteira do usuario.
         final snapshot = await _db
             .collection('user_notifications')
             .where('user_id', isEqualTo: user.uid)
+            .where('is_read', isEqualTo: false)
             .get();
+        if (snapshot.docs.isEmpty) return;
         final batch = _db.batch();
         for (final doc in snapshot.docs) {
-          if (doc.data()['is_read'] != true) {
-            batch.update(doc.reference, {
-              'is_read': true,
-              'read_at': FieldValue.serverTimestamp(),
-            });
-          }
+          batch.update(doc.reference, {
+            'is_read': true,
+            'read_at': FieldValue.serverTimestamp(),
+          });
         }
         await batch.commit();
         return;
@@ -1700,6 +1748,18 @@ class ApiService {
     };
   }
 
+  /// Um registro ja gravado corresponde a esta mesma tentativa de batida?
+  /// Usado so no fallback pos-falha do backend, para diferenciar "o ponto ja
+  /// entrou" (mesmo minuto) de um conflito real de turno.
+  static const Duration _sameAttemptWindow = Duration(minutes: 5);
+
+  bool _matchesAttempt(Map<String, dynamic>? record, DateTime attempted) {
+    if (record == null) return false;
+    final moment = DateTime.tryParse(record['timestamp']?.toString() ?? '');
+    if (moment == null) return false;
+    return moment.difference(attempted).abs() <= _sameAttemptWindow;
+  }
+
   Future<Map<String, dynamic>> _createScheduleControlledPunchInFirestore({
     required String recordType,
     String? timestamp,
@@ -1724,15 +1784,24 @@ class ApiService {
       ..sort((a, b) =>
           a['timestamp'].toString().compareTo(b['timestamp'].toString()));
     Map<String, dynamic>? openShift;
+    Map<String, dynamic>? lastCheckOut;
     for (final record in records) {
       if (record['record_type'] == 'check_in') {
         openShift = record;
       } else if (record['record_type'] == 'check_out') {
         openShift = null;
+        lastCheckOut = record;
       }
     }
 
     if (recordType == 'check_in') {
+      // Este caminho so roda quando o backend falhou (timeout/5xx). A batida
+      // pode ter sido gravada la antes da falha: se o turno recem-aberto e o
+      // desta tentativa, o ponto ja existe e repetir seria duplicar. Devolver
+      // sucesso evita o erro na tela de um registro que na verdade entrou.
+      if (_matchesAttempt(openShift, attempted)) {
+        return {'status': 'created', 'duplicate': true, ...openShift!};
+      }
       if (openShift != null) throw Exception('Ja existe um turno aberto.');
       if (!isInternStartWithinSchedule(attempted, schedule)) {
         return {
@@ -1746,6 +1815,12 @@ class ApiService {
         };
       }
     } else if (recordType == 'check_out') {
+      // Mesma protecao da entrada: a saida pode ter sido gravada pelo backend
+      // antes do erro de rede. Se o ultimo check_out e desta tentativa, o turno
+      // ja foi encerrado com sucesso.
+      if (openShift == null && _matchesAttempt(lastCheckOut, attempted)) {
+        return {'status': 'created', 'duplicate': true, ...lastCheckOut!};
+      }
       if (openShift == null) throw Exception('Nao existe turno aberto.');
       final shiftStart = DateTime.parse(openShift['timestamp'].toString());
       final scheduledEnd = _scheduleTime(shiftStart, schedule['shift_end']);
@@ -1814,9 +1889,12 @@ class ApiService {
         .get();
     for (final doc in snapshot.docs) {
       final data = doc.data();
+      // Inclui 'approved': um pedido ja liberado no mesmo dia torna o novo
+      // desnecessario. Sem isso, um retry criava um pedido irmao que ficava
+      // pendente pra sempre na tela do gestor.
       if (data['request_type'] == requestType &&
           data['day_key'] == dayKey &&
-          data['status'] == 'pending') {
+          (data['status'] == 'pending' || data['status'] == 'approved')) {
         return {
           'status': 'existing',
           'request': {'id': doc.id, ...data}
@@ -1851,11 +1929,16 @@ class ApiService {
 
   Future<List<Map<String, dynamic>>> _getScheduleApprovalRequestsFromFirestore(
       {String? status}) async {
-    final snapshot =
-        await _db.collection('work_schedule_approval_requests').get();
+    // Filtra no Firestore, nao em memoria: esta consulta roda em loop na tela
+    // de liberacoes e no sininho.
+    Query<Map<String, dynamic>> query =
+        _db.collection('work_schedule_approval_requests');
+    if (status != null) {
+      query = query.where('status', isEqualTo: status);
+    }
+    final snapshot = await query.get();
     final requests = snapshot.docs
         .map((doc) => {'id': doc.id, ...doc.data()})
-        .where((item) => status == null || item['status'] == status)
         .toList()
       ..sort(
           (a, b) => _firestoreCreatedAt(b).compareTo(_firestoreCreatedAt(a)));
@@ -1878,7 +1961,11 @@ class ApiService {
       throw Exception('Solicitacao nao encontrada.');
     }
     final request = snapshot.data()!;
-    if (request['status'] != 'pending') {
+    final currentStatus = request['status']?.toString();
+    // Decisao ja aplicada (ex.: o backend concluiu e so a resposta se perdeu):
+    // repetir a mesma decisao e sucesso, nao erro.
+    if (currentStatus == (approve ? 'approved' : 'rejected')) return;
+    if (currentStatus != 'pending') {
       throw Exception('Esta solicitacao ja foi decidida.');
     }
 
@@ -1893,31 +1980,60 @@ class ApiService {
               .toList()
         ..sort((a, b) =>
             a['timestamp'].toString().compareTo(b['timestamp'].toString()));
-      bool open = false;
+      Map<String, dynamic>? openShift;
       for (final record in records) {
-        if (record['record_type'] == 'check_in') open = true;
-        if (record['record_type'] == 'check_out') open = false;
+        if (record['record_type'] == 'check_in') openShift = record;
+        if (record['record_type'] == 'check_out') openShift = null;
       }
-      if (open) throw Exception('O usuario ja possui um turno aberto.');
-      final recordRef = _db.collection('time_records').doc();
-      linkedRecordId = recordRef.id;
-      batch.set(recordRef, {
-        'user_id': request['user_id'],
-        'record_type': 'check_in',
-        'location': request['location'] ?? 'App (aprovado)',
-        'notes':
-            request['notes'] ?? 'Entrada fora do horario aprovada pelo gestor',
-        'timestamp': request['attempted_at'],
-        'latitude': request['latitude'],
-        'longitude': request['longitude'],
-        'schedule_controlled': true,
-        'schedule_approval_request_id': requestId,
-        'approved_by_id': manager['id'],
-        'approved_by_name': manager['name'] ?? manager['email'],
-        'schedule_snapshot': request['schedule_snapshot'],
-        'compatibility_mode': true,
-        'created_at': FieldValue.serverTimestamp(),
-      });
+      // Procura pelo vinculo, nao pelo turno aberto: o ponto pode ter sido
+      // gravado por uma tentativa anterior e o turno ja ter sido encerrado.
+      // Vale tambem o ponto vindo de OUTRO pedido do mesmo dia (pedidos
+      // duplicados): a entrada do dia ja existe, este pedido e redundante.
+      final dayKey = request['day_key']?.toString();
+      Map<String, dynamic>? existing;
+      for (final record in records) {
+        if (record['record_type'] != 'check_in') continue;
+        final linked = record['schedule_approval_request_id'];
+        if (linked == null) continue;
+        final sameDay =
+            record['timestamp']?.toString().startsWith(dayKey ?? ' ') ==
+                true;
+        if (linked == requestId || sameDay) {
+          existing = record;
+          break;
+        }
+      }
+      if (existing != null) {
+        // A tentativa anterior gravou o ponto mas nao concluiu a decisao (por
+        // isso o pedido continuou pendente na lista). Reaproveita o ponto que
+        // ja existe; criar outro duplicaria a entrada.
+        linkedRecordId = existing['id']?.toString();
+      } else if (openShift != null) {
+        throw Exception('O usuario ja possui um turno aberto.');
+      } else {
+        // Id deterministico: reenviar a liberacao regrava o mesmo documento em
+        // vez de criar um segundo check_in.
+        final recordRef =
+            _db.collection('time_records').doc('approval_$requestId');
+        linkedRecordId = recordRef.id;
+        batch.set(recordRef, {
+          'user_id': request['user_id'],
+          'record_type': 'check_in',
+          'location': request['location'] ?? 'App (aprovado)',
+          'notes':
+              request['notes'] ?? 'Entrada fora do horario aprovada pelo gestor',
+          'timestamp': request['attempted_at'],
+          'latitude': request['latitude'],
+          'longitude': request['longitude'],
+          'schedule_controlled': true,
+          'schedule_approval_request_id': requestId,
+          'approved_by_id': manager['id'],
+          'approved_by_name': manager['name'] ?? manager['email'],
+          'schedule_snapshot': request['schedule_snapshot'],
+          'compatibility_mode': true,
+          'created_at': FieldValue.serverTimestamp(),
+        });
+      }
     }
     batch.update(requestRef, {
       'status': approve ? 'approved' : 'rejected',
@@ -1976,6 +2092,7 @@ class ApiService {
       } catch (_) {}
       throw Exception('Falha ao excluir usuario: $detail');
     }
+    invalidateUsersCache();
   }
 
   Future<List<dynamic>> getAdminTimeRecords({
@@ -1983,16 +2100,41 @@ class ApiService {
     String? startDate,
     String? endDate,
   }) async {
-    Query query = _db.collection('time_records');
+    // O filtro de data vai para o Firestore. Antes ele era aplicado em memoria
+    // DEPOIS de baixar a colecao inteira: a aba Resumo, atualizando sozinha,
+    // relia todo o historico de pontos da empresa a cada ciclo e sozinha
+    // esgotava a cota diaria de leituras (o custo crescia com o acumulado, nao
+    // com o uso). Exige o indice user_id + timestamp; intervalo so por data usa
+    // o indice automatico.
+    Query<Map<String, dynamic>> base = _db.collection('time_records');
     if (userId != null && userId.toString().isNotEmpty) {
-      query = query.where('user_id', isEqualTo: userId.toString());
+      base = base.where('user_id', isEqualTo: userId.toString());
     }
-    QuerySnapshot snapshot = await query.get();
-    var records = snapshot.docs
-        .map((doc) => {'id': doc.id, ...doc.data() as Map<String, dynamic>})
-        .toList();
+    Query<Map<String, dynamic>> query = base;
+    if (startDate != null) {
+      query = query.where('timestamp', isGreaterThanOrEqualTo: startDate);
+    }
+    if (endDate != null) {
+      query = query.where('timestamp', isLessThanOrEqualTo: endDate);
+    }
+
+    List<Map<String, dynamic>> records;
+    try {
+      final snapshot = await query.get();
+      records =
+          snapshot.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
+    } catch (e) {
+      // Sem o indice composto: nao quebra a tela, mas volta a custar caro.
+      debugPrint('Consulta por data indisponivel, usando fallback: $e');
+      final snapshot = await base.get();
+      records =
+          snapshot.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
+    }
+
     records.sort((a, b) =>
         (b['timestamp'] as String).compareTo(a['timestamp'] as String));
+    // Mantido: o fallback acima e os registros gravados sem hora exata ainda
+    // precisam do recorte em memoria.
     if (startDate != null || endDate != null) {
       records = records.where((r) {
         final ts = r['timestamp'] as String;

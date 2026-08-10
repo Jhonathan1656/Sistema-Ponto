@@ -112,9 +112,9 @@ class _UsersListTabState extends State<_UsersListTab> {
     }
   }
 
-  Future<void> _fetchUsers() async {
+  Future<void> _fetchUsers({bool forceRefresh = false}) async {
     try {
-      final users = await _apiService.getUsers();
+      final users = await _apiService.getUsers(forceRefresh: forceRefresh);
       setState(() => _users = users);
     } catch (e) {
       if (mounted) {
@@ -141,7 +141,9 @@ class _UsersListTabState extends State<_UsersListTab> {
       return const Center(child: CircularProgressIndicator(color: wineColor));
 
     return RefreshIndicator(
-      onRefresh: _fetchUsers,
+      // Puxar a lista para baixo e pedido explicito de dado novo: ignora o
+      // cache de 5 min do quadro de pessoal.
+      onRefresh: () => _fetchUsers(forceRefresh: true),
       color: wineColor,
       child: ListView.separated(
         padding: const EdgeInsets.all(16),
@@ -206,8 +208,10 @@ class _ScheduleApprovalsTabState extends State<_ScheduleApprovalsTab> {
   void initState() {
     super.initState();
     _load();
+    // 1 min em vez de 15s: liberacao nao e tempo real e cada ciclo custa
+    // leitura do Firestore (a cota diaria ja estourou uma vez por causa disso).
     _timer =
-        Timer.periodic(const Duration(seconds: 15), (_) => _load(silent: true));
+        Timer.periodic(const Duration(minutes: 1), (_) => _load(silent: true));
   }
 
   @override
@@ -814,8 +818,10 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
   void initState() {
     super.initState();
     _loadSummary();
+    // 5 min em vez de 1: cada ciclo le os usuarios + os pontos do dia. Quem
+    // precisa do numero na hora puxa a lista para baixo (RefreshIndicator).
     _timer = Timer.periodic(
-        const Duration(minutes: 1), (_) => _loadSummary(silent: true));
+        const Duration(minutes: 5), (_) => _loadSummary(silent: true));
   }
 
   @override
@@ -828,7 +834,9 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
     if (!silent && mounted) setState(() => _isLoading = true);
 
     try {
-      final users = await _apiService.getUsers();
+      // Atualizacao automatica usa o cache; pull-to-refresh (silent == false)
+      // pede dado novo.
+      final users = await _apiService.getUsers(forceRefresh: !silent);
       final now = DateTime.now();
       final start = DateTime(now.year, now.month, now.day).toIso8601String();
       final end =
@@ -1720,9 +1728,9 @@ class _ManualEntryTabState extends State<_ManualEntryTab> {
     _fetchUsers();
   }
 
-  Future<void> _fetchUsers() async {
+  Future<void> _fetchUsers({bool forceRefresh = false}) async {
     try {
-      final users = await _apiService.getUsers();
+      final users = await _apiService.getUsers(forceRefresh: forceRefresh);
       setState(() {
         _users = users;
         _isLoadingUsers = false;

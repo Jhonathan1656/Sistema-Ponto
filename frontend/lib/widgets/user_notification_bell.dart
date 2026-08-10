@@ -26,8 +26,10 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
   void initState() {
     super.initState();
     _loadNotifications();
+    // 2 min em vez de 30s: o push ja avisa na hora; este polling e so rede de
+    // seguranca e roda em toda aba aberta o dia inteiro, custando leitura.
     _pollTimer = Timer.periodic(
-      const Duration(seconds: 30),
+      const Duration(minutes: 2),
       (_) => _loadNotifications(),
     );
   }
@@ -70,15 +72,19 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return const Stream.empty();
 
+    // O filtro de remetente vai para o Firestore: so as mensagens do gestor
+    // interessam aqui, e antes o listener baixava a conversa inteira do usuario
+    // toda vez que o sininho era montado (ou seja, em cada troca de tela).
+    // 'notification_read' fica no filtro em memoria de proposito: mensagem
+    // antiga sem esse campo nao casa com igualdade e sumiria da contagem.
     return FirebaseFirestore.instance
         .collection('adjustment_requests')
         .where('user_id', isEqualTo: user.uid)
+        .where('sender_role', isEqualTo: 'admin')
         .snapshots()
         .map((snapshot) => snapshot.docs
             .map((doc) => {'id': doc.id, ...doc.data()})
-            .where((message) =>
-                message['sender_role'] == 'admin' &&
-                message['notification_read'] != true)
+            .where((message) => message['notification_read'] != true)
             .toList());
   }
 

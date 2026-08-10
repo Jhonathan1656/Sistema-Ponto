@@ -275,11 +275,22 @@ class _HomeScreenState extends State<HomeScreen> {
       final end =
           DateTime(now.year, now.month, now.day, 23, 59, 59).toIso8601String();
 
-      final records =
-          await _apiService.getTimeRecords(startDate: start, endDate: end);
+      // Estagiario precisa da janela de 14 dias (turno que atravessou o dia),
+      // e ela ja contem o dia de hoje: uma consulta so serve as duas coisas.
+      // Antes eram duas leituras do Firestore a cada atualizacao da tela.
+      final todayMidnight = DateTime(now.year, now.month, now.day);
+      final windowStart = _isInternUser
+          ? todayMidnight.subtract(const Duration(days: 14)).toIso8601String()
+          : start;
+      final windowRecords =
+          await _apiService.getTimeRecords(startDate: windowStart, endDate: end);
+      final records = windowRecords.where((item) {
+        final timestamp = (item as Map)['timestamp'].toString();
+        return timestamp.compareTo(start) >= 0;
+      }).toList();
       final pendingRecords = await _apiService.getOfflineRecords();
 
-      await _refreshCarriedOpenShift(now);
+      _refreshCarriedOpenShift(now, windowRecords);
 
       setState(() {
         _todayRecords = records.reversed.toList(); // Ordem cronológica
@@ -296,40 +307,37 @@ class _HomeScreenState extends State<HomeScreen> {
   // (check_in sem check_out). Isso garante que a tela reconheca o turno mesmo
   // depois da virada do dia, oferecendo a decisao (continuar ou fechar as 19:30)
   // em vez de travar com "Ja existe um turno aberto".
-  Future<void> _refreshCarriedOpenShift(DateTime now) async {
+  // A janela de 14 dias e a MESMA que o backend usa para decidir se ha turno
+  // aberto. Com 10 dias aqui, um check_in preso entre 10 e 14 dias atras ficava
+  // invisivel na tela (que so mostra hoje) enquanto o backend recusava a
+  // entrada com "Ja existe um turno aberto". Recebe os registros ja lidos por
+  // _loadTodayRecords em vez de consultar o Firestore de novo.
+  void _refreshCarriedOpenShift(DateTime now, List<dynamic> windowRecords) {
     if (!_isInternUser) {
       _carriedOpenShiftStart = null;
       return;
     }
-    try {
-      final todayMidnight = DateTime(now.year, now.month, now.day);
-      final windowStart =
-          todayMidnight.subtract(const Duration(days: 10)).toIso8601String();
-      final records =
-          await _apiService.getTimeRecords(startDate: windowStart);
-      final ordered = records
-          .map((item) => Map<String, dynamic>.from(item as Map))
-          .toList()
-        ..sort((a, b) =>
-            a['timestamp'].toString().compareTo(b['timestamp'].toString()));
+    final todayMidnight = DateTime(now.year, now.month, now.day);
+    final ordered = windowRecords
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .toList()
+      ..sort((a, b) =>
+          a['timestamp'].toString().compareTo(b['timestamp'].toString()));
 
-      DateTime? openStart;
-      for (final record in ordered) {
-        final type = record['record_type']?.toString();
-        if (type == 'check_in') {
-          openStart = DateTime.tryParse(record['timestamp']?.toString() ?? '');
-        } else if (type == 'check_out') {
-          openStart = null;
-        }
+    DateTime? openStart;
+    for (final record in ordered) {
+      final type = record['record_type']?.toString();
+      if (type == 'check_in') {
+        openStart = DateTime.tryParse(record['timestamp']?.toString() ?? '');
+      } else if (type == 'check_out') {
+        openStart = null;
       }
-
-      _carriedOpenShiftStart =
-          (openStart != null && openStart.isBefore(todayMidnight))
-              ? openStart
-              : null;
-    } catch (e) {
-      debugPrint('Falha ao detectar turno aberto de dia anterior: $e');
     }
+
+    _carriedOpenShiftStart =
+        (openStart != null && openStart.isBefore(todayMidnight))
+            ? openStart
+            : null;
   }
 
   Future<void> _trySyncOfflineRecords({bool showMessage = false}) async {

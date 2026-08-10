@@ -587,8 +587,26 @@ def _approval_dict(snapshot) -> dict:
             data[key] = value.isoformat()
     return {"id": snapshot.id, **data}
 
-def _user_records_sorted(db, user_id: str) -> List[dict]:
-    snapshots = db.collection("time_records").where("user_id", "==", user_id).stream()
+def _user_records_sorted(db, user_id: str, lookback_days: int = 14) -> List[dict]:
+    """Pontos recentes do usuario, do mais antigo para o mais novo.
+
+    So o passado recente importa para detectar turno aberto: um check_in sem
+    check_out ha mais de duas semanas e dado quebrado, nao turno. Filtrar por
+    data no Firestore evita ler o historico inteiro a cada batida - era esse
+    volume de leituras que derrubava o endpoint no horario de pico (todo mundo
+    batendo junto) e fazia o app cair no fallback e duplicar/errar registro.
+    Exige o indice composto user_id + timestamp (firestore.indexes.json).
+    """
+    collection = db.collection("time_records").where("user_id", "==", user_id)
+    if lookback_days > 0:
+        since = (datetime.now() - timedelta(days=lookback_days)).isoformat()
+        try:
+            snapshots = list(collection.where("timestamp", ">=", since).stream())
+        except Exception as exc:  # indice ausente ou consulta indisponivel
+            print(f"[schedule] consulta por data indisponivel, lendo tudo: {exc}")
+            snapshots = list(collection.stream())
+    else:
+        snapshots = list(collection.stream())
     records = [{"id": item.id, **(item.to_dict() or {})} for item in snapshots]
     records.sort(key=lambda item: str(item.get("timestamp") or ""))
     return records
@@ -778,6 +796,15 @@ async def get_firestore_document_with_user_token(
         )
     if response.status_code == 404:
         return None
+    if response.status_code == 429:
+        # Cota do Firestore esgotada nao e falta de permissao. Devolver 403 aqui
+        # fazia toda a tela acusar "sem permissao" e escondia a causa real.
+        # 429 tambem evita o fallback do app (que so dispara em 404/5xx e
+        # bateria na mesma cota estourada).
+        raise HTTPException(
+            status_code=429,
+            detail="Cota diaria do banco de dados esgotada. Tente novamente mais tarde.",
+        )
     if response.status_code < 200 or response.status_code >= 300:
         raise HTTPException(
             status_code=403,
@@ -2388,8 +2415,12 @@ async def create_schedule_approval_request_endpoint(
             detail="O horario da solicitacao esta muito distante do relogio do servidor.",
         )
     day_key = attempted.date().isoformat()
+    # Inclui "approved": um pedido ja liberado no mesmo dia torna o novo
+    # desnecessario. Sem isso, uma segunda tentativa do app (retry apos timeout,
+    # toque duplo) criava um pedido irmao que ficava eternamente pendente na
+    # tela do gestor, ja que o ponto do dia veio do primeiro.
     existing = _find_schedule_request(
-        db, user["id"], payload.request_type, day_key, {"pending"}
+        db, user["id"], payload.request_type, day_key, {"pending", "approved"}
     )
     if existing is not None:
         return {"status": "existing", "request": _approval_dict(existing)}
@@ -2442,12 +2473,14 @@ async def list_schedule_approval_requests_endpoint(
     admin=Depends(require_admin_user),
 ):
     db = get_firestore_admin()
-    snapshots = db.collection("work_schedule_approval_requests").stream()
+    collection = db.collection("work_schedule_approval_requests")
+    # Filtra no Firestore, nao em memoria. A tela de liberacoes e o sininho
+    # chamam isto de 15 em 15 / 30 em 30 segundos: ler a colecao inteira a cada
+    # chamada, so para descartar quase tudo, era o que torrava a cota diaria de
+    # leituras. Com o filtro, "pendentes" costuma custar 0 ou 1 documento.
+    query = collection.where("status", "==", status) if status else collection
     requests = []
-    for item in snapshots:
-        data = item.to_dict() or {}
-        if status and data.get("status") != status:
-            continue
+    for item in query.stream():
         requests.append(_approval_dict(item))
     requests.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
     return requests
@@ -2455,9 +2488,17 @@ async def list_schedule_approval_requests_endpoint(
 @app.get("/notifications")
 async def list_user_notifications_endpoint(user=Depends(require_authenticated_user)):
     db = get_firestore_admin()
-    snapshots = db.collection("user_notifications").where(
-        "user_id", "==", user["id"]
-    ).stream()
+    # So as nao lidas: e o unico que o sininho exibe, e a colecao so cresce.
+    # Ler o historico inteiro a cada 30s por aba aberta era leitura jogada fora.
+    minhas = db.collection("user_notifications").where("user_id", "==", user["id"])
+    try:
+        snapshots = list(minhas.where("is_read", "==", False).stream())
+    except Exception as exc:  # indice ausente: nao vale quebrar o sininho
+        print(f"[notifications] filtro de nao lidas indisponivel, lendo tudo: {exc}")
+        snapshots = [
+            item for item in minhas.stream()
+            if (item.to_dict() or {}).get("is_read") is not True
+        ]
     notifications = [_approval_dict(item) for item in snapshots]
     notifications.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
     return notifications[:100]
@@ -2465,15 +2506,19 @@ async def list_user_notifications_endpoint(user=Depends(require_authenticated_us
 @app.post("/notifications/read")
 async def mark_user_notifications_read_endpoint(user=Depends(require_authenticated_user)):
     db = get_firestore_admin()
-    snapshots = db.collection("user_notifications").where(
-        "user_id", "==", user["id"]
-    ).stream()
+    # Le so o que precisa mudar, em vez da caixa inteira do usuario.
+    minhas = db.collection("user_notifications").where("user_id", "==", user["id"])
+    try:
+        snapshots = list(minhas.where("is_read", "==", False).stream())
+    except Exception as exc:
+        print(f"[notifications] filtro de nao lidas indisponivel, lendo tudo: {exc}")
+        snapshots = [
+            item for item in minhas.stream()
+            if (item.to_dict() or {}).get("is_read") is not True
+        ]
     batch = db.batch()
     count = 0
     for item in snapshots:
-        data = item.to_dict() or {}
-        if data.get("is_read") is True:
-            continue
         batch.update(item.reference, {"is_read": True, "read_at": firestore.SERVER_TIMESTAMP})
         count += 1
     if count:
@@ -2500,25 +2545,53 @@ async def approve_schedule_request_endpoint(
     linked_record_id = data.get("linked_time_record_id")
     if data.get("request_type") == "start_exception":
         records = _user_records_sorted(db, data["user_id"])
-        if _open_shift_start(records) is not None:
+        open_shift = _open_shift_start(records)
+        # Procura pelo vinculo, nao pelo turno aberto: o ponto pode ter sido
+        # gravado por uma tentativa anterior e o turno ja ter sido encerrado.
+        # Vale tambem o ponto vindo de OUTRO pedido do mesmo dia: quando o app
+        # cria pedidos duplicados, liberar o segundo nao pode gerar uma segunda
+        # entrada - a do dia ja esta la e este pedido virou redundante.
+        existing = next(
+            (
+                item
+                for item in records
+                if item.get("record_type") == "check_in"
+                and item.get("schedule_approval_request_id")
+                and (
+                    item.get("schedule_approval_request_id") == request_id
+                    or str(item.get("timestamp") or "")[:10] == data.get("day_key")
+                )
+            ),
+            None,
+        )
+        if existing is not None:
+            # A tentativa anterior gravou o ponto mas nao chegou a marcar o
+            # pedido como aprovado (timeout, queda do processo) - por isso ele
+            # continuou na lista do gestor. Reaproveita o ponto que ja existe e
+            # so conclui a decisao; criar outro duplicaria a entrada.
+            linked_record_id = existing["id"]
+        elif open_shift is not None:
             raise HTTPException(status_code=409, detail="O usuario ja possui um turno aberto.")
-        record_ref = db.collection("time_records").document()
-        record_ref.set({
-            "user_id": data["user_id"],
-            "record_type": "check_in",
-            "location": data.get("location") or "App (aprovado)",
-            "notes": data.get("notes") or "Entrada fora do horario aprovada pelo gestor",
-            "timestamp": data["attempted_at"],
-            "latitude": data.get("latitude"),
-            "longitude": data.get("longitude"),
-            "schedule_controlled": True,
-            "schedule_approval_request_id": request_id,
-            "approved_by_id": admin["id"],
-            "approved_by_name": admin.get("name", ""),
-            "schedule_snapshot": data.get("schedule_snapshot"),
-            "created_at": firestore.SERVER_TIMESTAMP,
-        })
-        linked_record_id = record_ref.id
+        else:
+            # Id deterministico: se a liberacao for reenviada, o set() regrava o
+            # MESMO documento em vez de criar uma segunda entrada.
+            record_ref = db.collection("time_records").document(f"approval_{request_id}")
+            record_ref.set({
+                "user_id": data["user_id"],
+                "record_type": "check_in",
+                "location": data.get("location") or "App (aprovado)",
+                "notes": data.get("notes") or "Entrada fora do horario aprovada pelo gestor",
+                "timestamp": data["attempted_at"],
+                "latitude": data.get("latitude"),
+                "longitude": data.get("longitude"),
+                "schedule_controlled": True,
+                "schedule_approval_request_id": request_id,
+                "approved_by_id": admin["id"],
+                "approved_by_name": admin.get("name", ""),
+                "schedule_snapshot": data.get("schedule_snapshot"),
+                "created_at": firestore.SERVER_TIMESTAMP,
+            })
+            linked_record_id = record_ref.id
 
     request_ref.update({
         "status": "approved",
@@ -2551,6 +2624,8 @@ async def reject_schedule_request_endpoint(
     if not snapshot.exists:
         raise HTTPException(status_code=404, detail="Solicitacao nao encontrada.")
     data = snapshot.to_dict() or {}
+    if data.get("status") == "rejected":
+        return {"status": "rejected", "request": _approval_dict(snapshot)}
     if data.get("status") != "pending":
         raise HTTPException(status_code=409, detail="Esta solicitacao ja foi decidida.")
     request_ref.update({

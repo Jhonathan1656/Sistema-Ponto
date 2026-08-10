@@ -12,6 +12,7 @@ import 'screens/login_screen.dart';
 import 'screens/main_screen.dart';
 import 'services/app_permission_service.dart';
 import 'services/notification_service.dart';
+import 'services/session_service.dart';
 import 'services/theme_service.dart';
 
 void main() {
@@ -286,27 +287,54 @@ class _PermissionGateState extends State<PermissionGate>
   }
 }
 
-class AuthGate extends StatelessWidget {
+class AuthGate extends StatefulWidget {
   const AuthGate({super.key});
 
   @override
+  State<AuthGate> createState() => _AuthGateState();
+}
+
+class _AuthGateState extends State<AuthGate> {
+  late final Future<User?> _restoredSession;
+
+  @override
+  void initState() {
+    super.initState();
+    _restoredSession = SessionService.restoreSession();
+  }
+
+  static const Widget _splash = Scaffold(
+    body: Center(
+      child: CircularProgressIndicator(color: Color(0xFF8B0000)),
+    ),
+  );
+
+  @override
   Widget build(BuildContext context) {
-    return StreamBuilder<User?>(
-      stream: FirebaseAuth.instance.authStateChanges(),
-      builder: (context, authSnapshot) {
-        if (authSnapshot.connectionState == ConnectionState.waiting) {
-          return const Scaffold(
-            body: Center(
-              child: CircularProgressIndicator(color: Color(0xFF8B0000)),
-            ),
-          );
+    return FutureBuilder<User?>(
+      future: _restoredSession,
+      builder: (context, restoreSnapshot) {
+        // Enquanto a sessao guardada nao for resolvida nao mostramos o login:
+        // um null passageiro aqui faria o usuario logado digitar senha a toa.
+        if (restoreSnapshot.connectionState != ConnectionState.done) {
+          return _splash;
         }
 
-        if (authSnapshot.data != null) {
-          return const MainScreen();
-        }
+        return StreamBuilder<User?>(
+          stream: FirebaseAuth.instance.authStateChanges(),
+          initialData: restoreSnapshot.data ?? FirebaseAuth.instance.currentUser,
+          builder: (context, authSnapshot) {
+            if (authSnapshot.data != null) {
+              return const MainScreen();
+            }
 
-        return const LoginScreen();
+            if (authSnapshot.connectionState == ConnectionState.waiting) {
+              return _splash;
+            }
+
+            return const LoginScreen();
+          },
+        );
       },
     );
   }

@@ -1,7 +1,7 @@
 name: ponto_app
 description: Sistema de Registro de Ponto
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.0.1+2
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
@@ -27,6 +27,7 @@ dependencies:
   
   # Storage
   shared_preferences: ^2.2.2
+  flutter_secure_storage: ^9.2.2
   connectivity_plus: ^6.1.4
   
   # UI
