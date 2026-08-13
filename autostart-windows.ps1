@@ -1,25 +1,47 @@
-# Sobe a stack do ponto no logon, depois que o Docker Desktop fica pronto.
-# Reforco do restart:unless-stopped: cobre o caso de container parado manual.
-# Chamado pela pasta Startup do usuario (ver instrucoes no fim do arquivo).
+# Sobe a stack do ponto depois do boot, sem depender de ninguem clicar em nada.
+#
+# Cenario alvo: queda/pico de energia. A BIOS religa o PC, o Windows faz
+# autologon, e este script garante que Docker Desktop + containers voltem.
+#
+# Diferenca pro que existia antes:
+#   - inicia o Docker Desktop se ele nao subiu (antes so esperava);
+#   - espera 15 min em vez de 6 (boot pos-queda e lento: disco frio, WSL2,
+#     chkdsk eventual);
+#   - confere se a stack ficou saudavel de verdade, nao so se o comando saiu 0.
+#
+# Chamado pela Scheduled Task "PontoAutostart" (ver setup-autostart.ps1).
 
-$ErrorActionPreference = "SilentlyContinue"
-$log = "$env:LOCALAPPDATA\ponto-autostart.log"
-"$(Get-Date -Format o)  --- autostart iniciando ---" | Out-File $log -Append
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
 
-# Espera o engine do Docker responder (Docker Desktop leva ~1-2 min no boot).
-$deadline = (Get-Date).AddMinutes(6)
-$ready = $false
-while ((Get-Date) -lt $deadline) {
-    docker info *> $null
-    if ($LASTEXITCODE -eq 0) { $ready = $true; break }
-    Start-Sleep -Seconds 10
-}
+. "$PSScriptRoot\ops-common.ps1"
 
-if (-not $ready) {
-    "$(Get-Date -Format o)  Docker nao ficou pronto em 6 min; abortando." | Out-File $log -Append
+Write-PontoLog "--- autostart iniciando (usuario: $env:USERNAME) ---"
+
+try {
+    if (-not (Wait-DockerEngine -TimeoutMinutes 15)) {
+        Write-PontoLog "ERRO: engine do Docker nao respondeu em 15 min; abortando."
+        exit 1
+    }
+
+    # up -d e idempotente: recria so o que estiver faltando.
+    $res = Invoke-Native { docker compose up -d }
+    Write-PontoLog "docker compose up -d (exit $($res.ExitCode)): $($res.Output)"
+
+    if ($res.ExitCode -ne 0) {
+        Write-PontoLog "ERRO: compose up falhou."
+        exit 1
+    }
+
+    if (Wait-StackHealthy -TimeoutMinutes 5) {
+        Write-PontoLog "OK: stack no ar e saudavel."
+        exit 0
+    }
+
+    Write-PontoLog "AVISO: stack subiu mas nao ficou healthy em 5 min. O watchdog assume daqui."
     exit 1
 }
-
-Set-Location $PSScriptRoot
-docker compose up -d *>> $log
-"$(Get-Date -Format o)  docker compose up -d (exit $LASTEXITCODE)" | Out-File $log -Append
+catch {
+    Write-PontoLog "ERRO inesperado: $($_.Exception.Message)"
+    exit 1
+}

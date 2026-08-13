@@ -42,6 +42,7 @@ Sistema completo de controle de ponto eletrônico com backend Python (FastAPI) e
 | [FEATURES.md](docs/FEATURES.md) | Funcionalidades detalhadas |
 | [DEPLOY.md](docs/DEPLOY.md) | Publicação em produção |
 | [OPERATIONAL_CONFIG.md](docs/OPERATIONAL_CONFIG.md) | Configuração operacional |
+| [RECOVERY.md](docs/RECOVERY.md) | Recuperação automática após queda de energia |
 
 ## 🏗️ Arquitetura
 

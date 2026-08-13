@@ -143,6 +143,15 @@ app = FastAPI(
 security = HTTPBearer(auto_error=True)
 
 
+@app.get("/health")
+async def health():
+    """Sonda do healthcheck do Docker: so diz que o processo responde.
+
+    Nao toca no Firestore de proposito - roda a cada 30s e comeria cota a toa.
+    """
+    return {"status": "ok"}
+
+
 def _shared_access_cookie_value() -> str:
     """Returns a signed value without exposing the shared access token."""
     return hmac.new(
@@ -935,6 +944,12 @@ SIGNATURE_DOCUMENT_COLUMNS = """
 def signature_db_connection():
     connection = sqlite3.connect(DATABASE_PATH)
     connection.row_factory = sqlite3.Row
+    # WAL + synchronous=FULL: queda de energia no meio de um write deixava o
+    # arquivo corrompido. Com WAL o commit vira append no -wal e o FULL forca
+    # o fsync antes de confirmar, entao o pior caso e perder a transacao em
+    # andamento em vez do banco inteiro.
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=FULL")
     return connection
 
 def init_signature_documents_table():
