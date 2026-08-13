@@ -15,6 +15,22 @@ Cada elo depende do anterior. Se um quebra, os de baixo nunca acontecem.
 | 4 | Docker Desktop inicia | Chave `Run` + `AutoStart` — `setup-autostart.ps1` |
 | 5 | Containers sobem | Task `PontoAutostart` + `restart: always` |
 | 6 | Continuam de pé | Task `PontoWatchdog` (5 em 5 min) |
+| 7 | Usuários alcançam o site | Serviço `Cloudflared` (LocalSystem, automático) |
+
+### Como os usuários chegam
+
+O acesso externo é `https://ponto.vmacengenharia.com`, servido por **Cloudflare
+Tunnel**: a Cloudflare termina o TLS e o `cloudflared` local entrega no nginx da
+porta 8080 em HTTP puro.
+
+O `cloudflared` roda como serviço do Windows sob `LocalSystem`, com início
+automático e ação de falha "reiniciar em 20s". Isso o torna o elo *mais* robusto
+da corrente — diferente do Docker Desktop, ele não depende de logon.
+
+Mas ele é um ponto único de falha invisível: se o túnel não voltar, os usuários
+veem **erro 1033 da Cloudflare** enquanto tudo localmente parece perfeito. Por
+isso o `check-recovery.ps1` testa a URL pública, não só o `localhost` — checar só
+o local daria verde com o site inacessível.
 
 ## O que você precisa fazer (uma vez)
 
@@ -114,6 +130,13 @@ Firestore aí comeria cota à toa. O endpoint só confirma que o processo respon
 (ZapSign) vive em SQLite; o resto dos dados está no Firestore. Com WAL o commit
 vira append e o `FULL` força o fsync antes de confirmar, então uma queda de
 energia no meio de um write custa a transação em andamento, não o banco inteiro.
+
+**Redirect do gate precisa ser relativo.** O nginx escuta na 80 dentro do
+container e recebe HTTP puro do túnel, então o `$scheme` que ele enxerga é
+`http`. Com `absolute_redirect` ligado (o padrão), o 302 do gate de acesso saía
+como `http://ponto.vmacengenharia.com/...` — rebaixando de HTTPS para HTTP e
+perdendo a porta em acessos locais por `:8080`. Com `absolute_redirect off` o
+Location sai relativo e o navegador preserva esquema, host e porta sozinho.
 
 ## Por que não Kubernetes
 

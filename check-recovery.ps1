@@ -71,6 +71,42 @@ foreach ($alvo in @(@{n='API     ';u='http://127.0.0.1:8000/health'}, @{n='Front
 }
 
 Write-Host ""
+Write-Host "=== TUNEL CLOUDFLARE ===" -ForegroundColor Cyan
+# Os usuarios chegam por https://ponto.vmacengenharia.com via Cloudflare
+# Tunnel. Checar so o localhost daria tudo verde com o tunel fora do ar e o
+# site devolvendo erro 1033 pra todo mundo - falso positivo.
+$svc = Get-Service Cloudflared -ErrorAction SilentlyContinue
+if (-not $svc) {
+    Write-Host "  servico : NAO ENCONTRADO" -ForegroundColor Yellow
+} else {
+    $cor = if ($svc.Status -eq 'Running') { "Green" } else { "Red" }
+    Write-Host "  servico : $($svc.Status) / $($svc.StartType)" -ForegroundColor $cor
+}
+
+$pub = 'https://ponto.vmacengenharia.com/'
+try {
+    # PS 5.1 negocia TLS 1.0 por padrao; a Cloudflare recusa.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $req = [System.Net.HttpWebRequest]::Create($pub)
+    $req.AllowAutoRedirect = $false
+    $req.Timeout = 25000
+    try {
+        $resp = $req.GetResponse()
+        $code = [int]$resp.StatusCode
+        $resp.Close()
+    } catch [System.Net.WebException] {
+        if (-not $_.Exception.Response) { throw }
+        $code = [int]$_.Exception.Response.StatusCode
+    }
+    # 3xx e sucesso: e o redirect do gate de acesso.
+    $cor = if ($code -lt 400) { "Green" } else { "Red" }
+    Write-Host "  publico : HTTP $code  ($pub)" -ForegroundColor $cor
+} catch {
+    Write-Host "  publico : FALHOU - $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "            (usuarios veem erro 1033 da Cloudflare)" -ForegroundColor Red
+}
+
+Write-Host ""
 Write-Host "=== TEMPO DE RECUPERACAO ===" -ForegroundColor Cyan
 $linha = Select-String -Path $script:PontoLog -Pattern "OK: stack no ar e saudavel" -ErrorAction SilentlyContinue | Select-Object -Last 1
 if ($linha -and $linha.Line -match '^(\S+)\s') {
