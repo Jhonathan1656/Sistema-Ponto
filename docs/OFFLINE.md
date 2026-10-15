@@ -9,6 +9,7 @@ aparelho e sobem sozinhos quando o sinal volta.
 | Etapa | Como funciona |
 |---|---|
 | Abrir o app | O service worker (`frontend/web/pwa_service_worker.js`) serve a copia salva de `index.html`, `main.dart.js`, canvaskit e assets. |
+| Texto na tela | A fonte Roboto vem embutida no app (`frontend/assets/fonts`, declarada no `pubspec.yaml`). Sem ela o Flutter web baixa a Roboto do `fonts.gstatic.com` e, offline, a tela abria com cores e icones mas **sem nenhum texto** (visto no iPhone). Fontes extras que o Flutter busca para simbolos tambem vao para o cache `vmac-ponto-vendor`. |
 | Firebase iniciar | O SDK JS do Firebase (`www.gstatic.com/firebasejs/...`) tambem fica no cache do service worker. Sem isso o app parava em "Nao foi possivel iniciar o aplicativo". |
 | Sessao | O Firebase Auth guarda a sessao no IndexedDB; nao pede senha de novo. |
 | Perfil e pontos do dia | O cache local do Firestore (ligado em `frontend/lib/main.dart`) devolve o que foi lido online por ultimo. A tela mostra o status certo (ex.: "Em servico") mesmo offline. |
@@ -61,6 +62,6 @@ No Chrome: `chrome://inspect` (celular via USB) ou DevTools > Application:
 
 - **Service Workers**: `pwa_service_worker.js` deve estar "activated".
 - **Cache Storage**: `vmac-ponto-shell-v1` (arquivos do site) e
-  `vmac-ponto-vendor-v1` (SDK do Firebase).
+  `vmac-ponto-vendor-v1` (SDK do Firebase e fontes do Google).
 - **IndexedDB**: `firebaseLocalStorageDb` (sessao) e `firestore/...` (cache
   de dados).

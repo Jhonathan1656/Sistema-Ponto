@@ -101,3 +101,15 @@ flutter:
     - assets/templates/Excel-Campo/2026/10-2026/
     - assets/templates/Excel-Campo/2026/11-2026/
     - assets/templates/Excel-Campo/2026/12-2026/
+
+  # Roboto embutida (Apache 2.0, ver assets/fonts/LICENSE.txt). No web o
+  # Flutter baixaria a fonte do fonts.gstatic.com a cada abertura; offline o
+  # app abria sem nenhum texto.
+  fonts:
+    - family: Roboto
+      fonts:
+        - asset: assets/fonts/Roboto-Regular.ttf
+        - asset: assets/fonts/Roboto-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/Roboto-Bold.ttf
+          weight: 700

@@ -238,7 +238,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 style: TextStyle(
                     fontSize: 20,
                     fontWeight: FontWeight.bold,
-                    fontFamily: 'monospace',
+                    fontFamily: 'Roboto',
+                    fontFeatures: const [FontFeature.tabularFigures()],
                     color: textColor)),
           ],
         ),

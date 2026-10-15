@@ -75,7 +75,7 @@
           .catch(function (err) { console.warn('Service worker nao registrado:', err); });
 
         // Aquecimento do cache: manda ao service worker a lista do que esta
-        // pagina carregou (canvaskit, fontes, imagens, SDK do Firebase) para
+        // pagina carregou (canvaskit, fontes, imagens, SDK do Firebase, fontes do Google) para
         // ele guardar. Na primeira visita ele ainda nao intercepta nada, e
         // sem isso a primeira abertura offline falharia nesses arquivos.
         var vmacSent = {};
@@ -87,7 +87,8 @@
               .filter(function (u) {
                 if (vmacSent[u]) return false;
                 return u.indexOf(location.origin + '/') === 0 ||
-                  u.indexOf('https://www.gstatic.com/firebasejs/') === 0;
+                  u.indexOf('https://www.gstatic.com/firebasejs/') === 0 ||
+                  u.indexOf('https://fonts.gstatic.com/') === 0;
               });
             if (!urls.length) return;
             urls.forEach(function (u) { vmacSent[u] = true; });

@@ -13,7 +13,9 @@
  *    revalidacao custa um 304). Offline, ou se a rede travar, vem do cache.
  *    Toda resposta boa da rede atualiza o cache.
  *
- *  - SDK JS do Firebase (www.gstatic.com/firebasejs/<versao>/...):
+ *  - SDK JS do Firebase (www.gstatic.com/firebasejs/<versao>/...) e fontes
+ *    do Google (fonts.gstatic.com, usadas pelo Flutter para simbolos e
+ *    caracteres que a Roboto embutida nao tem):
  *    CACHE PRIMEIRO. A URL carrega a versao, entao o conteudo nunca muda.
  *    Sem isso o Firebase.initializeApp falha offline e o app mostra
  *    "Nao foi possivel iniciar o aplicativo".
@@ -49,9 +51,20 @@ const SHELL_URLS = [
   '/assets/AssetManifest.bin',
   '/assets/FontManifest.json',
   '/assets/fonts/MaterialIcons-Regular.otf',
+  '/assets/assets/fonts/Roboto-Regular.ttf',
+  '/assets/assets/fonts/Roboto-Medium.ttf',
+  '/assets/assets/fonts/Roboto-Bold.ttf',
 ];
 
-const VENDOR_PREFIX = 'https://www.gstatic.com/firebasejs/';
+// URLs versionadas (o conteudo de um endereco nunca muda): cache primeiro.
+const VENDOR_PREFIXES = [
+  'https://www.gstatic.com/firebasejs/',
+  'https://fonts.gstatic.com/',
+];
+
+function isVendorUrl(href) {
+  return VENDOR_PREFIXES.some((prefix) => href.startsWith(prefix));
+}
 
 // Caminhos do proprio dominio que nunca passam pelo cache.
 const BYPASS_PREFIXES = ['/api/', '/access/', '/access-check', '/openapi.json'];
@@ -98,7 +111,7 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(request.url);
 
-  if (url.href.startsWith(VENDOR_PREFIX)) {
+  if (isVendorUrl(url.href)) {
     event.respondWith(cacheFirst(request, VENDOR_CACHE));
     return;
   }
@@ -137,7 +150,7 @@ async function warmCache(urls) {
   for (const raw of urls) {
     try {
       const url = new URL(String(raw), self.location.origin);
-      if (url.href.startsWith(VENDOR_PREFIX)) {
+      if (isVendorUrl(url.href)) {
         if (await vendor.match(url.href, { ignoreVary: true })) continue;
         const response = await fetch(url.href, { mode: 'cors' });
         if (isCacheableVendor(response)) await vendor.put(url.href, response);

@@ -183,7 +183,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
                   ),
                 ],
               ),
-              Text(time, style: const TextStyle(fontWeight: FontWeight.bold, fontFamily: 'monospace')),
+              Text(time, style: const TextStyle(fontWeight: FontWeight.bold, fontFamily: 'Roboto', fontFeatures: [FontFeature.tabularFigures()])),
             ],
           ),
         );

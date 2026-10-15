@@ -147,6 +147,9 @@ class MyApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.light,
+        // Fonte embutida no app (assets/fonts): sem ela o Flutter web baixa a
+        // Roboto do fonts.gstatic.com e, offline, o texto some da tela.
+        fontFamily: 'Roboto',
         primaryColor: const Color(0xFF8B0000),
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF8B0000),
@@ -162,6 +165,7 @@ class MyApp extends StatelessWidget {
       ),
       darkTheme: ThemeData(
         brightness: Brightness.dark,
+        fontFamily: 'Roboto',
         primaryColor: const Color(0xFF8B0000),
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF8B0000),
