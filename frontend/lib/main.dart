@@ -118,7 +118,7 @@ class _AppBootstrapState extends State<AppBootstrap> {
         if (snapshot.connectionState != ConnectionState.done) {
           return const MaterialApp(
             debugShowCheckedModeBanner: false,
-            home: Scaffold(body: StartupLoading()),
+            home: Scaffold(body: StartupLoading(from: 80, to: 88)),
           );
         }
 
@@ -324,7 +324,8 @@ class _AuthGateState extends State<AuthGate> {
     _restoredSession = SessionService.restoreSession();
   }
 
-  static const Widget _splash = Scaffold(body: StartupLoading());
+  static const Widget _splash =
+      Scaffold(body: StartupLoading(from: 88, to: 94));
 
   @override
   Widget build(BuildContext context) {

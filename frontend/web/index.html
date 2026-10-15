@@ -52,9 +52,15 @@
       border-radius: 50%; animation: vmac-spin 0.9s linear infinite;
     }
     @keyframes vmac-spin { to { transform: rotate(360deg); } }
+    /* Barra de porcentagem: so na abertura sem internet. */
+    #vmac-progress { display: none; flex-direction: column; align-items: center; gap: 6px; }
+    #vmac-progress .bar { width: 220px; height: 6px; border-radius: 3px; background: #ddd; overflow: hidden; }
+    #vmac-progress .fill { height: 100%; width: 0; background: #8B0000; transition: width 0.15s linear; }
+    #vmac-progress .pct { font-weight: bold; color: #8B0000; font-variant-numeric: tabular-nums; }
     @media (prefers-color-scheme: dark) {
       html, body, #vmac-splash { background: #000; color: #bbb; }
       #vmac-splash .spin { border-color: #333; border-top-color: #8B0000; }
+      #vmac-progress .bar { background: #333; }
     }
   </style>
 </head>
@@ -62,6 +68,10 @@
   <div id="vmac-splash">
     <img src="icons/Icon-192.png" alt="">
     <div class="spin"></div>
+    <div id="vmac-progress">
+      <div class="bar"><div class="fill" id="vmac-progress-fill"></div></div>
+      <div class="pct" id="vmac-progress-pct">Abrindo... 0%</div>
+    </div>
     <div id="vmac-splash-text">Abrindo o VMac Ponto...</div>
   </div>
 
@@ -99,7 +109,35 @@
       });
     }
 
+    // Porcentagem da abertura (so sem internet, quando ela demora mais).
+    // O navegador nao informa o progresso real, entao cada etapa vale uma
+    // faixa e a barra anda devagar dentro dela, sem nunca passar do fim
+    // da etapa antes de ela terminar. O flutter_bootstrap.js avisa a troca
+    // de etapa; o app (StartupLoading) continua de 80% em diante.
+    var vmacStages = { start: [0, 40], entrypoint: [40, 70], engine: [70, 80] };
+    var vmacProgress = { from: 0, to: 40, t0: Date.now() };
+    function vmacPercent() {
+      var t = (Date.now() - vmacProgress.t0) / 1000;
+      return vmacProgress.from + (vmacProgress.to - vmacProgress.from) * (1 - Math.exp(-t / 4));
+    }
+    window.vmacSetStage = function (name) {
+      var stage = vmacStages[name];
+      if (!stage) return;
+      vmacProgress = { from: Math.max(stage[0], vmacPercent()), to: stage[1], t0: Date.now() };
+    };
+
     if (!navigator.onLine) {
+      var spinner = document.querySelector('#vmac-splash .spin');
+      if (spinner) spinner.remove();
+      document.getElementById('vmac-progress').style.display = 'flex';
+      var vmacTimer = setInterval(function () {
+        var fill = document.getElementById('vmac-progress-fill');
+        var pct = document.getElementById('vmac-progress-pct');
+        if (!fill || !pct) { clearInterval(vmacTimer); return; }
+        var value = Math.floor(vmacPercent());
+        fill.style.width = value + '%';
+        pct.textContent = 'Abrindo... ' + value + '%';
+      }, 150);
       var text = document.getElementById('vmac-splash-text');
       if (text) text.innerHTML = '<b>Voc\u00ea est\u00e1 sem internet</b><br>O app vai abrir com os dados salvos no aparelho. Sem sinal isso pode levar alguns segundos.';
       if (text) text.style.cssText = 'max-width:320px;text-align:center;line-height:1.5;padding:0 16px';

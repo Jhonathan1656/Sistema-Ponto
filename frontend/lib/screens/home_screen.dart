@@ -765,7 +765,7 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       extendBodyBehindAppBar: true,
       body: _isLoading && _todayRecords.isEmpty
-          ? const StartupLoading()
+          ? const StartupLoading(from: 94, to: 99)
           : _isOvertimeDecisionRequired
               ? _buildOvertimeDecisionScreen(theme)
               : RefreshIndicator(
