@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:provider/provider.dart';
@@ -40,10 +41,30 @@ class _AppBootstrapState extends State<AppBootstrap> {
     await Firebase.initializeApp(
       options: DefaultFirebaseOptions.currentPlatform,
     ).timeout(const Duration(seconds: 20));
+    _enableFirestoreOfflineCache();
     await initializeDateFormatting('pt_BR', null);
 
     if (!kIsWeb) {
       unawaited(NotificationService.initialize());
+    }
+  }
+
+  /// Liga o cache local do Firestore (IndexedDB no web).
+  ///
+  /// No Android/iOS ele ja vem ligado; no web vem DESLIGADO por padrao. Sem
+  /// ele, offline o app nao enxerga nem o perfil nem os pontos do dia que ja
+  /// foram gravados online: a tela abria em "Aguardando entrada" para quem
+  /// tinha batido a entrada de manha. Precisa rodar antes do primeiro uso do
+  /// Firestore, por isso fica aqui, logo depois do initializeApp.
+  void _enableFirestoreOfflineCache() {
+    try {
+      FirebaseFirestore.instance.settings = const Settings(
+        persistenceEnabled: true,
+        cacheSizeBytes: Settings.CACHE_SIZE_UNLIMITED,
+      );
+    } catch (e) {
+      // Segunda aba aberta ou navegador sem IndexedDB: segue sem cache.
+      debugPrint('Cache offline do Firestore indisponivel: $e');
     }
   }
 

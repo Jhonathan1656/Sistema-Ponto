@@ -708,6 +708,20 @@ class ApiService {
     await _replaceOfflineRecords([]);
   }
 
+  Future<bool> _recordExistsOnServer(String recordId) async {
+    try {
+      final snapshot = await _db
+          .collection('time_records')
+          .doc(recordId)
+          .get(const GetOptions(source: Source.server))
+          .timeout(const Duration(seconds: 15));
+      return snapshot.exists;
+    } catch (e) {
+      debugPrint('Nao deu para conferir o ponto $recordId no servidor: $e');
+      return false;
+    }
+  }
+
   Future<int> syncOfflineRecords() async {
     final pendingRecords = await getOfflineRecords();
     if (pendingRecords.isEmpty) return 0;
@@ -753,11 +767,22 @@ class ApiService {
           throw Exception('Registro offline sem identificador.');
         }
 
-        await _db
-            .collection('time_records')
-            .doc(recordId)
-            .set(firestoreData)
-            .timeout(const Duration(seconds: 15));
+        try {
+          await _db
+              .collection('time_records')
+              .doc(recordId)
+              .set(firestoreData)
+              .timeout(const Duration(seconds: 15));
+        } catch (e) {
+          // O SDK do Firestore continua tentando a escrita original em
+          // segundo plano (e, com o cache local ligado, ate depois de fechar
+          // o app). Quando ela entra antes desta, o set() vira um UPDATE, que
+          // as regras so permitem ao admin: permission-denied. O ponto ja
+          // esta no servidor; sem esta checagem ele ficava preso na fila
+          // para sempre, "aguardando internet".
+          if (!await _recordExistsOnServer(recordId)) rethrow;
+          debugPrint('Ponto offline $recordId ja estava no servidor.');
+        }
         syncedCount++;
       } catch (e) {
         debugPrint('Erro ao sincronizar ponto offline ${record['id']}: $e');
@@ -995,6 +1020,57 @@ class ApiService {
           'Ponto salvo offline para sincronizar depois: ${offlineRecord['id']}');
       return offlineRecord;
     }
+  }
+
+  /// Guarda o ponto na fila local SEM tentar o servidor.
+  ///
+  /// Usado quando a rede caiu no meio de uma batida que exige validacao do
+  /// backend (estagiario). Nao escreve direto no Firestore de proposito: a
+  /// sincronizacao reenvia pelo /work-schedule/punch, que aplica as regras de
+  /// horario, quando a internet voltar.
+  Future<Map<String, dynamic>> queueTimeRecordOffline({
+    required String recordType,
+    String? location,
+    String? notes,
+    String? timestamp,
+    double? latitude,
+    double? longitude,
+  }) async {
+    final cachedUser = await getCachedCurrentUser();
+    final userId = _auth.currentUser?.uid ?? cachedUser?['id']?.toString();
+    if (userId == null || userId.isEmpty) {
+      throw Exception(
+          'Faca login com internet uma vez antes de registrar offline.');
+    }
+
+    final now = DateTime.now();
+    final offlineRecord = <String, dynamic>{
+      'id': _db.collection('time_records').doc().id,
+      'user_id': userId,
+      'record_type': recordType,
+      'location': location ?? 'App',
+      'notes': notes,
+      'timestamp': timestamp ?? now.toIso8601String(),
+      'latitude': latitude,
+      'longitude': longitude,
+      'offline': true,
+      'sync_status': 'pending',
+      'created_at_local': now.toIso8601String(),
+    };
+    await _saveOfflineRecord(offlineRecord);
+    debugPrint('Ponto guardado na fila offline: ${offlineRecord['id']}');
+    return offlineRecord;
+  }
+
+  /// Erro de rede (sem sinal, DNS, timeout), em oposicao a uma resposta do
+  /// servidor recusando o pedido.
+  static bool isNetworkFailure(Object error) {
+    if (error is TimeoutException || error is http.ClientException) return true;
+    final text = error.toString();
+    return text.contains('SocketException') ||
+        text.contains('Failed host lookup') ||
+        text.contains('Connection refused') ||
+        text.contains('Network is unreachable');
   }
 
   // ignore: unused_element

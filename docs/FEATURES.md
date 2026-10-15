@@ -22,7 +22,7 @@
 - [x] Feedback visual de sucesso/erro
 - [ ] Geolocalização (opcional - código pronto)
 - [ ] Foto/biometria (futuro)
-- [ ] Modo offline (futuro)
+- [x] Modo offline (web/PWA e app; ver OFFLINE.md)
 
 ### Dashboard
 - [x] Seletor de mês

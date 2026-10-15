@@ -43,6 +43,7 @@ Sistema completo de controle de ponto eletrônico com backend Python (FastAPI) e
 | [DEPLOY.md](docs/DEPLOY.md) | Publicação em produção |
 | [OPERATIONAL_CONFIG.md](docs/OPERATIONAL_CONFIG.md) | Configuração operacional |
 | [RECOVERY.md](docs/RECOVERY.md) | Recuperação automática após queda de energia |
+| [OFFLINE.md](docs/OFFLINE.md) | Modo offline do app web (PWA): como funciona, regras e teste |
 
 ## 🏗️ Arquitetura
 
@@ -266,7 +267,7 @@ daily_hours = Column(Float, default=8.0)  # Mude aqui
 ## 📈 Próximas Melhorias
 
 - [ ] Notificações push
-- [ ] Modo offline
+- [x] Modo offline (ver [OFFLINE.md](docs/OFFLINE.md))
 - [ ] Reconhecimento facial
 - [ ] Integração com sistemas de RH
 - [ ] App para gestores

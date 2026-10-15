@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html lang="pt-BR">
 <head>
   <!--
     If you are serving your web app in a path other than the root, change the
@@ -18,11 +18,13 @@
 
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="description" content="Registro de ponto VMac com suporte offline.">
   <meta name="theme-color" content="#8B0000">
 
   <!-- iOS meta tags & icons -->
   <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
   <meta name="apple-mobile-web-app-title" content="VMac Ponto">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
@@ -32,8 +34,104 @@
 
   <title>VMac Ponto</title>
   <link rel="manifest" href="manifest.json">
+
+  <style>
+    /* Tela de carregamento enquanto o main.dart.js (alguns MB) chega. Sem
+       isso o usuario ve uma pagina branca e acha que travou, principalmente
+       no sinal fraco do campo. O Flutter remove este bloco ao assumir. */
+    html, body { margin: 0; height: 100%; background: #F5F5F5; }
+    #vmac-splash {
+      position: fixed; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 14px;
+      font-family: -apple-system, Roboto, Arial, sans-serif; color: #555;
+      font-size: 14px; background: #F5F5F5; z-index: 1;
+    }
+    #vmac-splash img { width: 96px; height: 96px; border-radius: 20px; }
+    #vmac-splash .spin {
+      width: 28px; height: 28px; border: 3px solid #ddd; border-top-color: #8B0000;
+      border-radius: 50%; animation: vmac-spin 0.9s linear infinite;
+    }
+    @keyframes vmac-spin { to { transform: rotate(360deg); } }
+    @media (prefers-color-scheme: dark) {
+      html, body, #vmac-splash { background: #000; color: #bbb; }
+      #vmac-splash .spin { border-color: #333; border-top-color: #8B0000; }
+    }
+  </style>
 </head>
 <body>
+  <div id="vmac-splash">
+    <img src="icons/Icon-192.png" alt="">
+    <div class="spin"></div>
+    <div id="vmac-splash-text">Abrindo o VMac Ponto...</div>
+  </div>
+
+  <script>
+    // Registra o service worker que guarda o app para uso offline
+    // (frontend/web/pwa_service_worker.js).
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker
+          .register('pwa_service_worker.js', { scope: '/' })
+          .catch(function (err) { console.warn('Service worker nao registrado:', err); });
+
+        // Aquecimento do cache: manda ao service worker a lista do que esta
+        // pagina carregou (canvaskit, fontes, imagens, SDK do Firebase) para
+        // ele guardar. Na primeira visita ele ainda nao intercepta nada, e
+        // sem isso a primeira abertura offline falharia nesses arquivos.
+        var vmacSent = {};
+        function vmacWarmCache() {
+          navigator.serviceWorker.ready.then(function (reg) {
+            if (!reg.active) return;
+            var urls = performance.getEntriesByType('resource')
+              .map(function (e) { return e.name; })
+              .filter(function (u) {
+                if (vmacSent[u]) return false;
+                return u.indexOf(location.origin + '/') === 0 ||
+                  u.indexOf('https://www.gstatic.com/firebasejs/') === 0;
+              });
+            if (!urls.length) return;
+            urls.forEach(function (u) { vmacSent[u] = true; });
+            reg.active.postMessage({ type: 'CACHE_URLS', urls: urls });
+          }).catch(function () {});
+        }
+        [3000, 15000, 45000, 120000].forEach(function (ms) { setTimeout(vmacWarmCache, ms); });
+      });
+    }
+
+    if (!navigator.onLine) {
+      var text = document.getElementById('vmac-splash-text');
+      if (text) text.textContent = 'Sem internet: abrindo a copia salva no aparelho...';
+    }
+
+    // O Flutter monta a interface dentro de <flutter-view>; quando ele
+    // aparece, a tela de carregamento sai.
+    var vmacObserver = new MutationObserver(function () {
+      if (document.querySelector('flutter-view')) {
+        var splash = document.getElementById('vmac-splash');
+        if (splash) splash.remove();
+        vmacObserver.disconnect();
+      }
+    });
+    vmacObserver.observe(document.body, { childList: true, subtree: true });
+
+    // Se em 30s o app nao subiu (sem internet e sem copia salva, ou arquivo
+    // que nao baixou), troca o spinner por uma orientacao em vez de girar
+    // para sempre.
+    setTimeout(function () {
+      var splash = document.getElementById('vmac-splash');
+      if (!splash) return;
+      var spin = splash.querySelector('.spin');
+      if (spin) spin.remove();
+      var text = document.getElementById('vmac-splash-text');
+      if (text) {
+        text.innerHTML = navigator.onLine
+          ? 'O app esta demorando para carregar. Verifique a conexao e toque para tentar de novo.'
+          : 'Sem internet e sem copia salva neste aparelho. Abra o app uma vez com internet para habilitar o uso offline.';
+        text.style.cssText = 'max-width:320px;text-align:center;line-height:1.5;padding:0 16px;cursor:pointer';
+        text.onclick = function () { location.reload(); };
+      }
+    }, 30000);
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

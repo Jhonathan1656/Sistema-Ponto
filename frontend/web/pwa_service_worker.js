@@ -1,12 +1,230 @@
+/* Service worker do VMac Ponto.
+ *
+ * Objetivo: o app abrir e funcionar sem internet depois de UMA abertura
+ * online. O Flutter 3.35+ nao gera mais o flutter_service_worker.js, entao
+ * sem este arquivo o navegador nao tem nada guardado e a tela fica em
+ * branco quando o sinal cai.
+ *
+ * Estrategia (sem passo de build, sem lista de versao):
+ *
+ *  - Arquivos do proprio site (index.html, main.dart.js, canvaskit, assets):
+ *    REDE PRIMEIRO, cache como reserva. Online o usuario sempre recebe a
+ *    versao publicada (o nginx manda Cache-Control: no-cache, entao a
+ *    revalidacao custa um 304). Offline, ou se a rede travar, vem do cache.
+ *    Toda resposta boa da rede atualiza o cache.
+ *
+ *  - SDK JS do Firebase (www.gstatic.com/firebasejs/<versao>/...):
+ *    CACHE PRIMEIRO. A URL carrega a versao, entao o conteudo nunca muda.
+ *    Sem isso o Firebase.initializeApp falha offline e o app mostra
+ *    "Nao foi possivel iniciar o aplicativo".
+ *
+ *  - /api/, /access/, qualquer POST e os outros dominios (Firestore, Auth,
+ *    Storage): nao sao tocados. O Firestore tem a propria persistencia
+ *    (ligada em main.dart) e a fila de pontos offline e do app.
+ */
+
+const CACHE_VERSION = 'v1';
+const SHELL_CACHE = `vmac-ponto-shell-${CACHE_VERSION}`;
+const VENDOR_CACHE = `vmac-ponto-vendor-${CACHE_VERSION}`;
+
+// Quanto esperar a rede antes de servir o cache. Arquivos grandes (main.dart.js,
+// canvaskit.wasm) continuam baixando em segundo plano e atualizam o cache
+// quando terminam.
+const NETWORK_TIMEOUT_MS = 8000;
+
+// Arquivos minimos para o app abrir. Sao buscados na instalacao para o
+// offline funcionar mesmo que a primeira visita tenha sido interrompida.
+// O canvaskit (varia por navegador), as fontes, imagens e o SDK do Firebase
+// entram pelo "aquecimento": o index.html manda para ca a lista do que a
+// pagina realmente carregou (mensagem CACHE_URLS) e tudo e guardado.
+const SHELL_URLS = [
+  '/index.html',
+  '/flutter_bootstrap.js',
+  '/main.dart.js',
+  '/manifest.json',
+  '/favicon.png',
+  '/icons/Icon-192.png',
+  '/icons/Icon-512.png',
+  '/assets/AssetManifest.bin.json',
+  '/assets/AssetManifest.bin',
+  '/assets/FontManifest.json',
+  '/assets/fonts/MaterialIcons-Regular.otf',
+];
+
+const VENDOR_PREFIX = 'https://www.gstatic.com/firebasejs/';
+
+// Caminhos do proprio dominio que nunca passam pelo cache.
+const BYPASS_PREFIXES = ['/api/', '/access/', '/access-check', '/openapi.json'];
+
 self.addEventListener('install', (event) => {
-  event.waitUntil(self.skipWaiting());
+  event.waitUntil(
+    caches
+      .open(SHELL_CACHE)
+      .then((cache) =>
+        Promise.all(
+          SHELL_URLS.map((url) =>
+            fetch(new Request(url, { cache: 'no-cache', credentials: 'same-origin' }))
+              .then((response) => {
+                if (isCacheableSameOrigin(response)) return cache.put(url, response);
+              })
+              // Um arquivo que nao veio (ex.: sem sinal na instalacao) nao
+              // impede o service worker de subir; ele entra na proxima visita.
+              .catch(() => undefined),
+          ),
+        ),
+      )
+      .then(() => self.skipWaiting()),
+  );
 });
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches
       .keys()
-      .then((keys) => Promise.all(keys.map((key) => caches.delete(key))))
-      .then(() => self.registration.unregister()),
+      .then((keys) =>
+        Promise.all(
+          keys
+            .filter((key) => key !== SHELL_CACHE && key !== VENDOR_CACHE)
+            .map((key) => caches.delete(key)),
+        ),
+      )
+      .then(() => self.clients.claim()),
   );
 });
+
+self.addEventListener('fetch', (event) => {
+  const request = event.request;
+  if (request.method !== 'GET') return;
+
+  const url = new URL(request.url);
+
+  if (url.href.startsWith(VENDOR_PREFIX)) {
+    event.respondWith(cacheFirst(request, VENDOR_CACHE));
+    return;
+  }
+
+  if (url.origin !== self.location.origin) return;
+  if (isBypassed(url.pathname)) return;
+
+  if (request.mode === 'navigate') {
+    event.respondWith(networkFirst(request, SHELL_CACHE, '/index.html'));
+    return;
+  }
+
+  event.respondWith(networkFirst(request, SHELL_CACHE));
+});
+
+self.addEventListener('message', (event) => {
+  const data = event.data || {};
+  if (data.type === 'SKIP_WAITING') self.skipWaiting();
+  if (data.type === 'CACHE_URLS' && Array.isArray(data.urls)) {
+    const done = warmCache(data.urls);
+    if (event.waitUntil) event.waitUntil(done);
+  }
+});
+
+function isBypassed(pathname) {
+  return BYPASS_PREFIXES.some((prefix) => pathname.startsWith(prefix));
+}
+
+// Aquecimento: guarda o que a pagina ja carregou e ainda nao esta no cache.
+// Na primeira visita o service worker ainda nao controla a pagina, entao o
+// canvaskit, as fontes e o SDK do Firebase passam direto por ele; sem isto
+// a proxima abertura offline falharia justamente nesses arquivos.
+async function warmCache(urls) {
+  const shell = await caches.open(SHELL_CACHE);
+  const vendor = await caches.open(VENDOR_CACHE);
+  for (const raw of urls) {
+    try {
+      const url = new URL(String(raw), self.location.origin);
+      if (url.href.startsWith(VENDOR_PREFIX)) {
+        if (await vendor.match(url.href, { ignoreVary: true })) continue;
+        const response = await fetch(url.href, { mode: 'cors' });
+        if (isCacheableVendor(response)) await vendor.put(url.href, response);
+        continue;
+      }
+      if (url.origin !== self.location.origin) continue;
+      if (isBypassed(url.pathname)) continue;
+      if (url.pathname === '/pwa_service_worker.js') continue;
+      const key = url.pathname;
+      if (await shell.match(key, { ignoreVary: true })) continue;
+      const response = await fetch(
+        new Request(url.href, { cache: 'no-cache', credentials: 'same-origin' }),
+      );
+      if (isCacheableSameOrigin(response)) await shell.put(key, response);
+    } catch (_) {
+      // Arquivo que nao veio agora entra numa proxima visita.
+    }
+  }
+}
+
+function isCacheableSameOrigin(response) {
+  // "redirected" cobre o gate de acesso: sem o cookie, o nginx responde um
+  // 302 para /access/unlock e o fetch segue o redirect. Guardar esse HTML
+  // como se fosse main.dart.js quebraria o app offline.
+  return (
+    response &&
+    response.ok &&
+    !response.redirected &&
+    (response.type === 'basic' || response.type === 'default')
+  );
+}
+
+function isCacheableVendor(response) {
+  return response && response.ok && response.type !== 'opaque';
+}
+
+async function cacheFirst(request, cacheName) {
+  const cache = await caches.open(cacheName);
+  const cached = await cache.match(request, { ignoreVary: true });
+  if (cached) return cached;
+  const response = await fetch(request);
+  if (isCacheableVendor(response)) await cache.put(request, response.clone());
+  return response;
+}
+
+async function networkFirst(request, cacheName, fallbackUrl) {
+  const cache = await caches.open(cacheName);
+  const cacheKey = cacheKeyFor(request);
+
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(undefined), NETWORK_TIMEOUT_MS);
+  });
+
+  const network = fetch(request)
+    .then((response) => {
+      if (isCacheableSameOrigin(response)) {
+        // Nao aguardamos o put: a resposta vai para a tela ja.
+        cache.put(cacheKey, response.clone()).catch(() => undefined);
+      }
+      return response;
+    })
+    .catch(() => undefined)
+    .finally(() => clearTimeout(timer));
+
+  const fromNetwork = await Promise.race([network, timeout]);
+  if (fromNetwork) return fromNetwork;
+
+  const cached =
+    (await cache.match(cacheKey, { ignoreVary: true })) ||
+    (fallbackUrl ? await cache.match(fallbackUrl, { ignoreVary: true }) : undefined);
+  if (cached) return cached;
+
+  // Nada no cache: devolve o que a rede der (erro, provavelmente), para o
+  // navegador mostrar a falha normal em vez de uma pagina vazia.
+  const late = await network;
+  if (late) return late;
+  return new Response('Sem conexao e sem copia local do app.', {
+    status: 503,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+  });
+}
+
+function cacheKeyFor(request) {
+  // Navegacoes para qualquer rota do app (ex.: /?utm=...) sao sempre o
+  // index.html: o Flutter roteia no cliente.
+  if (request.mode === 'navigate') return '/index.html';
+  const url = new URL(request.url);
+  return url.pathname;
+}

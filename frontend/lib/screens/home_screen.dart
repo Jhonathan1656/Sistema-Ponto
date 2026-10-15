@@ -457,16 +457,32 @@ class _HomeScreenState extends State<HomeScreen> {
 
       // 2. Estagiarios usam validacao autoritativa do backend na entrada/saida.
       final attemptedAt = timestamp ?? DateTime.now();
-      final Map<String, dynamic> result;
+      Map<String, dynamic> result;
       if (_isInternUser && (type == 'check_in' || type == 'check_out')) {
-        result = await _apiService.createScheduleControlledPunch(
-          recordType: type,
-          timestamp: attemptedAt.toIso8601String(),
-          notes: notes,
-          location: location,
-          latitude: position?.latitude,
-          longitude: position?.longitude,
-        );
+        try {
+          result = await _apiService.createScheduleControlledPunch(
+            recordType: type,
+            timestamp: attemptedAt.toIso8601String(),
+            notes: notes,
+            location: location,
+            latitude: position?.latitude,
+            longitude: position?.longitude,
+          );
+        } catch (e) {
+          // Sem rede o backend nao responde. Em vez de perder a batida,
+          // guarda na fila: a sincronizacao reenvia pelo mesmo endpoint
+          // (com as regras de horario) quando a internet voltar.
+          if (!ApiService.isNetworkFailure(e)) rethrow;
+          debugPrint('Backend inacessivel, guardando ponto na fila: $e');
+          result = await _apiService.queueTimeRecordOffline(
+            recordType: type,
+            timestamp: attemptedAt.toIso8601String(),
+            notes: notes,
+            location: location,
+            latitude: position?.latitude,
+            longitude: position?.longitude,
+          );
+        }
         if (result['status'] == 'approval_required') {
           await _offerScheduleApproval(
             result['request_type']?.toString() ?? 'start_exception',
