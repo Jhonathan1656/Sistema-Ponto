@@ -5,6 +5,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import '../services/api_service.dart';
 import '../services/notification_service.dart';
+import '../widgets/startup_loading.dart';
 import '../widgets/user_notification_bell.dart';
 
 import 'user_chat_list_screen.dart';
@@ -764,7 +765,7 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       extendBodyBehindAppBar: true,
       body: _isLoading && _todayRecords.isEmpty
-          ? const Center(child: CircularProgressIndicator(color: wineColor))
+          ? const StartupLoading()
           : _isOvertimeDecisionRequired
               ? _buildOvertimeDecisionScreen(theme)
               : RefreshIndicator(

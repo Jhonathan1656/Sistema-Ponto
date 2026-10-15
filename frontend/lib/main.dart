@@ -15,6 +15,7 @@ import 'services/app_permission_service.dart';
 import 'services/notification_service.dart';
 import 'services/session_service.dart';
 import 'services/theme_service.dart';
+import 'widgets/startup_loading.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -117,11 +118,7 @@ class _AppBootstrapState extends State<AppBootstrap> {
         if (snapshot.connectionState != ConnectionState.done) {
           return const MaterialApp(
             debugShowCheckedModeBanner: false,
-            home: Scaffold(
-              body: Center(
-                child: CircularProgressIndicator(color: Color(0xFF8B0000)),
-              ),
-            ),
+            home: Scaffold(body: StartupLoading()),
           );
         }
 
@@ -327,11 +324,7 @@ class _AuthGateState extends State<AuthGate> {
     _restoredSession = SessionService.restoreSession();
   }
 
-  static const Widget _splash = Scaffold(
-    body: Center(
-      child: CircularProgressIndicator(color: Color(0xFF8B0000)),
-    ),
-  );
+  static const Widget _splash = Scaffold(body: StartupLoading());
 
   @override
   Widget build(BuildContext context) {
