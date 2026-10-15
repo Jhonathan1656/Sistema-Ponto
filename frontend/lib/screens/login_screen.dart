@@ -25,12 +25,24 @@ class _LoginScreenState extends State<LoginScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       AppPermissionService.requestStartupPermissions();
     });
+    _fillLastEmail();
+  }
+
+  // Abre com o ultimo e-mail usado neste aparelho ja preenchido.
+  Future<void> _fillLastEmail() async {
+    final email = await _apiService.getLastLoginEmail();
+    if (!mounted || email == null || _emailController.text.isNotEmpty) return;
+    setState(() => _emailController.text = email);
   }
 
   Future<void> _login() async {
     if (!_formKey.currentState!.validate()) return;
 
     setState(() => _isLoading = true);
+
+    // Lembra o e-mail ja na tentativa (com ou sem internet), nao so no
+    // login que deu certo.
+    await _apiService.saveLastLoginEmail(_emailController.text);
 
     try {
       debugPrint('Tentando login para: ${_emailController.text}');
@@ -65,7 +77,8 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   void _showForgotPasswordDialog() {
-    final emailController = TextEditingController();
+    final emailController =
+        TextEditingController(text: _emailController.text.trim());
     showDialog(
       context: context,
       builder: (context) => AlertDialog(

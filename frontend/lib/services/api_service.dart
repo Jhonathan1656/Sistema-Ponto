@@ -35,6 +35,9 @@ class ApiService {
   final FirebaseStorage _storage = FirebaseStorage.instance;
   static const String _offlineRecordsKey = 'offline_time_records';
   static const String _cachedUserKey = 'cached_current_user';
+  // Ultimo e-mail digitado no login. Fica mesmo depois de sair da conta,
+  // para a tela de login ja abrir preenchida (com ou sem internet).
+  static const String _lastLoginEmailKey = 'last_login_email';
   // Copia local dos pontos do proprio usuario (ultimos dias). No web o cache
   // do Firestore fica desligado (o IndexedDB trava no Safari do iPhone), entao
   // e esta copia que mostra o status do dia sem internet e na abertura.
@@ -629,6 +632,32 @@ class ApiService {
       return user;
     } on FirebaseAuthException catch (e) {
       throw Exception('Registro falhou: ${e.message}');
+    }
+  }
+
+  Future<void> saveLastLoginEmail(String email) async {
+    final value = email.trim();
+    if (value.isEmpty) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_lastLoginEmailKey, value);
+    } catch (e) {
+      debugPrint('Nao deu para lembrar o e-mail do login: $e');
+    }
+  }
+
+  /// Ultimo e-mail usado no login neste aparelho. Para quem entrou antes
+  /// desta funcao existir, usa o e-mail do perfil guardado, se houver.
+  Future<String?> getLastLoginEmail() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getString(_lastLoginEmailKey);
+      if (saved != null && saved.isNotEmpty) return saved;
+      final cachedEmail =
+          (await getCachedCurrentUser())?['email']?.toString().trim();
+      return (cachedEmail == null || cachedEmail.isEmpty) ? null : cachedEmail;
+    } catch (e) {
+      return null;
     }
   }
 
