@@ -235,6 +235,26 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _loadInitialData() async {
     setState(() => _isLoading = true);
+
+    // 1) Copia local primeiro: a tela de ponto aparece na hora, com ou sem
+    // internet. Antes ela esperava perfil + horario + fila + pontos do
+    // servidor; no iPhone, depois de fechar e reabrir o app, isso ficava
+    // girando sem fim.
+    try {
+      final cachedUser = await _apiService.getCachedCurrentUser();
+      // Sem copia local ainda (primeira abertura depois da atualizacao), a
+      // tela mostraria "Aguardando entrada" para quem ja bateu a entrada;
+      // nesse caso continua esperando o servidor, como antes.
+      if (cachedUser != null && await _apiService.hasLocalTimeRecordsCache()) {
+        _user = cachedUser;
+        await _loadTodayRecords(localOnly: true);
+        if (mounted) setState(() => _isLoading = false);
+      }
+    } catch (e) {
+      debugPrint('Copia local indisponivel: $e');
+    }
+
+    // 2) Atualiza com o servidor em segundo plano.
     try {
       final user = await _apiService.getCurrentUser();
       _user = user;
@@ -268,7 +288,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _loadTodayRecords() async {
+  Future<void> _loadTodayRecords({bool localOnly = false}) async {
     try {
       final now = DateTime.now();
       final start = DateTime(now.year, now.month, now.day).toIso8601String();
@@ -283,7 +303,8 @@ class _HomeScreenState extends State<HomeScreen> {
           ? todayMidnight.subtract(const Duration(days: 14)).toIso8601String()
           : start;
       final windowRecords =
-          await _apiService.getTimeRecords(startDate: windowStart, endDate: end);
+          await _apiService.getTimeRecords(
+              startDate: windowStart, endDate: end, localOnly: localOnly);
       final records = windowRecords.where((item) {
         final timestamp = (item as Map)['timestamp'].toString();
         return timestamp.compareTo(start) >= 0;
@@ -292,6 +313,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
       _refreshCarriedOpenShift(now, windowRecords);
 
+      if (!mounted) return;
       setState(() {
         _todayRecords = records.reversed.toList(); // Ordem cronológica
         _pendingOfflineRecordsCount = pendingRecords.length;

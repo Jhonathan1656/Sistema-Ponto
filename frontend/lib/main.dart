@@ -41,7 +41,7 @@ class _AppBootstrapState extends State<AppBootstrap> {
     await Firebase.initializeApp(
       options: DefaultFirebaseOptions.currentPlatform,
     ).timeout(const Duration(seconds: 20));
-    _enableFirestoreOfflineCache();
+    _configureFirestoreCache();
     await initializeDateFormatting('pt_BR', null);
 
     if (!kIsWeb) {
@@ -49,22 +49,21 @@ class _AppBootstrapState extends State<AppBootstrap> {
     }
   }
 
-  /// Liga o cache local do Firestore (IndexedDB no web).
+  /// Cache local do Firestore.
   ///
-  /// No Android/iOS ele ja vem ligado; no web vem DESLIGADO por padrao. Sem
-  /// ele, offline o app nao enxerga nem o perfil nem os pontos do dia que ja
-  /// foram gravados online: a tela abria em "Aguardando entrada" para quem
-  /// tinha batido a entrada de manha. Precisa rodar antes do primeiro uso do
-  /// Firestore, por isso fica aqui, logo depois do initializeApp.
-  void _enableFirestoreOfflineCache() {
+  /// No web ele fica DESLIGADO (memoria). Com o cache em IndexedDB ligado, o
+  /// Safari do iPhone travava o Firestore depois de fechar e reabrir o app
+  /// (o IndexedDB do WebKit fica preso), e a tela de ponto girava sem fim,
+  /// com ou sem internet. O que o app precisa ver offline (perfil, pontos dos
+  /// ultimos dias e a fila de pontos) fica na copia propria do ApiService, em
+  /// SharedPreferences. No Android/iOS nativo o padrao do SDK e mantido.
+  void _configureFirestoreCache() {
+    if (!kIsWeb) return;
     try {
-      FirebaseFirestore.instance.settings = const Settings(
-        persistenceEnabled: true,
-        cacheSizeBytes: Settings.CACHE_SIZE_UNLIMITED,
-      );
+      FirebaseFirestore.instance.settings =
+          const Settings(persistenceEnabled: false);
     } catch (e) {
-      // Segunda aba aberta ou navegador sem IndexedDB: segue sem cache.
-      debugPrint('Cache offline do Firestore indisponivel: $e');
+      debugPrint('Nao deu para configurar o cache do Firestore: $e');
     }
   }
 

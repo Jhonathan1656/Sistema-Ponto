@@ -35,6 +35,11 @@ class ApiService {
   final FirebaseStorage _storage = FirebaseStorage.instance;
   static const String _offlineRecordsKey = 'offline_time_records';
   static const String _cachedUserKey = 'cached_current_user';
+  // Copia local dos pontos do proprio usuario (ultimos dias). No web o cache
+  // do Firestore fica desligado (o IndexedDB trava no Safari do iPhone), entao
+  // e esta copia que mostra o status do dia sem internet e na abertura.
+  static const String _recordsCachePrefix = 'cached_time_records_';
+  static const int _recordsCacheDays = 15;
   static String get backendUrl => AppConfig.backendUrl;
 
   Future<Map<String, String>> _authorizedHeaders() async {
@@ -629,7 +634,7 @@ class ApiService {
 
   Future<Map<String, dynamic>> getCurrentUser() async {
     final user = _auth.currentUser;
-    if (user != null) {
+    if (user != null && await _hasNetworkConnection()) {
       try {
         final currentUser =
             await _getCurrentUserOnline().timeout(const Duration(seconds: 10));
@@ -1004,6 +1009,10 @@ class ApiService {
         ...recordData,
         'created_at': FieldValue.serverTimestamp(),
       }).timeout(const Duration(seconds: 10));
+      if (targetUid == currentUserId) {
+        await _appendCachedTimeRecord(
+            currentUserId, {'id': docRef.id, ...recordData});
+      }
       return {'id': docRef.id, ...recordData};
     } catch (e) {
       if (userId != null && userId != currentUserId) rethrow;
@@ -1126,8 +1135,13 @@ class ApiService {
     }
   }
 
+  /// [localOnly]: nao consulta o servidor; usa so a copia local e a fila
+  /// offline. Serve para a tela abrir na hora, antes da atualizacao online.
   Future<List<dynamic>> getTimeRecords(
-      {String? startDate, String? endDate, String? userId}) async {
+      {String? startDate,
+      String? endDate,
+      String? userId,
+      bool localOnly = false}) async {
     final cachedUser = await getCachedCurrentUser();
     final currentUserId =
         _auth.currentUser?.uid ?? cachedUser?['id']?.toString();
@@ -1146,25 +1160,43 @@ class ApiService {
       query = query.where('timestamp', isLessThanOrEqualTo: endDate);
     }
 
-    try {
-      final snapshot = await query.get().timeout(const Duration(seconds: 10));
-      records =
-          snapshot.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
-    } catch (e) {
-      // Sem o indice composto (FAILED_PRECONDITION) ou outra falha: cai para a
-      // consulta simples por usuario. Le mais, mas nao quebra; o filtro de data
-      // em memoria abaixo garante o mesmo resultado.
-      debugPrint('Consulta por data indisponivel, usando fallback: $e');
+    final ownUid = (targetUid != null && targetUid == currentUserId)
+        ? targetUid
+        : null;
+    var fromServer = false;
+    final online = !localOnly && await _hasNetworkConnection();
+
+    if (online) {
       try {
-        final snapshot = await _db
-            .collection('time_records')
-            .where('user_id', isEqualTo: targetUid)
-            .get()
-            .timeout(const Duration(seconds: 10));
+        final snapshot = await query.get().timeout(const Duration(seconds: 10));
         records =
             snapshot.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
-      } catch (e2) {
-        debugPrint('Pontos online indisponiveis, usando registros offline: $e2');
+        fromServer = true;
+      } catch (e) {
+        // Sem o indice composto (FAILED_PRECONDITION) ou outra falha: cai para a
+        // consulta simples por usuario. Le mais, mas nao quebra; o filtro de data
+        // em memoria abaixo garante o mesmo resultado.
+        debugPrint('Consulta por data indisponivel, usando fallback: $e');
+        try {
+          final snapshot = await _db
+              .collection('time_records')
+              .where('user_id', isEqualTo: targetUid)
+              .get()
+              .timeout(const Duration(seconds: 10));
+          records =
+              snapshot.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
+          fromServer = true;
+        } catch (e2) {
+          debugPrint('Pontos online indisponiveis, usando registros offline: $e2');
+        }
+      }
+    }
+
+    if (ownUid != null) {
+      if (fromServer) {
+        await _cacheTimeRecords(ownUid, startDate, endDate, records);
+      } else {
+        records = await _readCachedTimeRecords(ownUid);
       }
     }
 
@@ -1195,6 +1227,92 @@ class ApiService {
     }
 
     return records;
+  }
+
+  /// Atualiza a copia local com o que o servidor devolveu para a janela
+  /// [startDate, endDate]: dentro da janela o servidor manda (inclusive
+  /// remocoes); fora dela a copia anterior fica. Guarda so os ultimos
+  /// [_recordsCacheDays] dias.
+  Future<void> _cacheTimeRecords(String uid, String? startDate,
+      String? endDate, List<Map<String, dynamic>> serverRecords) async {
+    try {
+      bool inWindow(String ts) =>
+          (startDate == null || ts.compareTo(startDate) >= 0) &&
+          (endDate == null || ts.compareTo(endDate) <= 0);
+      final cutoff = DateTime.now()
+          .subtract(const Duration(days: _recordsCacheDays))
+          .toIso8601String();
+      final kept = (await _readCachedTimeRecords(uid))
+          .where((r) => !inWindow(r['timestamp']?.toString() ?? ''));
+      final merged = [
+        ...kept,
+        ...serverRecords.map(_jsonSafeRecord),
+      ]
+          .where((r) => (r['timestamp']?.toString() ?? '').compareTo(cutoff) >= 0)
+          .toList();
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('$_recordsCachePrefix$uid', jsonEncode(merged));
+    } catch (e) {
+      debugPrint('Nao deu para guardar a copia local dos pontos: $e');
+    }
+  }
+
+  /// True quando este aparelho ja tem a copia local dos pontos do usuario
+  /// logado (gravada numa leitura online anterior).
+  Future<bool> hasLocalTimeRecordsCache() async {
+    final cachedUser = await getCachedCurrentUser();
+    final uid = _auth.currentUser?.uid ?? cachedUser?['id']?.toString();
+    if (uid == null || uid.isEmpty) return false;
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.containsKey('$_recordsCachePrefix$uid');
+  }
+
+  Future<void> _appendCachedTimeRecord(
+      String uid, Map<String, dynamic> record) async {
+    try {
+      final records = (await _readCachedTimeRecords(uid))
+          .where((r) => r['id'] != record['id'])
+          .toList()
+        ..add(_jsonSafeRecord(record));
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('$_recordsCachePrefix$uid', jsonEncode(records));
+    } catch (e) {
+      debugPrint('Nao deu para guardar o ponto na copia local: $e');
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> _readCachedTimeRecords(String uid) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('$_recordsCachePrefix$uid');
+      if (raw == null) return [];
+      return (jsonDecode(raw) as List)
+          .map((item) => Map<String, dynamic>.from(item as Map))
+          .toList();
+    } catch (e) {
+      debugPrint('Copia local dos pontos ilegivel: $e');
+      return [];
+    }
+  }
+
+  Map<String, dynamic> _jsonSafeRecord(Map<String, dynamic> record) =>
+      record.map((key, value) => MapEntry(key, _jsonSafeValue(value)));
+
+  dynamic _jsonSafeValue(dynamic value) {
+    if (value == null || value is String || value is num || value is bool) {
+      return value;
+    }
+    if (value is Timestamp) return value.toDate().toIso8601String();
+    if (value is DateTime) return value.toIso8601String();
+    if (value is GeoPoint) {
+      return {'latitude': value.latitude, 'longitude': value.longitude};
+    }
+    if (value is List) return value.map(_jsonSafeValue).toList();
+    if (value is Map) {
+      return value.map(
+          (key, item) => MapEntry(key.toString(), _jsonSafeValue(item)));
+    }
+    return value.toString();
   }
 
   // ignore: unused_element
