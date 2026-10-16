@@ -1,0 +1,10 @@
+# So no VPS (ligado pelo COMPOSE_FILE em /opt/ponto/.env): as portas ficam
+# presas ao 127.0.0.1. O site chega pelo tunel da Cloudflare, e o Docker
+# passaria por cima do firewall se as portas ficassem em 0.0.0.0.
+services:
+  backend:
+    ports: !override
+      - "127.0.0.1:8000:8000"
+  frontend:
+    ports: !override
+      - "127.0.0.1:8080:80"

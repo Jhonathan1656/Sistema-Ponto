@@ -1,0 +1,3 @@
+# Scripts que rodam no VPS (Linux): sempre LF, inclusive no checkout do Windows.
+*.sh text eol=lf
+deploy/*.yml text eol=lf
