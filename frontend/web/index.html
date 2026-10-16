@@ -62,6 +62,37 @@
       #vmac-splash .spin { border-color: #333; border-top-color: #8B0000; }
       #vmac-progress .bar { background: #333; }
     }
+    /* Aviso "Instalar o app" (so no navegador do celular, nunca no app ja
+       instalado). Fica por cima da tela do Flutter. */
+    #vmac-install {
+      position: fixed; left: 12px; right: 12px; bottom: 12px; z-index: 20;
+      display: none; background: #fff; color: #222; border-radius: 16px;
+      box-shadow: 0 8px 28px rgba(0,0,0,.28); padding: 16px 16px 14px;
+      font-family: -apple-system, Roboto, Arial, sans-serif; font-size: 16px; line-height: 1.4;
+      max-width: 460px; margin: 0 auto;
+    }
+    #vmac-install.show { display: block; animation: vmac-up .25s ease-out; }
+    @keyframes vmac-up { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
+    #vmac-install .top { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+    #vmac-install .top img { width: 48px; height: 48px; border-radius: 11px; border: 1px solid #eee; }
+    #vmac-install .title { font-weight: bold; font-size: 18px; color: #8B0000; }
+    #vmac-install .steps { margin: 4px 0 12px; padding: 0; list-style: none; }
+    #vmac-install .steps li { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+    #vmac-install .num { flex: 0 0 26px; height: 26px; border-radius: 50%; background: #8B0000; color: #fff;
+      font-weight: bold; display: grid; place-items: center; font-size: 15px; }
+    #vmac-install .glyph { display: inline-flex; vertical-align: middle; width: 26px; height: 26px;
+      border: 1px solid #ccc; border-radius: 6px; align-items: center; justify-content: center; margin: 0 2px; }
+    #vmac-install .buttons { display: flex; gap: 10px; }
+    #vmac-install button { flex: 1; padding: 14px; border-radius: 12px; font-size: 17px; font-weight: bold; border: 0; cursor: pointer; }
+    #vmac-install .go { background: #8B0000; color: #fff; }
+    #vmac-install .later { background: #eee; color: #444; }
+    #vmac-install .arrow { text-align: center; font-size: 30px; color: #8B0000; margin-top: 6px; animation: vmac-bounce 1.2s infinite; }
+    @keyframes vmac-bounce { 50% { transform: translateY(6px); } }
+    @media (prefers-color-scheme: dark) {
+      #vmac-install { background: #1e1e1e; color: #eee; }
+      #vmac-install .later { background: #333; color: #ddd; }
+      #vmac-install .glyph { border-color: #555; }
+    }
   </style>
 </head>
 <body>
@@ -171,6 +202,113 @@
         text.onclick = function () { location.reload(); };
       }
     }, 45000);
+  </script>
+  <!-- Aviso "Instalar o app do ponto". Android: botao que abre a instalacao
+       do proprio celular. iPhone: a Apple nao deixa site instalar sozinho,
+       entao o aviso mostra os dois toques (Compartilhar > Adicionar a Tela de
+       Inicio). Nao aparece no app ja instalado; "Agora nao" esconde 3 dias. -->
+  <div id="vmac-install" role="dialog" aria-label="Instalar o app do ponto">
+    <div class="top">
+      <img src="icons/Icon-192.png?v=2" alt="">
+      <div><div class="title">Instale o app do ponto</div><div>Fica um &iacute;cone na tela do celular, igual a um aplicativo.</div></div>
+    </div>
+    <div id="vmac-install-body"></div>
+    <div class="buttons">
+      <button class="later" id="vmac-install-later" type="button">Agora n&atilde;o</button>
+      <button class="go" id="vmac-install-go" type="button" style="display:none">Instalar</button>
+    </div>
+  </div>
+  <script>
+    (function () {
+      var KEY = 'vmac-install-dismissed-at';
+      var ua = navigator.userAgent || '';
+      var isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+      var isAndroid = /Android/i.test(ua);
+      var installed = (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
+        window.navigator.standalone === true;
+      var deferredPrompt = null;
+      var box = document.getElementById('vmac-install');
+      var body = document.getElementById('vmac-install-body');
+      var go = document.getElementById('vmac-install-go');
+
+      function dismissedRecently() {
+        try {
+          var at = parseInt(localStorage.getItem(KEY) || '0', 10);
+          return at && (Date.now() - at) < 3 * 24 * 3600 * 1000;
+        } catch (e) { return false; }
+      }
+      function hide(remember) {
+        box.classList.remove('show');
+        if (remember) { try { localStorage.setItem(KEY, String(Date.now())); } catch (e) {} }
+      }
+      var shareIcon = '<span class="glyph" aria-label="Compartilhar"><svg width="16" height="18" viewBox="0 0 16 18" fill="none" stroke="#1a73e8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 11V1M4.5 4.5 8 1l3.5 3.5"/><path d="M5 7H2.5v9.5h11V7H11"/></svg></span>';
+      var plusIcon = '<span class="glyph" aria-label="Adicionar"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#444" stroke-width="1.8" stroke-linecap="round"><rect x="1.5" y="1.5" width="13" height="13" rx="3"/><path d="M8 5v6M5 8h6"/></svg></span>';
+      var menuIcon = '<span class="glyph" aria-label="Menu"><svg width="4" height="16" viewBox="0 0 4 16" fill="#444"><circle cx="2" cy="2" r="1.7"/><circle cx="2" cy="8" r="1.7"/><circle cx="2" cy="14" r="1.7"/></svg></span>';
+
+      function steps(items) {
+        return '<ul class="steps">' + items.map(function (s, i) {
+          return '<li><span class="num">' + (i + 1) + '</span><span>' + s + '</span></li>';
+        }).join('') + '</ul>';
+      }
+      function showIOS() {
+        body.innerHTML = steps([
+          'Toque no bot&atilde;o ' + shareIcon + ' <b>Compartilhar</b> (na barra do Safari; se n&atilde;o achar, toque antes em <b>&middot;&middot;&middot;</b>)',
+          'Toque em ' + plusIcon + ' <b>Adicionar &agrave; Tela de In&iacute;cio</b> e depois em <b>Adicionar</b>'
+        ]) + '<div class="arrow">&#8595;</div>';
+        go.style.display = 'none';
+        box.classList.add('show');
+      }
+      function showAndroidButton() {
+        body.innerHTML = '';
+        go.style.display = '';
+        box.classList.add('show');
+      }
+      function showAndroidManual() {
+        body.innerHTML = steps([
+          'Toque no menu ' + menuIcon + ' do navegador (canto de cima)',
+          'Toque em <b>Instalar app</b> ou <b>Adicionar &agrave; tela inicial</b>'
+        ]);
+        go.style.display = 'none';
+        box.classList.add('show');
+      }
+
+      // Chrome/Android avisa que da para instalar: guarda o evento para o botao.
+      window.addEventListener('beforeinstallprompt', function (e) {
+        e.preventDefault();
+        deferredPrompt = e;
+        if (box.classList.contains('show')) showAndroidButton();
+      });
+      window.addEventListener('appinstalled', function () { hide(false); deferredPrompt = null; });
+      document.getElementById('vmac-install-later').onclick = function () { hide(true); };
+      go.onclick = function () {
+        if (!deferredPrompt) { showAndroidManual(); return; }
+        deferredPrompt.prompt();
+        deferredPrompt.userChoice.then(function (choice) {
+          if (choice && choice.outcome === 'accepted') hide(false);
+        }).catch(function () {});
+        deferredPrompt = null;
+      };
+
+      if (installed || !(isIOS || isAndroid) || dismissedRecently()) return;
+
+      // Aparece alguns segundos depois de o app abrir, para nao cobrir a
+      // abertura. No Android espera o Chrome liberar a instalacao; se ele nao
+      // liberar (outro navegador), mostra o caminho pelo menu.
+      function whenAppVisible(fn) {
+        if (document.querySelector('flutter-view')) return fn();
+        var obs = new MutationObserver(function () {
+          if (document.querySelector('flutter-view')) { obs.disconnect(); fn(); }
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+      }
+      whenAppVisible(function () {
+        setTimeout(function () {
+          if (isIOS) showIOS();
+          else if (deferredPrompt) showAndroidButton();
+          else showAndroidManual();
+        }, 4000);
+      });
+    })();
   </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
