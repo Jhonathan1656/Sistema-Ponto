@@ -152,11 +152,24 @@ async def health():
     return {"status": "ok"}
 
 
+def _normalize_access_key(value: str) -> str:
+    """Palavra-chave sem diferenca de maiuscula/minuscula nem espacos nas
+    pontas: o pessoal digita no celular, muitas vezes com corretor ligado."""
+    return (value or "").strip().lower()
+
+
+def _access_key_matches(value: str) -> bool:
+    expected = _normalize_access_key(SHARED_ACCESS_TOKEN)
+    return bool(expected) and secrets.compare_digest(
+        _normalize_access_key(value).encode("utf-8"), expected.encode("utf-8")
+    )
+
+
 def _shared_access_cookie_value() -> str:
     """Returns a signed value without exposing the shared access token."""
     return hmac.new(
         SECRET_KEY.encode("utf-8"),
-        SHARED_ACCESS_TOKEN.encode("utf-8"),
+        _normalize_access_key(SHARED_ACCESS_TOKEN).encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 
@@ -165,35 +178,59 @@ def _safe_redirect_path(path: str) -> str:
     return path if path.startswith("/") and not path.startswith("//") else "/"
 
 
-@app.get("/access/unlock", response_class=HTMLResponse)
-async def access_unlock_form(next: str = "/"):
-    safe_next = html.escape(_safe_redirect_path(next), quote=True)
-    return f"""<!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Acesso ao Ponto</title><style>
-body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f6f8;font-family:Arial,sans-serif;color:#18212b}}
-main{{width:min(360px,calc(100% - 48px));background:#fff;padding:32px;border-radius:14px;box-shadow:0 12px 32px #0002}}
-h1{{margin:0 0 10px;font-size:24px}}p{{margin:0 0 24px;color:#52606d;line-height:1.45}}label{{display:block;font-weight:600;margin-bottom:8px}}input{{box-sizing:border-box;width:100%;padding:13px;border:1px solid #b8c2cc;border-radius:8px;font-size:16px}}button{{width:100%;margin-top:16px;padding:13px;border:0;border-radius:8px;background:#1769aa;color:#fff;font-size:16px;font-weight:600;cursor:pointer}}
-</style></head><body><main><h1>Acesso restrito</h1><p>Informe o token de acesso para continuar.</p>
-<form method="post" action="/access/login"><input type="hidden" name="next" value="{safe_next}"><label for="token">Token de acesso</label><input id="token" name="token" type="password" autocomplete="current-password" autofocus required><button type="submit">Entrar</button></form>
-</main></body></html>"""
+# Desbloqueio vale 1 ano no aparelho: o pessoal nao deveria ter de digitar
+# a palavra-chave de novo todo mes.
+_ACCESS_COOKIE_MAX_AGE = 60 * 60 * 24 * 365
 
 
-@app.post("/access/login")
-async def access_unlock(token: str = Form(...), next: str = Form("/")):
-    if not SHARED_ACCESS_TOKEN or not secrets.compare_digest(token, SHARED_ACCESS_TOKEN):
-        return HTMLResponse("<h1>Token inválido</h1><p><a href='/access/unlock'>Tentar novamente</a></p>", status_code=401)
-
-    response = RedirectResponse(url=_safe_redirect_path(next), status_code=303)
+def _unlocked_redirect(next_path: str) -> RedirectResponse:
+    response = RedirectResponse(url=_safe_redirect_path(next_path), status_code=303)
     response.set_cookie(
         key=SHARED_ACCESS_COOKIE,
         value=_shared_access_cookie_value(),
-        max_age=60 * 60 * 24 * 30,
+        max_age=_ACCESS_COOKIE_MAX_AGE,
         secure=True,
         httponly=True,
         samesite="lax",
     )
     return response
+
+
+def _access_page(next_path: str, error: bool = False) -> str:
+    safe_next = html.escape(_safe_redirect_path(next_path), quote=True)
+    error_html = (
+        '<p class="erro">Palavra-chave errada. Confira e tente de novo.</p>'
+        if error
+        else ""
+    )
+    return f"""<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Acesso ao Ponto</title><style>
+body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f5f5;font-family:Arial,sans-serif;color:#18212b}}
+main{{width:min(360px,calc(100% - 48px));background:#fff;padding:32px;border-radius:14px;box-shadow:0 12px 32px #0002}}
+h1{{margin:0 0 10px;font-size:24px;color:#8B0000}}p{{margin:0 0 20px;color:#52606d;line-height:1.45;font-size:17px}}
+.erro{{color:#b00020;font-weight:bold}}label{{display:block;font-weight:600;margin-bottom:8px;font-size:17px}}
+input{{box-sizing:border-box;width:100%;padding:14px;border:2px solid #b8c2cc;border-radius:10px;font-size:20px}}
+button{{width:100%;margin-top:16px;padding:16px;border:0;border-radius:10px;background:#8B0000;color:#fff;font-size:19px;font-weight:700;cursor:pointer}}
+</style></head><body><main><h1>Ponto VMac</h1><p>Digite a palavra-chave da empresa. Isso so e pedido uma vez neste celular.</p>{error_html}
+<form method="post" action="/access/login"><input type="hidden" name="next" value="{safe_next}"><label for="token">Palavra-chave</label><input id="token" name="token" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" autofocus required><button type="submit">Entrar</button></form>
+</main></body></html>"""
+
+
+@app.get("/access/unlock", response_class=HTMLResponse)
+async def access_unlock_form(next: str = "/", k: str = ""):
+    # Link pronto (WhatsApp / QR Code): /access/unlock?k=<palavra-chave>
+    # libera o aparelho sem digitar nada.
+    if k and _access_key_matches(k):
+        return _unlocked_redirect(next)
+    return HTMLResponse(_access_page(next, error=bool(k)))
+
+
+@app.post("/access/login")
+async def access_unlock(token: str = Form(...), next: str = Form("/")):
+    if not _access_key_matches(token):
+        return HTMLResponse(_access_page(next, error=True), status_code=401)
+    return _unlocked_redirect(next)
 
 
 @app.get("/access/check")
