@@ -59,8 +59,10 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
     });
     try {
       final start = _periodStart;
-      final end = DateTime(
-          _periodEnd.year, _periodEnd.month, _periodEnd.day, 23, 59, 59);
+      // Fim do dia com microssegundos: o backend grava 23:59:59.123456, que
+      // na comparacao de texto fica depois de "23:59:59".
+      final end = DateTime(_periodEnd.year, _periodEnd.month, _periodEnd.day,
+          23, 59, 59, 999, 999);
       final data = await _apiService.exportTimesheet(
         startDate: start.toIso8601String(),
         endDate: end.toIso8601String(),
@@ -94,8 +96,16 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
   /// O construtor do DateTime normaliza casos como "29 de fevereiro".
   DateTime get _periodStart => DateTime(_month.year, _month.month - 1, 29);
   DateTime get _periodEnd => DateTime(_month.year, _month.month, 28);
-  int get _periodDays => _periodEnd.difference(_periodStart).inDays + 1;
-  DateTime _dateAt(int index) => _periodStart.add(Duration(days: index));
+  // Dias contados pelo calendario (UTC nao tem horario de verao): com 24h
+  // por dia, um dia de 23h tirava um dia do periodo.
+  int get _periodDays =>
+      DateTime.utc(_periodEnd.year, _periodEnd.month, _periodEnd.day)
+          .difference(DateTime.utc(
+              _periodStart.year, _periodStart.month, _periodStart.day))
+          .inDays +
+      1;
+  DateTime _dateAt(int index) =>
+      DateTime(_periodStart.year, _periodStart.month, _periodStart.day + index);
 
   /// Meta do periodo = carga diaria x dias/semana x 4 semanas.
   /// Estagiario trabalha 5 dias/semana; demais cargos, 6.

@@ -3,6 +3,9 @@ import 'package:intl/intl.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'dart:async';
 import '../services/api_service.dart';
+import '../utils/batch_entry.dart';
+import '../utils/shift_records.dart';
+import '../utils/timesheet.dart';
 import 'team_records_screen.dart';
 
 class AdminScreen extends StatefulWidget {
@@ -348,12 +351,16 @@ class _ScheduleApprovalsTabState extends State<_ScheduleApprovalsTab> {
   Color _statusColor(String status) {
     if (status == 'approved') return Colors.green;
     if (status == 'rejected') return wineColor;
+    if (status == 'superseded') return Colors.grey;
     return Colors.orange.shade800;
   }
 
+  // superseded: pedido de entrada antigo que o estagiario refez mais tarde
+  // no mesmo dia (o backend fecha o antigo ao criar o novo).
   String _statusLabel(String status) {
     if (status == 'approved') return 'LIBERADA';
     if (status == 'rejected') return 'RECUSADA';
+    if (status == 'superseded') return 'SUBSTITUIDA';
     return 'PENDENTE';
   }
 
@@ -424,6 +431,11 @@ class _ScheduleApprovalsTabState extends State<_ScheduleApprovalsTab> {
             ),
             const SizedBox(height: 12),
             Text('Solicitado: ${_formatTimestamp(request['attempted_at'])}'),
+            // Pedido anterior do mesmo dia que este substituiu: a chegada
+            // real pode ter sido a dele (corrija pelo lote).
+            if (request['previous_attempted_at'] != null)
+              Text('Primeiro pedido do dia: '
+                  '${_formatTimestamp(request['previous_attempted_at'])}'),
             Text(
                 'Horário efetivo: ${schedule['shift_start'] ?? '-'} - ${schedule['shift_end'] ?? '-'}'),
             if (isStart)
@@ -728,6 +740,18 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
   bool _showInactive = false;
   Timer? _timer;
 
+  // Pontos de ontem, para o turno que passou da meia-noite. Dia fechado quase
+  // nao muda e o resumo atualiza a cada 5 min: le uma vez por dia (puxar a
+  // lista para baixo le de novo). Estatico como o cache de usuarios: a aba e
+  // recriada a cada troca de aba.
+  static String? _yesterdayKey;
+  static List<Map<String, dynamic>> _yesterdayRecords = const [];
+  // Pontos de hoje que comecam o dia sem entrada e que a vespera lida nao
+  // explica (dayStartWithoutShift): a vespera mudou depois de lida (lote do
+  // gestor em outro aparelho, ponto offline). Cada um pede uma leitura nova,
+  // uma vez so.
+  static Set<String> _yesterdayCheckedStarts = const {};
+
   String _statusFilterLabel() {
     switch (_statusFilter) {
       case 'working':
@@ -830,7 +854,8 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
     super.dispose();
   }
 
-  Future<void> _loadSummary({bool silent = false}) async {
+  Future<void> _loadSummary(
+      {bool silent = false, bool refreshYesterday = false}) async {
     if (!silent && mounted) setState(() => _isLoading = true);
 
     try {
@@ -839,25 +864,24 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
       final users = await _apiService.getUsers(forceRefresh: !silent);
       final now = DateTime.now();
       final start = DateTime(now.year, now.month, now.day).toIso8601String();
-      final end =
-          DateTime(now.year, now.month, now.day, 23, 59, 59).toIso8601String();
+      // Fim do dia com microssegundos: o backend grava 23:59:59.123456, que
+      // na comparacao de texto fica depois de "23:59:59".
+      final end = DateTime(now.year, now.month, now.day, 23, 59, 59, 999, 999)
+          .toIso8601String();
       final records =
           await _apiService.getAdminTimeRecords(startDate: start, endDate: end);
-
-      final recordsByUser = <String, List<Map<String, dynamic>>>{};
-      for (final rawRecord in records) {
-        final record = Map<String, dynamic>.from(rawRecord);
-        final userId = record['user_id']?.toString();
-        if (userId == null) continue;
-        recordsByUser.putIfAbsent(userId, () => []).add(record);
-      }
+      final recordsByUser = _groupByUser(records);
+      final yesterday =
+          await _loadYesterdayRecords(now, refreshYesterday, recordsByUser);
+      final yesterdayByUser = _groupByUser(yesterday);
 
       final summaries = users.map<Map<String, dynamic>>((rawUser) {
         final user = Map<String, dynamic>.from(rawUser);
-        final userRecords = recordsByUser[user['id']?.toString()] ?? [];
-        userRecords.sort((a, b) =>
-            (a['timestamp'] as String).compareTo(b['timestamp'] as String));
-        return _buildUserSummary(user, userRecords, now);
+        final userId = user['id']?.toString();
+        final todayRecords = recordsByUser[userId] ?? [];
+        final shift = _currentShiftRecords(
+            yesterdayByUser[userId] ?? const [], todayRecords, now);
+        return _buildUserSummary(user, shift, now);
       }).toList();
 
       summaries.sort((a, b) {
@@ -886,6 +910,91 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
     }
   }
 
+  Future<List<Map<String, dynamic>>> _loadYesterdayRecords(DateTime now,
+      bool force, Map<String, List<Map<String, dynamic>>> todayByUser) async {
+    final day = DateTime(now.year, now.month, now.day - 1);
+    final key = DateFormat('yyyy-MM-dd').format(day);
+    if (!force &&
+        _yesterdayKey == key &&
+        _yesterdayCheckedStarts
+            .containsAll(_startsWithoutShift(_yesterdayRecords, todayByUser))) {
+      return _yesterdayRecords;
+    }
+    final records = await _apiService.getAdminTimeRecords(
+      startDate: day.toIso8601String(),
+      endDate: DateTime(day.year, day.month, day.day, 23, 59, 59, 999, 999)
+          .toIso8601String(),
+    );
+    _yesterdayRecords =
+        records.map((record) => Map<String, dynamic>.from(record)).toList();
+    _yesterdayKey = key;
+    // Os que nem a vespera nova explica nao pedem outra leitura.
+    _yesterdayCheckedStarts =
+        _startsWithoutShift(_yesterdayRecords, todayByUser);
+    return _yesterdayRecords;
+  }
+
+  /// Pontos de hoje, um por usuario, que comecam o dia sem entrada e que
+  /// [yesterday] nao explica (dayStartWithoutShift).
+  Set<String> _startsWithoutShift(List<Map<String, dynamic>> yesterday,
+      Map<String, List<Map<String, dynamic>>> todayByUser) {
+    final yesterdayByUser = _groupByUser(yesterday);
+    return {
+      for (final MapEntry(key: userId, value: today) in todayByUser.entries)
+        if (dayStartWithoutShift(yesterdayByUser[userId] ?? const [], today)
+            case final start?)
+          '$userId|${start['id'] ?? start['timestamp']}',
+    };
+  }
+
+  /// Pontos por usuario, em ordem cronologica.
+  Map<String, List<Map<String, dynamic>>> _groupByUser(
+      Iterable<dynamic> records) {
+    final byUser = <String, List<Map<String, dynamic>>>{};
+    for (final rawRecord in records) {
+      final record = Map<String, dynamic>.from(rawRecord);
+      final userId = record['user_id']?.toString();
+      if (userId == null) continue;
+      byUser.putIfAbsent(userId, () => []).add(record);
+    }
+    for (final list in byUser.values) {
+      // No mesmo horario, a ordem vem do tipo (sortRecords).
+      sortRecords(list);
+    }
+    return byUser;
+  }
+
+  /// Pontos que o resumo considera: os de hoje e, quando o turno de ontem
+  /// ainda estava aberto na meia-noite (entrada 19:30, saida 07:00), os de
+  /// ontem desde a entrada. So com hoje, quem entrou 19:30 aparecia "Sem
+  /// ponto hoje" as 02:00 e com 00h00 depois da saida das 07:00.
+  /// Se hoje ja tem entrada, o turno de ontem acabou e o resumo segue o
+  /// turno novo (os pontos da madrugada sao do turno de ontem). Sem ponto
+  /// hoje ate [maxShiftSpan] depois da entrada e saida esquecida, nao turno.
+  List<Map<String, dynamic>> _currentShiftRecords(
+    List<Map<String, dynamic>> yesterday,
+    List<Map<String, dynamic>> today,
+    DateTime now,
+  ) {
+    final open = openShiftCheckIn(yesterday);
+    final openAt = DateTime.tryParse(open?['timestamp']?.toString() ?? '');
+    if (open == null || openAt == null) return today;
+    final next = today.isEmpty
+        ? now
+        : DateTime.tryParse(today.first['timestamp'].toString()) ?? now;
+    if (next.difference(openAt) > maxShiftSpan) return today;
+
+    final firstCheckIn =
+        today.indexWhere((record) => record['record_type'] == 'check_in');
+    if (firstCheckIn >= 0) return today.sublist(firstCheckIn);
+    final from = open['timestamp'].toString();
+    return [
+      ...yesterday.where(
+          (record) => record['timestamp'].toString().compareTo(from) >= 0),
+      ...today,
+    ];
+  }
+
   Map<String, dynamic> _buildUserSummary(
     Map<String, dynamic> user,
     List<Map<String, dynamic>> records,
@@ -893,13 +1002,22 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
   ) {
     Duration worked = Duration.zero;
     DateTime? workStart;
+    var resumedByAutomaticEnd = false;
 
     for (final record in records) {
       final type = record['record_type']?.toString();
       final timestamp = DateTime.parse(record['timestamp']);
 
-      if (type == 'check_in' || type == 'break_end' || type == 'exit_3') {
+      if (type == 'check_in') {
         workStart ??= timestamp;
+      } else if (type == 'break_end' || type == 'exit_3') {
+        // Fim real depois do automatico na mesma pausa (ponto offline que
+        // sincronizou tarde): vale o real, como na folha.
+        final automatic = isAutomaticBreakEnd(record);
+        if (workStart == null || (resumedByAutomaticEnd && !automatic)) {
+          workStart = timestamp;
+          resumedByAutomaticEnd = automatic;
+        }
       } else if (type == 'break_start' ||
           type == 'entry_3' ||
           type == 'check_out') {
@@ -907,6 +1025,7 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
           worked += timestamp.difference(workStart);
         }
         workStart = null;
+        resumedByAutomaticEnd = false;
       }
     }
 
@@ -914,6 +1033,12 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
     final lastType = lastRecord?['record_type']?.toString();
     final lastTime =
         lastRecord != null ? DateTime.parse(lastRecord['timestamp']).toLocal() : null;
+    // Turno que comecou ontem: as horas sao do turno, nao so de hoje.
+    final firstTime = records.isNotEmpty
+        ? DateTime.parse(records.first['timestamp']).toLocal()
+        : null;
+    final fromYesterday = firstTime != null &&
+        firstTime.isBefore(DateTime(now.year, now.month, now.day));
 
     String statusKey = 'none';
     String statusLabel = 'Sem ponto hoje';
@@ -951,6 +1076,7 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
       'status_color': statusColor,
       'worked': worked,
       'last_time': lastTime,
+      'from_yesterday': fromYesterday,
       'pause_overdue': pauseOverdue,
       'records_count': records.length,
     };
@@ -960,6 +1086,15 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
     final hours = duration.inHours;
     final minutes = duration.inMinutes.remainder(60);
     return '${hours.toString().padLeft(2, '0')}h${minutes.toString().padLeft(2, '0')}';
+  }
+
+  /// Hora do ultimo ponto, com a data quando ele e de ontem (turno que
+  /// passou da meia-noite).
+  String _formatLastTime(DateTime time) {
+    final now = DateTime.now();
+    final isToday =
+        time.year == now.year && time.month == now.month && time.day == now.day;
+    return DateFormat(isToday ? 'HH:mm' : 'dd/MM HH:mm').format(time);
   }
 
   @override
@@ -982,7 +1117,7 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
         .toList();
 
     return RefreshIndicator(
-      onRefresh: _loadSummary,
+      onRefresh: () => _loadSummary(refreshYesterday: true),
       color: wineColor,
       child: ListView(
         padding: const EdgeInsets.fromLTRB(16, 18, 16, 16),
@@ -1201,7 +1336,7 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
           if (lastTime != null) ...[
             const SizedBox(width: 12),
             Text(
-              DateFormat('HH:mm').format(lastTime),
+              _formatLastTime(lastTime),
               style: const TextStyle(color: Colors.grey, fontSize: 12),
             ),
           ],
@@ -1279,8 +1414,11 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
               style: TextStyle(
                   color: color, fontSize: 12, fontWeight: FontWeight.w700)),
           const Spacer(),
-          const Text('Horas hoje',
-              style: TextStyle(color: Colors.grey, fontSize: 11)),
+          Text(
+              summary['from_yesterday'] == true
+                  ? 'Horas do turno'
+                  : 'Horas hoje',
+              style: const TextStyle(color: Colors.grey, fontSize: 11)),
           Text(_formatDuration(worked),
               style:
                   const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
@@ -1288,7 +1426,7 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
           Text(
             lastTime == null
                 ? 'Sem registros hoje'
-                : 'Ultimo ponto ${DateFormat('HH:mm').format(lastTime)}',
+                : 'Ultimo ponto ${_formatLastTime(lastTime)}',
             style: const TextStyle(color: Colors.grey, fontSize: 11),
           ),
         ],
@@ -1778,54 +1916,119 @@ class _ManualEntryTabState extends State<_ManualEntryTab> {
     );
   }
 
+  static const Map<String, String> _batchLabels = {
+    'check_in': 'Entrada',
+    'break_start': 'Pausa 1 (início)',
+    'break_end': 'Pausa 1 (fim)',
+    'entry_3': 'Pausa 2 (início)',
+    'exit_3': 'Pausa 2 (fim)',
+    'check_out': 'Saída',
+  };
+
+  /// Pede a confirmacao dos horarios que vao para o dia seguinte.
+  Future<bool> _confirmNextDay(List<BatchPunch> nextDay) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Horários no dia seguinte'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            for (final punch in nextDay)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text('${_batchLabels[punch.recordType]} '
+                    '${DateFormat('HH:mm').format(punch.at)} será lançada em '
+                    '${DateFormat('dd/MM').format(punch.at)} (dia seguinte).'),
+              ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancelar'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            style: ElevatedButton.styleFrom(backgroundColor: wineColor),
+            child: const Text('Lançar',
+                style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    return confirmed == true;
+  }
+
   Future<void> _saveBatch() async {
     if (_selectedUserId == null) {
       _showError('Selecione um funcionário');
       return;
     }
 
+    final Map<String, TimeOfDay?> mappings = {
+      'check_in': _entryTime,
+      'break_start': _break1Start,
+      'break_end': _break1End,
+      'entry_3': _break2Start,
+      'exit_3': _break2End,
+      'check_out': _exitTime,
+    };
+    // Data real de cada ponto: com entrada, o que vem antes dela e do dia
+    // seguinte (batch_entry.dart).
+    final punches = planBatchPunches(_selectedDate, {
+      for (final entry in mappings.entries)
+        if (entry.value != null)
+          entry.key: (hour: entry.value!.hour, minute: entry.value!.minute),
+    });
+    if (punches.isEmpty) {
+      _showError('Preencha pelo menos um horário');
+      return;
+    }
+    if (batchTooLong(punches)) {
+      final span = batchShiftSpan(punches)!;
+      _showError('Do primeiro ao último horário são ${span.inHours}h'
+          '${(span.inMinutes % 60).toString().padLeft(2, '0')}, mais que '
+          '${maxShiftSpan.inHours}h. Confira os horários (o que vem antes '
+          'da entrada, ou do primeiro horário sem entrada, vai para o dia '
+          'seguinte; saída igual à entrada também).');
+      return;
+    }
+    final nextDay = punches.where((punch) => punch.nextDay).toList();
+    if (nextDay.isNotEmpty && !await _confirmNextDay(nextDay)) return;
+    if (!mounted) return;
+
     setState(() => _isSaving = true);
     try {
-      final Map<String, TimeOfDay?> mappings = {
-        'check_in': _entryTime,
-        'break_start': _break1Start,
-        'break_end': _break1End,
-        'entry_3': _break2Start,
-        'exit_3': _break2End,
-        'check_out': _exitTime,
-      };
-
       int count = 0;
-      for (var entry in mappings.entries) {
-        if (entry.value != null) {
-          final timestamp = DateTime(
-            _selectedDate.year,
-            _selectedDate.month,
-            _selectedDate.day,
-            entry.value!.hour,
-            entry.value!.minute,
-          ).toIso8601String();
-
-          await _apiService.createTimeRecord(
-            recordType: entry.key,
-            userId: _selectedUserId,
-            timestamp: timestamp,
-            notes: _notesController.text,
-            location: 'Manual (Lote Gestor)',
-          );
-          count++;
-        }
+      for (final punch in punches) {
+        await _apiService.createTimeRecord(
+          recordType: punch.recordType,
+          userId: _selectedUserId,
+          timestamp: punch.at.toIso8601String(),
+          notes: _notesController.text,
+          location: 'Manual (Lote Gestor)',
+          // Marca o ponto com a data real: as regras da noite do lote antigo
+          // (saida antes da entrada na mesma data) nao valem para ele.
+          extraFields: batchRecordFields,
+        );
+        count++;
       }
 
-      if (count > 0) {
-        _showSuccess('$count registros adicionados com sucesso!');
-        _clearForm();
-      } else {
-        _showError('Preencha pelo menos um horário');
-      }
+      _showSuccess('$count registros adicionados com sucesso!');
+      _clearForm();
     } catch (e) {
       _showError('Erro ao salvar: $e\nVerifique as permissões do Firebase.');
     } finally {
+      // Lote com ponto antes de hoje mudou a vespera que o Status da equipe
+      // guarda o dia todo: a noite de ontem lancada agora grava a madrugada
+      // em hoje, e sem a entrada de ontem essas horas iam para hoje.
+      final today = DateTime.now();
+      if (punches.any((punch) => punch.at
+          .isBefore(DateTime(today.year, today.month, today.day)))) {
+        _TeamStatusTabState._yesterdayKey = null;
+      }
       if (mounted) setState(() => _isSaving = false);
     }
   }
@@ -1924,6 +2127,9 @@ class _ManualEntryTabState extends State<_ManualEntryTab> {
               (t) => setState(() => _break2End = t)),
           _buildTimeRow(
               '6. Saída', _exitTime, (t) => setState(() => _exitTime = t)),
+          const SizedBox(height: 4),
+          const Text('Saída ou pausa antes da entrada vai para o dia seguinte.',
+              style: TextStyle(color: Colors.grey, fontSize: 12)),
           const SizedBox(height: 24),
           TextField(
             controller: _notesController,

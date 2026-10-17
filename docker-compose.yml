@@ -11,6 +11,10 @@ services:
       # chave nova a cada restart (derrubando os cookies de acesso).
       - DATABASE_URL=sqlite:////app/data/ponto.db
       - DATABASE_PATH=/app/data/ponto.db
+      # Relogio do processo em Brasilia: sem isso o container roda em UTC e
+      # toda hora local ingenua (logs, datas de arquivo de backup) sai 3h
+      # adiantada. O codigo de ponto ja converte o fuso por conta propria.
+      - TZ=America/Sao_Paulo
     volumes:
       - ./backend/data:/app/data
       - ./backend/service-account.json:/app/service-account.json:ro

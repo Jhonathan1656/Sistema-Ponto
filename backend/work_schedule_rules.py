@@ -24,10 +24,12 @@ def validate_work_schedule(raw: dict | None) -> dict:
     for field in time_fields:
         value = str(schedule.get(field, "")).strip()
         try:
-            datetime.strptime(value, "%H:%M")
+            parsed = datetime.strptime(value, "%H:%M")
         except ValueError as exc:
             raise ValueError(f"Horario invalido em {field}. Use HH:mm.") from exc
-        schedule[field] = value
+        # strptime aceita "9:30", mas as comparacoes abaixo sao de texto e
+        # "9:30" > "13:30". Com zero a esquerda texto e horario batem.
+        schedule[field] = parsed.strftime("%H:%M")
 
     if schedule["start_allowed_from"] > schedule["start_allowed_until"]:
         raise ValueError("A janela de entrada inicial e final e invalida.")

@@ -123,10 +123,6 @@ RATE_EXTRA = 8.33
 RATE_50 = 12.50
 RATE_100 = 16.66
 
-# Colunas Buckets (M..T)
-COL_M = 13; COL_N = 14; COL_O = 15; COL_P = 16
-COL_Q = 17; COL_R = 18; COL_S = 19; COL_T = 20
-
 # Resumo financeiro (B41:E44)
 SUMMARY_ROW_TITLE = 41
 SUMMARY_ROW_HOURS = 42
@@ -295,47 +291,57 @@ class ExportRecord(BaseModel):
     overtime_hours: Optional[float] = None
     extra_50: Optional[float] = None
     extra_100: Optional[float] = None
+    # Data (yyyy-mm-dd) em que o primeiro par comeca de verdade, mandada pelo
+    # app (computeWorkDay). A entrada 23:50 arredonda para 00:00 do dia
+    # seguinte, mas a linha continua na data da entrada.
+    start_date: Optional[str] = None
 
 class EstagRules(BaseModel):
     saturday_50: bool = True
     sunday_100: bool = True
     night_100: bool = True
 
-def night_minutes_between_str(s1: str, s2: str) -> int:
+def _record_start_day(record: ExportRecord, record_date: date) -> date:
+    """Dia em que o primeiro par comeca: o start_date do app, se for o dia da
+    linha ou o seguinte; senao a data da linha. So pelo "00:00" a entrada 23:50
+    arredondada nao se distingue de uma entrada real 00:05 do proprio dia."""
     try:
-        start = datetime.strptime(s1, "%H:%M")
-        end = datetime.strptime(s2, "%H:%M")
-        if end <= start:
-            end += timedelta(days=1)
+        start = date.fromisoformat((record.start_date or "")[:10])
+    except ValueError:
+        return record_date
+    if record_date <= start <= record_date + timedelta(days=1):
+        return start
+    return record_date
 
-        total = 0
-        current_day = start.replace(hour=0, minute=0, second=0, microsecond=0)
-        while current_day <= end:
-            night_ranges = [
-                (current_day, current_day.replace(hour=5)),
-                (current_day.replace(hour=22), current_day + timedelta(days=1)),
-            ]
-            for night_start, night_end in night_ranges:
-                overlap_start = max(start, night_start)
-                overlap_end = min(end, night_end)
-                if overlap_end > overlap_start:
-                    total += int((overlap_end - overlap_start).total_seconds() / 60)
-            current_day += timedelta(days=1)
-        return total
-    except Exception:
-        return 0
-
-def record_night_minutes(record: ExportRecord) -> int:
-    total = 0
-    pairs = [
+def record_segments(record: ExportRecord, record_date: date) -> List[tuple]:
+    """Os 3 pares de colunas como intervalos (inicio, fim) de verdade, a partir
+    do dia do primeiro par (_record_start_day): o par que passa da meia-noite
+    termina no dia seguinte, e o par que comeca antes do fim do anterior
+    (00:00-03:00 depois de 21:00-23:00) ja e do dia seguinte. Mesmos minutos de
+    session_minutes."""
+    segments = []
+    cursor = datetime.combine(_record_start_day(record, record_date), time.min)
+    for ini, fim in (
         (record.check_in, record.check_out),
         (record.break_start, record.break_end),
         (record.entry_3, record.exit_3),
-    ]
-    for start, end in pairs:
-        if start and end:
-            total += night_minutes_between_str(start, end)
-    return total
+    ):
+        if not (ini and fim):
+            continue
+        try:
+            ini_time = datetime.strptime(ini, "%H:%M").time()
+            fim_time = datetime.strptime(fim, "%H:%M").time()
+        except ValueError:
+            continue
+        start = datetime.combine(cursor.date(), ini_time)
+        if start < cursor:
+            start += timedelta(days=1)
+        end = datetime.combine(start.date(), fim_time)
+        if end < start:
+            end += timedelta(days=1)
+        segments.append((start, end))
+        cursor = end
+    return segments
 
 def session_minutes(record: ExportRecord) -> int:
     """Soma os minutos trabalhados nos 3 pares de colunas (C-D / E-F / G-H).
@@ -357,36 +363,36 @@ def split_normal_extra(total_min: int) -> dict:
     return {"normal": 360, "extras": total_min - 360}
 
 def classify_estag_payroll(record: ExportRecord, record_date: date, holiday_days: set, rules: Optional[EstagRules]) -> dict:
-    total = session_minutes(record)
-    mins = split_normal_extra(total)
-    result = {"normal": 0, "extras": 0, "50": 0, "100": 0}
+    """Minutos do estagiario por tipo. Cada minuto vale pelo PROPRIO dia, como
+    no app (computeWorkDay): pela data da linha, a madrugada de domingo do
+    turno de sabado 19:30-07:00 ia a 50% e o app mostrava 100%.
+      - domingo ou feriado: 100% (sem sunday_100, conta como dia comum, sem
+        separar o noturno)
+      - noturno 22h-05h: 100% (night_100)
+      - sabado: 50% (saturday_50)
+      - o resto: normal ate 6h no dia, depois extras
+    holiday_days aceita o dia do mes (12) ou a data ISO ("2026-10-12")."""
     rules = rules or EstagRules()
-
-    is_holiday = record_date.day in holiday_days or record_date.isoformat() in holiday_days
-    if record_date.weekday() == 6 or is_holiday:
-        if rules.sunday_100:
-            result["100"] = total
-        else:
-            result["normal"] = mins["normal"]
-            result["extras"] = mins["extras"]
-        return result
-
-    if record_date.weekday() == 5:
-        if rules.saturday_50:
-            result["50"] = total
-        else:
-            result["normal"] = mins["normal"]
-            result["extras"] = mins["extras"]
-        return result
-
-    if rules.night_100:
-        night = min(record_night_minutes(record), total)
-        result["100"] = night
-        remaining = total - night
-        result["normal"] = min(mins["normal"], remaining)
-        result["extras"] = max(remaining - result["normal"], 0)
-        return result
-
+    result = {"normal": 0, "extras": 0, "50": 0, "100": 0}
+    common = 0
+    for start, end in record_segments(record, record_date):
+        current = start
+        while current < end:
+            day = current.date()
+            is_holiday = day.day in holiday_days or day.isoformat() in holiday_days
+            if day.weekday() == 6 or is_holiday:
+                if rules.sunday_100:
+                    result["100"] += 1
+                else:
+                    common += 1
+            elif rules.night_100 and (current.hour >= 22 or current.hour < 5):
+                result["100"] += 1
+            elif day.weekday() == 5 and rules.saturday_50:
+                result["50"] += 1
+            else:
+                common += 1
+            current += timedelta(minutes=1)
+    mins = split_normal_extra(common)
     result["normal"] = mins["normal"]
     result["extras"] = mins["extras"]
     return result
@@ -478,16 +484,49 @@ def export_period_label(data: ExportData) -> str:
         return f"{MONTH_NAMES.get(int(data.month), data.month)}/{data.year}"
     return f"{dates[0].strftime('%d/%m/%Y')} a {dates[-1].strftime('%d/%m/%Y')}"
 
+_FIXED_NATIONAL_HOLIDAYS = {
+    (1, 1), (4, 21), (5, 1), (9, 7), (10, 12), (11, 2), (11, 15), (12, 25),
+}
+
+def _good_friday(year: int) -> date:
+    """Sexta-feira Santa: Pascoa (Meeus/Jones/Butcher) menos 2 dias."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month, day = divmod(h + l - 7 * m + 114, 31)
+    return date(year, month, day + 1) - timedelta(days=2)
+
+def is_national_holiday(day: date) -> bool:
+    """Feriado nacional, a mesma regra de isHoliday (frontend/lib/utils/
+    timesheet.dart): datas fixas, Consciencia Negra (20/11) desde 2024 e
+    Sexta-feira Santa."""
+    if (day.month, day.day) in _FIXED_NATIONAL_HOLIDAYS:
+        return True
+    if day.year >= 2024 and (day.month, day.day) == (11, 20):
+        return True
+    return day == _good_friday(day.year)
+
 def holiday_date_keys(data: ExportData) -> set:
+    # O app manda o feriado como dia do mes (15 = dia 15). Ler o numero tambem
+    # como posicao no periodo marcava um segundo dia errado no fechamento
+    # 29..28 (o "15" virava 15/10 e tambem 13/10, o 15o dia do periodo).
     days = set(data.holidays or [])
-    dates = export_period_dates(data)
-    keys = set()
-    for item in days:
-        if 1 <= item <= len(dates):
-            keys.add(dates[item - 1].isoformat())
-        for current in dates:
-            if current.day == item:
-                keys.add(current.isoformat())
+    period = export_period_dates(data)
+    keys = {current.isoformat() for current in period if current.day in days}
+    # O dia seguinte ao fim do periodo nao pode ser digitado (o "1" do
+    # fechamento de dezembro e 01/12), mas a madrugada do turno do ultimo dia
+    # cai nele: vale o calendario nacional, como no app. Sem isso a noite de
+    # 31/12 pagava 05-07 de 01/01 como dia comum.
+    if period:
+        after = period[-1] + timedelta(days=1)
+        if is_national_holiday(after):
+            keys.add(after.isoformat())
     return keys
 
 class DeleteUserRequest(BaseModel):
@@ -521,6 +560,11 @@ class SchedulePunchRequest(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     close_at_scheduled_end: bool = False
+    # Id gerado no aparelho: vira o id do documento e torna o reenvio
+    # idempotente (a fila offline reenvia a mesma batida ate ter resposta).
+    client_record_id: Optional[str] = None
+    # Batida feita sem internet e sincronizada depois (hora do aparelho).
+    offline: bool = False
 
 class ScheduleApprovalCreateRequest(BaseModel):
     request_type: str
@@ -615,6 +659,17 @@ def _local_iso(dt: datetime) -> str:
         dt = dt.replace(tzinfo=None)
     return dt.isoformat()
 
+_LOCAL_TZ = "America/Sao_Paulo"
+
+def _local_now() -> datetime:
+    """Agora em hora de parede de Brasilia, sem tzinfo.
+
+    O container roda em UTC: datetime.now() puro sai 3h adiantado e, entre
+    21h e meia-noite, ja cai no dia seguinte. Use para janelas por dia e para
+    hora exibida; carimbos de auditoria seguem em utcnow() + "Z".
+    """
+    return datetime.now(ZoneInfo(_LOCAL_TZ)).replace(tzinfo=None)
+
 def _time_on_day(day: date, hhmm: str, timezone_name: str) -> datetime:
     return time_on_day(day, hhmm, timezone_name)
 
@@ -645,7 +700,10 @@ def _user_records_sorted(db, user_id: str, lookback_days: int = 14) -> List[dict
     """
     collection = db.collection("time_records").where("user_id", "==", user_id)
     if lookback_days > 0:
-        since = (datetime.now() - timedelta(days=lookback_days)).isoformat()
+        # Meia-noite local de hoje menos N dias, a mesma janela do app: os
+        # timestamps sao hora local ingenua, entao o corte tambem precisa ser.
+        midnight = datetime.combine(_local_now().date(), time.min)
+        since = (midnight - timedelta(days=lookback_days)).isoformat()
         try:
             snapshots = list(collection.where("timestamp", ">=", since).stream())
         except Exception as exc:  # indice ausente ou consulta indisponivel
@@ -654,26 +712,287 @@ def _user_records_sorted(db, user_id: str, lookback_days: int = 14) -> List[dict
     else:
         snapshots = list(collection.stream())
     records = [{"id": item.id, **(item.to_dict() or {})} for item in snapshots]
-    records.sort(key=lambda item: str(item.get("timestamp") or ""))
+    return _sort_records(records)
+
+# Ordem dos tipos de ponto no MESMO timestamp (o lote do gestor grava sem
+# segundos): fim da pausa, saida, entrada e inicio da pausa. A saida antes da
+# entrada fecha um turno antes de abrir o seguinte (noite 19:00-07:00 e dia
+# 07:00-15:00 no lote); ao contrario, a ordem vinha do id aleatorio e o turno
+# aberto mudava. Mesma ordem de compareRecords (frontend/lib/utils/shift_records.dart).
+# O ponto do lote no mesmo minuto de uma batida com segundos segue a mesma
+# ordem (_sort_records).
+_SAME_TIMESTAMP_RANK = {
+    "break_end": 0,
+    "exit_3": 0,
+    "check_out": 1,
+    "check_in": 2,
+    "break_start": 3,
+    "entry_3": 3,
+}
+
+_TIMESTAMP_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?::(\d{2})(?:\.(\d+))?)?(.*)")
+
+def _normalized_timestamp(value) -> str:
+    """Timestamp com segundos e a fracao em 6 digitos: "...19:30:00" (este
+    backend, isoformat sem microssegundos) e "...19:30:00.000" (app e lote)
+    sao o mesmo instante. Comparando o texto cru, o mais curto vinha antes e o
+    desempate pelo tipo nunca rodava: o fim da pausa do lote igual a saida do
+    FECHAR PONTO caia depois dela e sumia. Mesma regra de _normalizedTimestamp
+    (frontend/lib/utils/shift_records.dart)."""
+    raw = str(value or "")
+    match = _TIMESTAMP_RE.fullmatch(raw)
+    if match is None:
+        return raw
+    fraction = (match.group(3) or "").ljust(6, "0")[:6]
+    return f"{match.group(1)}:{match.group(2) or '00'}.{fraction}{match.group(4)}"
+
+def _record_sort_key(record: dict) -> tuple:
+    """Chave cronologica de um ponto: o instante (_normalized_timestamp), se
+    vai logo depois de outro ponto do mesmo minuto (o do lote, em
+    _sort_records), o tipo (_SAME_TIMESTAMP_RANK) e o id."""
+    return (
+        _normalized_timestamp(record.get("timestamp")),
+        False,
+        _SAME_TIMESTAMP_RANK.get(record.get("record_type"), len(_SAME_TIMESTAMP_RANK)),
+        str(record.get("id") or ""),
+    )
+
+def _is_whole_minute_batch(record: dict, key: tuple) -> bool:
+    """Ponto do lote novo num minuto cheio (o lote grava HH:mm:00.000)."""
+    return record.get("batch_real_dates") is True and key[0][16:26] == ":00.000000"
+
+def _sort_records(records: List[dict]) -> List[dict]:
+    """Ordena records no lugar, em ordem cronologica, e devolve a lista.
+
+    O lote do gestor grava so hora e minuto; a batida do app e a deste
+    backend tem segundos. O ponto do lote vale pelo minuto inteiro: vai logo
+    depois da ultima batida do mesmo usuario no mesmo minuto com tipo antes do
+    dele (_SAME_TIMESTAMP_RANK) e, sem nenhuma, no comeco do minuto. Pelo
+    horario cru, a Entrada 07:00 do lote vinha antes da Saida 07:00:14 da noite
+    anterior: a saida virava o "Esqueci" do dia, a noite perdia as horas e o
+    turno do dia nao aparecia aberto ("Nao existe turno aberto"). A Saida
+    07:00 do lote fica depois da Pausa fim 07:00:20 do app e antes da Entrada
+    07:00:20 do turno seguinte. Entre pontos do lote, e entre batidas do app,
+    nada muda. Mesma regra de chronologicalOrder
+    (frontend/lib/utils/shift_records.dart)."""
+    own = [_record_sort_key(record) for record in records]
+
+    def minute_of(index: int) -> tuple:
+        return (str(records[index].get("user_id") or ""), own[index][0][:16])
+
+    punches_by_minute: Dict[tuple, List[int]] = {}
+    for index, record in enumerate(records):
+        if not _is_whole_minute_batch(record, own[index]):
+            punches_by_minute.setdefault(minute_of(index), []).append(index)
+    keys = []
+    for index, record in enumerate(records):
+        key = own[index]
+        if _is_whole_minute_batch(record, key):
+            lower = [own[j] for j in punches_by_minute.get(minute_of(index), []) if own[j][2] < key[2]]
+            if lower:
+                key = (max(lower)[0], True, key[2], key[3])
+        keys.append((key, index))
+    order = sorted(range(len(records)), key=lambda index: keys[index])
+    records[:] = [records[index] for index in order]
     return records
 
+# Id da batida em _records_before_punch: depois de qualquer id do Firestore.
+_AFTER_EVERY_ID = "\U0010ffff"
+
+def _records_before_punch(records: List[dict], punch: dict) -> List[dict]:
+    """Pontos de records (de um usuario) que vem antes da batida punch
+    (user_id, record_type e timestamp), em ordem (_sort_records): o turno
+    aberto no momento da batida offline, que chega depois. Pelo texto do
+    horario, a Entrada 07:00 do lote do turno do dia ficava antes da Saida
+    07:00:14 da noite batida offline, e a saida fechava o turno do dia. Os
+    pontos do mesmo horario e tipo da batida contam (pode ser ela mesma, ja
+    gravada). Mesma regra de recordsBeforePunch
+    (frontend/lib/utils/shift_records.dart)."""
+    probe = {**punch, "id": _AFTER_EVERY_ID}
+    ordered = _sort_records([*records, probe])
+    position = next(index for index, item in enumerate(ordered) if item is probe)
+    return ordered[:position]
+
+# Maior distancia entre a entrada e a saida de um turno (maxShiftSpan do app).
+_MAX_SHIFT_SPAN = timedelta(hours=16)
+
+def _is_legacy_batch(record: dict) -> bool:
+    """Ponto do lote ANTIGO do gestor: lancado para outra pessoa
+    (created_by_admin) sem batch_real_dates. Esse lote gravava todos os
+    horarios na data escolhida (a saida 07:00 da noite ficava antes da
+    entrada 19:30, no mesmo dia). O lote novo grava a data real e marca
+    batch_real_dates: vale pelo horario, como a batida do app. Mesma regra de
+    isLegacyBatchRecord (frontend/lib/utils/shift_records.dart)."""
+    return record.get("created_by_admin") is True and record.get("batch_real_dates") is not True
+
+def _manual_night_exit_index(records: List[dict], index: int) -> Optional[int]:
+    """Turno da noite lancado no lote ANTIGO do gestor (_is_legacy_batch): o
+    lote antigo gravava todos os horarios na data escolhida, entao a saida
+    07:00 fica ANTES da entrada 19:30, no mesmo dia, e o turno ja vem fechado.
+    E a ultima entrada do dia, do lote antigo, sem saida depois dela, e com
+    uma saida do lote antigo antes da PRIMEIRA entrada do dia (as saidas
+    depois dela fecham os turnos do proprio dia, como o 08-17 da dobra). Com
+    mais de uma, vale a mais perto da entrada. Pontos do app e do lote novo
+    (data real) nunca entram aqui.
+    Sem nenhuma, vale a saida do lote antigo depois da primeira entrada que
+    outra saida substitui antes da proxima entrada (a mais perto da noite):
+    na dobra 06:50-16:00 e 19:00-07:00 a saida 07:00 cai depois da entrada
+    06:50, e o turno do dia ja a ignora (vale a ultima saida).
+    A noite vai no maximo _MAX_SHIFT_SPAN da entrada ate a saida do dia
+    seguinte: a entrada 08:00 do gestor no dia da saida 07:00 que corrige o
+    "Esqueci" da vespera nao e uma noite de 23h, e sim o turno do dia, aberto.
+    Devolve o indice dessa saida em records (cronologico), ou None.
+
+    Mesma regra de manualNightExitIndex (frontend/lib/utils/shift_records.dart):
+    sem ela aqui, o app mostrava o turno fechado e liberava a entrada, e este
+    endpoint recusava com "Ja existe um turno aberto" por 14 dias."""
+    entry = records[index]
+    if entry.get("record_type") != "check_in" or not _is_legacy_batch(entry):
+        return None
+    day = str(entry.get("timestamp") or "")[:10]
+    for later in records[index + 1:]:
+        if str(later.get("timestamp") or "")[:10] != day:
+            break
+        if later.get("record_type") in ("check_in", "check_out"):
+            return None
+    entry_at = _to_local_naive(str(entry.get("timestamp") or ""))
+
+    def fits_night(exit_index: int) -> bool:
+        exit_at = _to_local_naive(str(records[exit_index].get("timestamp") or ""))
+        return (
+            entry_at is not None
+            and exit_at is not None
+            and exit_at + timedelta(days=1) - entry_at <= _MAX_SHIFT_SPAN
+        )
+
+    def legacy_check_out(record: dict) -> bool:
+        return record.get("record_type") == "check_out" and _is_legacy_batch(record)
+
+    def superseded(exit_index: int) -> bool:
+        for later in records[exit_index + 1:]:
+            if later.get("record_type") == "check_in":
+                return False
+            if later.get("record_type") == "check_out":
+                return True
+        return False
+
+    first_check_in = index
+    for j in range(index - 1, -1, -1):
+        if str(records[j].get("timestamp") or "")[:10] != day:
+            break
+        if records[j].get("record_type") == "check_in":
+            first_check_in = j
+    for j in range(first_check_in - 1, -1, -1):
+        earlier = records[j]
+        if str(earlier.get("timestamp") or "")[:10] != day:
+            break
+        if legacy_check_out(earlier):
+            if fits_night(j):
+                return j
+            break
+    for j in range(index - 1, first_check_in, -1):
+        if legacy_check_out(records[j]) and superseded(j):
+            return j if fits_night(j) else None
+    return None
+
 def _open_shift_start(records: List[dict]) -> Optional[dict]:
+    """Entrada do turno ainda aberto (a ultima sem saida depois dela), ou None.
+    A noite do lote antigo do gestor ja vem fechada (_manual_night_exit_index);
+    a do lote novo fecha pela saida gravada no dia seguinte, como no app."""
     last_check_in = None
-    for record in records:
+    for index, record in enumerate(records):
         record_type = record.get("record_type")
         if record_type == "check_in":
-            last_check_in = record
+            closed = _manual_night_exit_index(records, index) is not None
+            last_check_in = None if closed else record
         elif record_type == "check_out":
             last_check_in = None
     return last_check_in
 
-def _find_schedule_request(
+def _reusable_approval_check_in(
+    records: List[dict],
+    request_id: str,
+    request: dict,
+    open_shift: Optional[dict],
+) -> Optional[dict]:
+    """check_in ja gravado que atende este pedido de entrada, se houver.
+
+    Primeiro o do proprio pedido: uma tentativa anterior gravou o ponto e caiu
+    antes de marcar a decisao. Depois o de OUTRO pedido do mesmo dia, mas so
+    se for o mesmo turno - ainda aberto, ou este pedido foi feito antes da
+    saida dele (pedido duplicado de um turno ja trabalhado). Pedido feito
+    depois daquela saida e uma nova entrada e precisa do proprio ponto.
+    """
+    for item in records:
+        if item.get("record_type") == "check_in" and item.get("schedule_approval_request_id") == request_id:
+            return item
+
+    attempted = _to_local_naive(request.get("attempted_at"))
+    for idx, item in enumerate(records):
+        if item.get("record_type") != "check_in" or not item.get("schedule_approval_request_id"):
+            continue
+        if str(item.get("timestamp") or "")[:10] != request.get("day_key"):
+            continue
+        if open_shift is not None and item.get("id") == open_shift.get("id"):
+            return item
+        following = next(
+            (later for later in records[idx + 1:] if later.get("record_type") in ("check_in", "check_out")),
+            None,
+        )
+        if following is None or following.get("record_type") != "check_out":
+            continue
+        ended = _to_local_naive(following.get("timestamp"))
+        if attempted is not None and ended is not None and attempted <= ended:
+            return item
+    return None
+
+# Idade maxima de um pedido de entrada fora do horario para a liberacao
+# ainda criar o ponto.
+_START_APPROVAL_MAX_AGE = timedelta(hours=12)
+
+def _start_request_expired(attempted: Optional[datetime], now: datetime) -> bool:
+    """Pedido de entrada velho demais para virar ponto. Mede a idade, nao a
+    data: o pedido das 23:55 liberado as 00:03 ainda e o mesmo turno, mas pela
+    data era "de outro dia" e ficava pendente para sempre."""
+    return attempted is not None and now - attempted > _START_APPROVAL_MAX_AGE
+
+# Dois pedidos de entrada ate 15 min um do outro (a mesma folga do relogio)
+# sao a mesma tentativa repetida; mais longe, e uma entrada nova.
+_START_REQUEST_RETRY_WINDOW = timedelta(minutes=15)
+
+def _is_start_request_retry(previous: Optional[datetime], attempted: Optional[datetime]) -> bool:
+    """O pedido de entrada feito em [attempted] repete o de [previous]?
+    Sem as duas horas, trata como repeticao (comportamento antigo)."""
+    if previous is None or attempted is None:
+        return True
+    return abs(attempted - previous) <= _START_REQUEST_RETRY_WINDOW
+
+def _newer_start_attempt(db, request_id: str, data: dict) -> Optional[dict]:
+    """Outro pedido de entrada do mesmo dia feito bem depois deste (fora da
+    janela de repeticao). Liberar este abriria o turno na hora antiga, que o
+    estagiario ja tinha refeito."""
+    attempted = _to_local_naive(data.get("attempted_at"))
+    if attempted is None:
+        return None
+    for item in _find_schedule_requests(
+        db, data["user_id"], "start_exception", data.get("day_key") or "",
+        {"pending", "approved", "rejected"},
+    ):
+        if item.id == request_id:
+            continue
+        other = _to_local_naive((item.to_dict() or {}).get("attempted_at"))
+        if other is not None and other > attempted and not _is_start_request_retry(attempted, other):
+            return {"id": item.id, **(item.to_dict() or {})}
+    return None
+
+def _find_schedule_requests(
     db,
     user_id: str,
     request_type: str,
     day_key: str,
     statuses: Optional[set] = None,
-) -> Optional[Any]:
+) -> List[Any]:
+    """Pedidos do usuario para o tipo/dia, do mais novo para o mais antigo."""
     candidates = db.collection("work_schedule_approval_requests").where(
         "user_id", "==", user_id
     ).stream()
@@ -689,6 +1008,16 @@ def _find_schedule_request(
         key=lambda item: str((item.to_dict() or {}).get("created_at") or ""),
         reverse=True,
     )
+    return matches
+
+def _find_schedule_request(
+    db,
+    user_id: str,
+    request_type: str,
+    day_key: str,
+    statuses: Optional[set] = None,
+) -> Optional[Any]:
+    matches = _find_schedule_requests(db, user_id, request_type, day_key, statuses)
     return matches[0] if matches else None
 
 def _create_user_notification(
@@ -851,10 +1180,18 @@ async def get_firestore_document_with_user_token(
             status_code=429,
             detail="Cota diaria do banco de dados esgotada. Tente novamente mais tarde.",
         )
-    if response.status_code < 200 or response.status_code >= 300:
+    if response.status_code in (401, 403):
         raise HTTPException(
             status_code=403,
             detail="Nao foi possivel validar as permissoes no Firebase.",
+        )
+    if response.status_code < 200 or response.status_code >= 300:
+        # Firestore fora do ar (5xx) ou resposta inesperada nao e falta de
+        # permissao: com 403 o app tratava como recusa da regra e deixava a
+        # batida da fila offline parada, em vez de tentar de novo.
+        raise HTTPException(
+            status_code=503,
+            detail="Firebase indisponivel no momento. Tente novamente.",
         )
 
     fields = response.json().get("fields", {})
@@ -1109,14 +1446,15 @@ def _to_local_naive(value: Optional[str]) -> Optional[datetime]:
     except Exception:
         return None
 
-def _run_auto_close_breaks() -> None:
+def _run_auto_close_breaks(window: timedelta = _AUTO_CLOSE_WINDOW) -> bool:
+    """Fecha as pausas vencidas. Devolve False se nao conseguiu consultar."""
     try:
         db = get_firestore_admin()
     except Exception:
-        return  # Firestore indisponivel; tenta na proxima rodada
+        return False  # Firestore indisponivel; tenta na proxima rodada
 
     now = datetime.now(ZoneInfo(_AUTO_CLOSE_TZ)).replace(tzinfo=None)
-    window_start = (now - _AUTO_CLOSE_WINDOW).isoformat()
+    window_start = (now - window).isoformat()
     try:
         # Consulta de campo unico (indice automatico, sem indice composto):
         # so os registros recentes de todos os usuarios de uma vez.
@@ -1127,7 +1465,7 @@ def _run_auto_close_breaks() -> None:
         )
     except Exception as exc:
         print(f"[auto-close] falha na consulta: {exc}")
-        return
+        return False
 
     by_user: Dict[str, List[dict]] = {}
     for doc in recent:
@@ -1137,7 +1475,7 @@ def _run_auto_close_breaks() -> None:
             by_user.setdefault(uid, []).append({"id": doc.id, **data})
 
     for uid, records in by_user.items():
-        records.sort(key=lambda item: str(item.get("timestamp") or ""))
+        _sort_records(records)
         # O ultimo registro na janela e o ultimo do usuario (a janela e o
         # trecho mais recente); se o cliente ja fechou, aparece aqui.
         last = records[-1]
@@ -1178,14 +1516,22 @@ def _run_auto_close_breaks() -> None:
             print(f"[auto-close] pausa fechada para {uid} (inicio {last.get('timestamp')})")
         except Exception as exc:
             print(f"[auto-close] falha ao fechar pausa de {uid}: {exc}")
+    return True
 
 async def _auto_close_breaks_loop() -> None:
+    # A primeira rodada sai ja no boot e olha _AUTO_CLOSE_MAX_AGE para tras:
+    # com o servidor fora do ar, pausas venceram sem ninguem fechar e a janela
+    # de 10h nao alcancaria todas. A recuperacao so termina quando a consulta
+    # funciona (logo apos uma queda o Firestore pode ainda nao responder);
+    # depois volta a janela curta, que mantem as leituras baixas.
+    window = _AUTO_CLOSE_MAX_AGE
     while True:
-        await asyncio.sleep(_AUTO_CLOSE_INTERVAL_SECONDS)
         try:
-            await asyncio.to_thread(_run_auto_close_breaks)
+            if await asyncio.to_thread(_run_auto_close_breaks, window):
+                window = _AUTO_CLOSE_WINDOW
         except Exception as exc:
             print(f"[auto-close] loop: {exc}")
+        await asyncio.sleep(_AUTO_CLOSE_INTERVAL_SECONDS)
 
 # --- JOB: backup diario (Firestore + SQLite) ---
 # Firestore no plano Spark nao tem backup gerenciado; este job exporta tudo,
@@ -1431,7 +1777,9 @@ async def list_backups_endpoint(admin=Depends(require_admin_user)):
         out.append({
             "file": name,
             "bytes": os.path.getsize(path),
-            "modified": datetime.fromtimestamp(os.path.getmtime(path)).isoformat(),
+            "modified": datetime.fromtimestamp(
+                os.path.getmtime(path), ZoneInfo(_LOCAL_TZ)
+            ).replace(tzinfo=None).isoformat(),
         })
     return {"retention": _BACKUP_RETENTION, "bucket": _BACKUP_STORAGE_BUCKET,
             "backups": out}
@@ -1486,19 +1834,41 @@ def delete_user_cascade(db, user_id: str) -> dict:
 
 # --- LÓGICA EXCEL ---
 
-def generate_excel_file(data: ExportData) -> str:
-    type_path = "Excel-Campo" if data.is_campo else "Excel-Administrativos"
-    file_name = f"Folha_Ponto_Campo_{data.month}-{data.year}.xlsx" if data.is_campo else f"Folha_Ponto_administrativo_{data.month}-{data.year}.xlsx"
-    
-    template_path = os.path.join("..", "frontend", "assets", "templates", type_path, data.year, f"{data.month}-{data.year}", file_name)
-    if not os.path.exists(template_path):
-        template_path = os.path.join("frontend", "assets", "templates", type_path, data.year, f"{data.month}-{data.year}", file_name)
-        if not os.path.exists(template_path):
-             template_path = os.path.join("ponto-system", "frontend", "assets", "templates", type_path, data.year, f"{data.month}-{data.year}", file_name)
-             if not os.path.exists(template_path):
-                raise FileNotFoundError(f"Template não encontrado: {file_name}")
+# Um modelo por tipo, valido para qualquer mes: dia e dia da semana (colunas
+# A/B) sao escritos aqui a partir do periodo. Os modelos antigos eram um
+# arquivo por mes/ano e a exportacao quebrava em todo ano novo sem modelo.
+EXCEL_TEMPLATE_FILES = {
+    True: ("Excel-Campo", "Folha_Ponto_Campo.xlsx"),
+    False: ("Excel-Administrativos", "Folha_Ponto_administrativo.xlsx"),
+}
+EXCEL_WEEKDAY_NAMES = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+EXCEL_FIRST_DAY_ROW = 9
+EXCEL_DAY_ROWS = 31
+# Bloco de assinaturas (M8:P35): N34 e o total do mes; o resto e texto fixo
+# do modelo e nao pode ser apagado.
+EXCEL_MONTH_TOTAL_CELL = "N34"
+# A coluna A (numero do dia) entra na impressao: o modelo marca B1:P39, mas
+# sem a coluna A a folha impressa sai sem as datas.
+EXCEL_PRINT_AREA = "A1:P39"
+# Estagiario: inclui o resumo financeiro das linhas 40-44.
+EXCEL_PRINT_AREA_INTERN = "A1:P44"
+# Largura da coluna A com a data "dd/mm" do fechamento 29..28.
+EXCEL_CUSTOM_DAY_WIDTH = 6.5
 
-    wb = openpyxl.load_workbook(template_path)
+def excel_template_path(is_campo: bool) -> str:
+    type_path, file_name = EXCEL_TEMPLATE_FILES[bool(is_campo)]
+    for base in (
+        os.path.join("..", "frontend"),
+        "frontend",
+        os.path.join("ponto-system", "frontend"),
+    ):
+        candidate = os.path.join(base, "assets", "templates", type_path, file_name)
+        if os.path.exists(candidate):
+            return candidate
+    raise FileNotFoundError(f"Template não encontrado: {file_name}")
+
+def generate_excel_file(data: ExportData) -> str:
+    wb = openpyxl.load_workbook(excel_template_path(data.is_campo))
     ws = wb.active
 
     if data.generate_from_scratch:
@@ -1507,7 +1877,10 @@ def generate_excel_file(data: ExportData) -> str:
 
     period_dates = export_period_dates(data)
     custom_period = bool(data.period_start and data.period_end)
-    row_by_date = {current.isoformat(): 9 + idx for idx, current in enumerate(period_dates[:31])}
+    row_by_date = {
+        current.isoformat(): EXCEL_FIRST_DAY_ROW + idx
+        for idx, current in enumerate(period_dates[:EXCEL_DAY_ROWS])
+    }
 
     ws.cell(row=5, column=3).value = data.employee_name
     is_estagiario = "estagiario" in data.employee_role.lower() or "intern" in data.employee_role.lower()
@@ -1522,17 +1895,25 @@ def generate_excel_file(data: ExportData) -> str:
     ws.cell(row=6, column=9).value = data.custom_department or ("Processamento de Dados" if is_estagiario else "Campo")
     if custom_period:
         ws.cell(row=7, column=2).value = f"Fechamento: {export_period_label(data)}"
+        # A coluna A do modelo (4,9) cabe "01".."31", nao "29/09": cortada, a
+        # data saia "29/0" na tela e na impressao.
+        width = ws.column_dimensions["A"].width or 0
+        ws.column_dimensions["A"].width = max(width, EXCEL_CUSTOM_DAY_WIDTH)
 
     total_bank = {"normal": 0, "extras": 0, "50": 0, "100": 0}
 
-    for idx in range(31):
-        row_idx = 9 + idx
-        if custom_period:
-            current_date = period_dates[idx] if idx < len(period_dates) else None
-            ws.cell(row=row_idx, column=1).value = current_date.strftime("%d/%m") if current_date else None
-            ws.cell(row=row_idx, column=2).value = WEEKDAY_NAMES[current_date.weekday()] if current_date else None
-            for clear_col in range(3, 9):
-                ws.cell(row=row_idx, column=clear_col).value = None
+    day_format = "%d/%m" if custom_period else "%d"
+    for idx in range(EXCEL_DAY_ROWS):
+        row_idx = EXCEL_FIRST_DAY_ROW + idx
+        current_date = period_dates[idx] if idx < len(period_dates) else None
+        # Limpa a linha inteira (A..I) antes: as linhas alem do fim do periodo
+        # (mes de 28/30 dias) ficam vazias, sem dia nem formula.
+        for clear_col in range(1, 10):
+            ws.cell(row=row_idx, column=clear_col).value = None
+        if current_date is None:
+            continue
+        ws.cell(row=row_idx, column=1).value = current_date.strftime(day_format)
+        ws.cell(row=row_idx, column=2).value = EXCEL_WEEKDAY_NAMES[current_date.weekday()]
         # So conta o par se AMBAS as celulas (entrada e saida) estiverem preenchidas.
         # Sem isso, um turno aberto (saida vazia) gera MOD(-entrada,1) = horas ate a meia-noite (bug do 10:30).
         ws.cell(row=row_idx, column=9).value = (
@@ -1549,18 +1930,15 @@ def generate_excel_file(data: ExportData) -> str:
         row_idx = row_by_date.get(record_date.isoformat())
         if row_idx is None:
             continue
+        # "00:00" vai como veio: o MOD(D-C,1) da coluna I ja conta a saida a
+        # meia-noite. Trocar por "23:59" tirava 1 min do dia, de I40 e de N34
+        # (e so nas colunas D e H, nao na F).
         if record.check_in: ws.cell(row=row_idx, column=3).value = record.check_in
-        if record.check_out:
-            val_out = record.check_out
-            if val_out == "00:00": val_out = "23:59"
-            ws.cell(row=row_idx, column=4).value = val_out
+        if record.check_out: ws.cell(row=row_idx, column=4).value = record.check_out
         if record.break_start: ws.cell(row=row_idx, column=5).value = record.break_start
         if record.break_end: ws.cell(row=row_idx, column=6).value = record.break_end
         if record.entry_3: ws.cell(row=row_idx, column=7).value = record.entry_3
-        if record.exit_3:
-            val_out3 = record.exit_3
-            if val_out3 == "00:00": val_out3 = "23:59"
-            ws.cell(row=row_idx, column=8).value = val_out3
+        if record.exit_3: ws.cell(row=row_idx, column=8).value = record.exit_3
 
         if is_estagiario and record.check_in and record.check_out:
             payroll = classify_estag_payroll(record, record_date, holiday_keys, data.estag_rules)
@@ -1592,17 +1970,23 @@ def generate_excel_file(data: ExportData) -> str:
         ws.cell(row=SUMMARY_ROW_FINAL, column=3).value = "=SUM(B43:E43)+500"
         ws.cell(row=SUMMARY_ROW_FINAL, column=3).number_format = '"R$ "#,##0.00'; ws.cell(row=SUMMARY_ROW_FINAL, column=3).font = bold
 
-    for r in range(9, 40):
-        for c in range(COL_M, COL_T + 1):
-            cell = ws.cell(row=r, column=c)
-            if is_estagiario or cell.value == 0:
-                cell.value = None
+    # Nao ha mais limpeza das colunas M..T: ela vinha dos modelos antigos, com
+    # colunas de apoio que nenhum modelo atual tem. Agora M..P sao o bloco de
+    # assinaturas (celulas mescladas, apagar quebraria o texto) e Q..T estao
+    # vazias.
 
     try: ws.unmerge_cells('I40:J40')
     except: pass
     ws.merge_cells('I40:J40')
     cell_total = ws['I40']; cell_total.value = "=SUM(I9:I39)"; cell_total.number_format = "[h]:mm"
     cell_total.alignment = Alignment(horizontal="center", vertical="center"); cell_total.font = Font(bold=True)
+
+    # O valor de N34 no modelo e so exemplo; aqui vira o total real do mes.
+    month_total = ws[EXCEL_MONTH_TOTAL_CELL]
+    month_total.value = "=SUM(I9:I39)"
+    month_total.number_format = "[h]:mm"
+
+    ws.print_area = EXCEL_PRINT_AREA_INTERN if is_estagiario else EXCEL_PRINT_AREA
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
     wb.save(tmp.name); wb.close()
@@ -1722,10 +2106,14 @@ def record_total_minutes(record: ExportRecord) -> int:
             total += minutes_between_str(start, end)
     return total
 
-def classify_html_day(record: ExportRecord, is_estagiario: bool, current_date: date, is_holiday: bool = False, rules: Optional[EstagRules] = None) -> dict:
+def classify_html_day(record: ExportRecord, is_estagiario: bool, current_date: date, is_holiday: bool = False, rules: Optional[EstagRules] = None, holiday_days: Optional[set] = None) -> dict:
     total = record_total_minutes(record)
     if is_estagiario:
-        payroll = classify_estag_payroll(record, current_date, {current_date.day} if is_holiday else set(), rules)
+        # Todos os feriados do periodo, nao so o do dia: a madrugada do turno
+        # da vespera de um feriado cai no feriado.
+        if holiday_days is None:
+            holiday_days = {current_date.isoformat()} if is_holiday else set()
+        payroll = classify_estag_payroll(record, current_date, holiday_days, rules)
         return {
             "total": total,
             "normal": payroll["normal"],
@@ -1795,7 +2183,7 @@ def build_employee_html(data: ExportData, panel_id: str, visible: bool) -> tuple
 
         vals = {"total": 0, "normal": 0, "extra_contract": 0, "he50": 0, "he100": 0, "noc_real": 0, "noc_ficto": 0}
         if record:
-            vals = classify_html_day(record, is_estagiario, current_date, is_holiday, data.estag_rules)
+            vals = classify_html_day(record, is_estagiario, current_date, is_holiday, data.estag_rules, holiday_keys)
             if vals["total"] > 0:
                 totals["days"] += 1
             for key in ["total", "normal", "extra_contract", "he50", "he100", "noc_real", "noc_ficto"]:
@@ -1948,7 +2336,7 @@ def generate_batch_html_file(data_list: List[ExportData]) -> str:
 <body>
 <header>
   <h1>VM Engenharia de Infraestruturas Ltda - CNPJ: 53.655.381/0001-03</h1>
-  <p>Folhas de Ponto - {esc(month_label)} - gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
+  <p>Folhas de Ponto - {esc(month_label)} - gerado em {_local_now().strftime('%d/%m/%Y %H:%M')}</p>
 </header>
 <div class="legend" style="padding:.7rem 1rem;background:#fff;border-bottom:1px solid #dde">
   HN <=8h/dia &nbsp;|&nbsp; HE 50% &nbsp;|&nbsp; HE 100% &nbsp;|&nbsp;
@@ -2030,7 +2418,7 @@ async def send_assistant_message(
 
         Colaborador: {employee_name}
         E-mail: {employee_email}
-        Data/Hora: {datetime.now().strftime('%d/%m/%Y %H:%M')}
+        Data/Hora: {_local_now().strftime('%d/%m/%Y %H:%M')}
 
         Mensagem:
         {message}
@@ -2291,18 +2679,42 @@ async def zapsign_webhook(request: Request):
     )
     return {"status": "success"}
 
+_DAY_KEY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# Mesmo limite da busca de turno aberto (_user_records_sorted).
+_SHIFT_DAY_MAX_AGE_DAYS = 14
+
+def _parse_shift_day(value: Optional[str], today: date) -> Optional[date]:
+    """Dia em que o turno aberto comecou, informado pelo app; None se invalido."""
+    text = (value or "").strip()
+    if not _DAY_KEY_RE.fullmatch(text):
+        return None
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError:
+        return None
+    if today - timedelta(days=_SHIFT_DAY_MAX_AGE_DAYS) <= parsed <= today:
+        return parsed
+    return None
+
 @app.get("/work-schedule/effective")
-async def get_effective_work_schedule_endpoint(user=Depends(require_authenticated_user)):
+async def get_effective_work_schedule_endpoint(
+    shift_day: Optional[str] = None,
+    user=Depends(require_authenticated_user),
+):
     db = get_firestore_admin()
     schedule = _resolve_effective_work_schedule(db, user)
     timezone_name = schedule["timezone"]
     now = datetime.now(ZoneInfo(timezone_name))
     day_key = now.date().isoformat()
+    # O pedido de hora extra e guardado pelo dia em que o turno comecou: num
+    # turno que virou a meia-noite, procurar por "hoje" nao acharia a
+    # liberacao. A entrada (start_request) continua sendo a de hoje.
+    overtime_day = _parse_shift_day(shift_day, now.date()) or now.date()
     overtime = _find_schedule_request(
         db,
         user["id"],
         "overtime",
-        day_key,
+        overtime_day.isoformat(),
         {"pending", "approved", "rejected"},
     )
     start_request = _find_schedule_request(
@@ -2355,6 +2767,11 @@ async def update_global_work_schedule_endpoint(
     })
     return schedule
 
+# Id de documento aceito do app: so caracteres seguros para o Firestore.
+_CLIENT_RECORD_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
+_OFFLINE_MAX_AHEAD = timedelta(minutes=15)
+_OFFLINE_MAX_DELAY = timedelta(days=7)
+
 @app.post("/work-schedule/punch")
 async def schedule_controlled_punch_endpoint(
     payload: SchedulePunchRequest,
@@ -2363,16 +2780,53 @@ async def schedule_controlled_punch_endpoint(
     allowed_types = {"check_in", "check_out"}
     if payload.record_type not in allowed_types:
         raise HTTPException(status_code=400, detail="Tipo de ponto nao suportado neste fluxo.")
+    client_record_id = payload.client_record_id
+    if client_record_id is not None and not _CLIENT_RECORD_ID_RE.fullmatch(client_record_id):
+        raise HTTPException(status_code=400, detail="Identificador do registro invalido.")
 
     db = get_firestore_admin()
+    if client_record_id is not None:
+        record_ref = db.collection("time_records").document(client_record_id)
+        # Antes de qualquer regra: um reenvio da mesma batida (resposta
+        # perdida, fila offline) devolve o que ja foi gravado. Reavaliar
+        # recusaria a propria batida ("Ja existe um turno aberto").
+        existing = record_ref.get()
+        if existing.exists:
+            existing_data = serialize_firestore_document(existing)
+            if existing_data.get("user_id") != user["id"]:
+                raise HTTPException(status_code=409, detail="Identificador do registro ja usado por outro usuario.")
+            return {"status": "created", **existing_data}
+    else:
+        record_ref = db.collection("time_records").document()
+
     schedule = _resolve_effective_work_schedule(db, user)
     timezone_name = schedule["timezone"]
     attempted = _parse_schedule_datetime(payload.timestamp, timezone_name)
+    punched_at = attempted
     server_now = datetime.now(ZoneInfo(timezone_name))
-    if abs((server_now - attempted).total_seconds()) > 15 * 60 and not payload.close_at_scheduled_end:
+    if payload.close_at_scheduled_end:
+        pass  # a hora gravada sera o fim programado, conferido abaixo
+    elif payload.offline:
+        # Batida feita sem internet: vale a hora do aparelho no momento da
+        # batida, que chega aqui horas ou dias depois. Futuro nao (relogio
+        # adiantado) e no maximo 7 dias de atraso.
+        delay = server_now - attempted
+        if delay < -_OFFLINE_MAX_AHEAD or delay > _OFFLINE_MAX_DELAY:
+            raise HTTPException(status_code=400, detail="O horario da batida offline esta fora do periodo aceito.")
+    elif abs((server_now - attempted).total_seconds()) > 15 * 60:
         raise HTTPException(status_code=400, detail="O horario informado esta muito distante do relogio do servidor.")
 
     records = _user_records_sorted(db, user["id"])
+    if payload.offline:
+        # O turno aberto e o do momento da batida: o que veio depois dela
+        # (outras batidas ja sincronizadas) nao conta. Na ordem dos pontos,
+        # nao pelo texto do horario: o ponto do lote no mesmo minuto vale
+        # pelo tipo (_records_before_punch).
+        records = _records_before_punch(records, {
+            "user_id": user["id"],
+            "record_type": payload.record_type,
+            "timestamp": _local_iso(attempted),
+        })
     open_shift = _open_shift_start(records)
     if payload.record_type == "check_in":
         if open_shift is not None:
@@ -2401,6 +2855,13 @@ async def schedule_controlled_punch_endpoint(
                     status_code=409,
                     detail="A entrada ocorreu depois do fim programado; solicite liberacao para continuar e encerre no horario real.",
                 )
+            # Gravar uma saida no futuro fecharia o turno antes da hora e
+            # pagaria minutos nao trabalhados.
+            if scheduled_end > server_now:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Ainda nao deu o fim do horario programado. Para sair agora, use Finalizar expediente.",
+                )
             attempted = scheduled_end
         elif _is_intern_profile(user):
             overtime_threshold = _time_on_day(shift_started.date(), schedule["overtime_prompt_after"], timezone_name)
@@ -2420,7 +2881,6 @@ async def schedule_controlled_punch_endpoint(
                         "schedule": schedule,
                     }
 
-    record_ref = db.collection("time_records").document()
     record = {
         "user_id": user["id"],
         "record_type": payload.record_type,
@@ -2433,6 +2893,11 @@ async def schedule_controlled_punch_endpoint(
         "schedule_snapshot": schedule if _is_intern_profile(user) else None,
         "created_at": firestore.SERVER_TIMESTAMP,
     }
+    if payload.offline:
+        record["synced_from_offline"] = True
+        record["offline_delay_minutes"] = max(
+            0, int((server_now - punched_at).total_seconds() // 60)
+        )
     record_ref.set(record)
     return {"status": "created", "id": record_ref.id, **record}
 
@@ -2459,27 +2924,86 @@ async def create_schedule_approval_request_endpoint(
 
     db = get_firestore_admin()
     schedule = _resolve_effective_work_schedule(db, user)
-    attempted = _parse_schedule_datetime(payload.attempted_at, schedule["timezone"])
-    server_now = datetime.now(ZoneInfo(schedule["timezone"]))
+    timezone_name = schedule["timezone"]
+    attempted = _parse_schedule_datetime(payload.attempted_at, timezone_name)
+    server_now = datetime.now(ZoneInfo(timezone_name))
     if abs((server_now - attempted).total_seconds()) > 15 * 60:
         raise HTTPException(
             status_code=400,
             detail="O horario da solicitacao esta muito distante do relogio do servidor.",
         )
     day_key = attempted.date().isoformat()
-    # Inclui "approved": um pedido ja liberado no mesmo dia torna o novo
-    # desnecessario. Sem isso, uma segunda tentativa do app (retry apos timeout,
-    # toque duplo) criava um pedido irmao que ficava eternamente pendente na
-    # tela do gestor, ja que o ponto do dia veio do primeiro.
-    existing = _find_schedule_request(
+    shift_start_at = payload.shift_start_at
+    records: Optional[List[dict]] = None
+    open_shift = None
+    if payload.request_type == "overtime":
+        records = _user_records_sorted(db, user["id"])
+        open_shift = _open_shift_start(records)
+        if open_shift is not None:
+            # Chave = dia em que o turno comecou, o mesmo que a saida consulta.
+            # Num turno que vira a meia-noite o dia da tentativa ja e outro, e
+            # a liberacao dada pelo gestor nunca seria encontrada.
+            shift_started = _parse_schedule_datetime(str(open_shift.get("timestamp")), timezone_name)
+            day_key = shift_started.date().isoformat()
+            shift_start_at = str(open_shift.get("timestamp"))
+
+    # Pendente do mesmo dia: o novo pedido e repeticao (retry apos timeout,
+    # toque duplo) e criaria um irmao eternamente pendente na tela do gestor.
+    # Na entrada, so se for da mesma tentativa (_is_start_request_retry): o
+    # pedido das 08:00 sem resposta engolia o das 15:00, e liberado as 15:05
+    # abria o turno as 08:00 (7h pagas a mais). O antigo vira "superseded".
+    # Aprovado so conta enquanto ainda vale para o turno atual: uma segunda
+    # entrada fora do horario no mesmo dia, depois de encerrar o primeiro
+    # turno, precisa de pedido novo.
+    candidates = _find_schedule_requests(
         db, user["id"], payload.request_type, day_key, {"pending", "approved"}
     )
+    existing = None
+    stale = []
+    for item in candidates:
+        item_data = item.to_dict() or {}
+        if item_data.get("status") != "pending":
+            continue
+        if payload.request_type == "start_exception" and not _is_start_request_retry(
+            _to_local_naive(item_data.get("attempted_at")), attempted.replace(tzinfo=None)
+        ):
+            stale.append(item)
+            continue
+        existing = item
+        break
+    approved = [item for item in candidates if (item.to_dict() or {}).get("status") == "approved"]
+    if existing is None and approved:
+        if records is None:
+            records = _user_records_sorted(db, user["id"])
+            open_shift = _open_shift_start(records)
+        for item in approved:
+            item_data = item.to_dict() or {}
+            if payload.request_type == "start_exception":
+                still_valid = (
+                    open_shift is not None
+                    and item_data.get("linked_time_record_id") == open_shift.get("id")
+                )
+            else:
+                # day_key ja e o do turno aberto: mesmo dia = mesmo turno.
+                still_valid = open_shift is not None
+            if still_valid:
+                existing = item
+                break
     if existing is not None:
         return {"status": "existing", "request": _approval_dict(existing)}
 
     if payload.request_type == "start_exception":
         if _is_start_within_schedule(attempted, schedule):
             raise HTTPException(status_code=400, detail="Este horario nao precisa de autorizacao.")
+
+    for item in stale:
+        # Sai da lista de pendentes e nao pode mais ser liberado (approve so
+        # aceita "pending").
+        item.reference.update({
+            "status": "superseded",
+            "superseded_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
 
     request_ref = db.collection("work_schedule_approval_requests").document()
     request_data = {
@@ -2489,7 +3013,7 @@ async def create_schedule_approval_request_endpoint(
         "request_type": payload.request_type,
         "status": "pending",
         "attempted_at": _local_iso(attempted),
-        "shift_start_at": payload.shift_start_at,
+        "shift_start_at": shift_start_at,
         "day_key": day_key,
         "location": payload.location or "App",
         "notes": observation,
@@ -2499,6 +3023,16 @@ async def create_schedule_approval_request_endpoint(
         "created_at": firestore.SERVER_TIMESTAMP,
         "updated_at": firestore.SERVER_TIMESTAMP,
     }
+    # Hora do primeiro pedido substituido, para o gestor ver as duas: se o
+    # estagiario pediu de novo enquanto esperava, a chegada real foi a
+    # primeira, e o gestor corrige pelo lote.
+    previous_attempts = [
+        str(data.get("previous_attempted_at") or data.get("attempted_at") or "")
+        for data in ((item.to_dict() or {}) for item in stale)
+    ]
+    previous_attempts = [value for value in previous_attempts if value]
+    if previous_attempts:
+        request_data["previous_attempted_at"] = min(previous_attempts)
     request_ref.set(request_data)
 
     title = "Liberacao de horario solicitada"
@@ -2600,28 +3134,32 @@ async def approve_schedule_request_endpoint(
         open_shift = _open_shift_start(records)
         # Procura pelo vinculo, nao pelo turno aberto: o ponto pode ter sido
         # gravado por uma tentativa anterior e o turno ja ter sido encerrado.
-        # Vale tambem o ponto vindo de OUTRO pedido do mesmo dia: quando o app
-        # cria pedidos duplicados, liberar o segundo nao pode gerar uma segunda
-        # entrada - a do dia ja esta la e este pedido virou redundante.
-        existing = next(
-            (
-                item
-                for item in records
-                if item.get("record_type") == "check_in"
-                and item.get("schedule_approval_request_id")
-                and (
-                    item.get("schedule_approval_request_id") == request_id
-                    or str(item.get("timestamp") or "")[:10] == data.get("day_key")
-                )
-            ),
-            None,
-        )
+        existing = _reusable_approval_check_in(records, request_id, data, open_shift)
+        timezone_name = (data.get("schedule_snapshot") or {}).get("timezone") or _LOCAL_TZ
+        try:
+            attempted = _parse_schedule_datetime(data.get("attempted_at") or "", timezone_name)
+            now = datetime.now(ZoneInfo(timezone_name))
+        except Exception:
+            attempted = now = None
         if existing is not None:
-            # A tentativa anterior gravou o ponto mas nao chegou a marcar o
-            # pedido como aprovado (timeout, queda do processo) - por isso ele
-            # continuou na lista do gestor. Reaproveita o ponto que ja existe e
-            # so conclui a decisao; criar outro duplicaria a entrada.
+            # Reaproveita o ponto que ja existe e so conclui a decisao; criar
+            # outro duplicaria a entrada.
             linked_record_id = existing["id"]
+        elif now is not None and _start_request_expired(attempted, now):
+            # Liberar agora um pedido de muitas horas atras gravaria a entrada
+            # na hora dele, abrindo um turno que ja passou; o ponto real
+            # desse dia deve ser lancado pelo lote.
+            raise HTTPException(
+                status_code=409,
+                detail="Pedido antigo: a entrada nao foi criada. Rejeite e lance o ponto pelo lote se for o caso.",
+            )
+        elif _newer_start_attempt(db, request_id, data) is not None:
+            # Pedido feito pelo app antigo ou pelo modo compativel, que nao
+            # marca o pedido anterior como substituido.
+            raise HTTPException(
+                status_code=409,
+                detail="O estagiario pediu a entrada de novo mais tarde neste dia: libere o pedido mais recente.",
+            )
         elif open_shift is not None:
             raise HTTPException(status_code=409, detail="O usuario ja possui um turno aberto.")
         else:

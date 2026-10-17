@@ -15,6 +15,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'app_config.dart';
 import 'session_service.dart';
 import '../utils/chat_timestamp.dart';
+import '../utils/shift_records.dart';
+import '../utils/timesheet.dart';
 import '../utils/work_schedule_rules.dart';
 
 class AdjustmentRequestResult {
@@ -27,6 +29,22 @@ class AdjustmentRequestResult {
     this.audioUrl,
     this.audioUploadPending = false,
   });
+}
+
+/// Batida recusada pelas regras de horario (backend ou fallback), nao por
+/// falta de rede: reenviar igual nao muda nada. O texto e o mesmo de uma
+/// Exception comum, para a mensagem na tela nao mudar.
+class PunchRejectedException implements Exception {
+  const PunchRejectedException(this.message, {this.awaitingApproval = false});
+
+  final String message;
+
+  /// Recusada so por falta da liberacao do gestor: com a liberacao, a mesma
+  /// batida passa.
+  final bool awaitingApproval;
+
+  @override
+  String toString() => 'Exception: $message';
 }
 
 class ApiService {
@@ -719,11 +737,84 @@ class ApiService {
         .toList();
   }
 
+  /// Usuario logado neste aparelho: a sessao do Firebase ou, sem ela, o perfil
+  /// guardado.
+  Future<String?> _localUserId() async {
+    final uid = _auth.currentUser?.uid ??
+        (await getCachedCurrentUser())?['id']?.toString();
+    return (uid == null || uid.isEmpty) ? null : uid;
+  }
+
+  /// Fila offline so do usuario logado. A fila e do aparelho e guarda pontos
+  /// de todos que entraram nele; a contagem e o "Descartar" da tela de ponto
+  /// valem so para os pontos de quem esta usando.
+  Future<List<Map<String, dynamic>>> getCurrentUserOfflineRecords() async {
+    final userId = await _localUserId();
+    if (userId == null) return [];
+    return (await getOfflineRecords())
+        .where((record) => record['user_id']?.toString() == userId)
+        .toList();
+  }
+
+  Future<void> clearCurrentUserOfflineRecords() async {
+    final userId = await _localUserId();
+    if (userId == null) return;
+    final others = (await getOfflineRecords())
+        .where((record) => record['user_id']?.toString() != userId)
+        .toList();
+    await _replaceOfflineRecords(others);
+  }
+
+  /// Descarta so as batidas do usuario logado que o servidor recusou. As que
+  /// ainda esperam internet ficam: apagar tudo levava junto a entrada de hoje,
+  /// boa, so porque a saida de ontem tinha sido recusada.
+  Future<void> clearCurrentUserBlockedOfflineRecords() async {
+    final userId = await _localUserId();
+    if (userId == null) return;
+    final kept = (await getOfflineRecords())
+        .where((record) =>
+            record['user_id']?.toString() != userId ||
+            !isBlockedOfflineRecord(record))
+        .toList();
+    await _replaceOfflineRecords(kept);
+  }
+
+  /// Chave de um ponto na fila: o id, ou o proprio JSON nos antigos sem id.
+  String _offlineQueueKey(Map<String, dynamic> record) {
+    final id = record['id']?.toString() ?? '';
+    return id.isNotEmpty ? id : jsonEncode(record);
+  }
+
+  String? _offlineQueueKeyOfRaw(String raw) {
+    try {
+      return _offlineQueueKey(jsonDecode(raw) as Map<String, dynamic>);
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<void> _saveOfflineRecord(Map<String, dynamic> recordData) async {
     final prefs = await SharedPreferences.getInstance();
     final records = prefs.getStringList(_offlineRecordsKey) ?? [];
+    // Mesmo id = mesma batida (id fixo da pausa automatica, ou a batida que
+    // ja estava na fila): nao entra duas vezes.
+    final key = _offlineQueueKey(recordData);
+    if (records.any((raw) => _offlineQueueKeyOfRaw(raw) == key)) return;
     records.add(jsonEncode(recordData));
     await prefs.setStringList(_offlineRecordsKey, records);
+  }
+
+  /// Tira da fila so os pontos [syncedKeys], lendo a fila de AGORA: um ponto
+  /// batido enquanto a sincronizacao (lenta, sinal ruim) rodava entrou depois
+  /// da copia lida no inicio dela, e regravar aquela copia o apagava. Sem
+  /// await entre ler e gravar, nada entra no meio.
+  Future<void> _removeOfflineRecords(Set<String> syncedKeys) async {
+    if (syncedKeys.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    final remaining = (prefs.getStringList(_offlineRecordsKey) ?? [])
+        .where((raw) => !syncedKeys.contains(_offlineQueueKeyOfRaw(raw)))
+        .toList();
+    await prefs.setStringList(_offlineRecordsKey, remaining);
   }
 
   Future<void> _replaceOfflineRecords(
@@ -742,32 +833,213 @@ class ApiService {
     await _replaceOfflineRecords([]);
   }
 
-  Future<bool> _recordExistsOnServer(String recordId) async {
+  /// Ponto [recordId] lido direto do servidor, ou null (nao existe, e de
+  /// outro usuario ou nao deu para ler).
+  Future<Map<String, dynamic>?> _serverTimeRecord(String recordId) async {
     try {
       final snapshot = await _db
           .collection('time_records')
           .doc(recordId)
           .get(const GetOptions(source: Source.server))
           .timeout(const Duration(seconds: 15));
-      return snapshot.exists;
+      final data = snapshot.data();
+      if (!snapshot.exists || data == null) return null;
+      return {'id': snapshot.id, ...data};
     } catch (e) {
       debugPrint('Nao deu para conferir o ponto $recordId no servidor: $e');
-      return false;
+      return null;
     }
   }
 
-  Future<int> syncOfflineRecords() async {
-    final pendingRecords = await getOfflineRecords();
+  Future<bool> _recordExistsOnServer(String recordId) async =>
+      await _serverTimeRecord(recordId) != null;
+
+  /// Grava um ponto com id fixo. O SDK do Firestore continua tentando uma
+  /// escrita anterior em segundo plano (e, com o cache local ligado, ate
+  /// depois de fechar o app), e o backend grava a pausa automatica com o mesmo
+  /// id. Quando o documento ja existe, o set() vira um UPDATE, que as regras
+  /// so permitem ao admin: permission-denied. O ponto ja esta no servidor;
+  /// sem esta checagem ele ficava preso na fila para sempre.
+  Future<void> _setNewTimeRecord(
+      String recordId, Map<String, dynamic> data) async {
+    try {
+      await _db
+          .collection('time_records')
+          .doc(recordId)
+          .set(data)
+          .timeout(const Duration(seconds: 15));
+    } catch (e) {
+      if (!await _recordExistsOnServer(recordId)) rethrow;
+      debugPrint('Ponto $recordId ja estava no servidor.');
+    }
+  }
+
+  /// Id novo de documento de time_records, gerado no aparelho (sem rede).
+  String newTimeRecordId() => _db.collection('time_records').doc().id;
+
+  static final RegExp _clientRecordIdPattern = RegExp(r'^[A-Za-z0-9_-]{8,64}$');
+
+  // Sincronizacao em andamento, compartilhada pelas instancias do ApiService
+  // (cada tela cria a sua): duas ao mesmo tempo reenviariam os mesmos pontos.
+  static Future<int>? _offlineSyncInFlight;
+
+  /// [retryBlocked]: reenvia tambem as batidas que o servidor ja recusou
+  /// (o toque em "Sincronizar"; ex.: o gestor liberou a hora extra depois).
+  Future<int> syncOfflineRecords({bool retryBlocked = false}) {
+    return _offlineSyncInFlight ??= _syncOfflineRecords(retryBlocked)
+        .whenComplete(() => _offlineSyncInFlight = null);
+  }
+
+  /// Espera a sincronizacao em andamento, se houver, terminar.
+  static Future<void> waitForOfflineSync() async {
+    try {
+      await _offlineSyncInFlight;
+    } catch (_) {
+      // O erro ja foi tratado por quem disparou a sincronizacao.
+    }
+  }
+
+  /// Batida da fila que o servidor recusou pelas regras (precisa de
+  /// liberacao, fora do periodo aceito...). Reenviar igual a cada minuto nao
+  /// muda nada: ela fica parada, fora da tela de ponto, ate a pessoa tocar em
+  /// "Sincronizar" ou descartar.
+  static bool isBlockedOfflineRecord(Map<String, dynamic> record) =>
+      record['sync_status'] == 'blocked';
+
+  /// Recusada so porque faltava a liberacao do gestor (a saida depois do
+  /// limite da hora extra): liberada, a mesma batida passa e nao deve ser
+  /// batida de novo.
+  static bool isAwaitingApprovalOfflineRecord(Map<String, dynamic> record) =>
+      isBlockedOfflineRecord(record) &&
+      record['sync_awaiting_approval'] == true;
+
+  /// O reenvio das saidas que esperavam a liberacao teve resposta do
+  /// servidor? [before] e [after] sao a fila antes e depois dele. Sim quando
+  /// a saida saiu da fila ou quando o servidor recusou de novo algum ponto
+  /// (sync_refused_at novo): a propria saida ou um anterior, que a segura.
+  /// Com a saida parada na mesma hora de recusa e nenhuma recusa nova, o
+  /// reenvio nao chegou ao servidor (timeout no sinal fraco, ou outra
+  /// sincronizacao sem reenvio ja rodava) e precisa de outra tentativa.
+  static bool awaitingApprovalRetryAnswered(
+      List<Map<String, dynamic>> before, List<Map<String, dynamic>> after) {
+    String idOf(Map<String, dynamic> record) => record['id']?.toString() ?? '';
+    Map<String, String?> refusals(List<Map<String, dynamic>> queue) => {
+          for (final record in queue.where(isBlockedOfflineRecord))
+            idOf(record): record['sync_refused_at']?.toString(),
+        };
+    final was = refusals(before);
+    final now = refusals(after);
+    if (now.entries.any((entry) =>
+        !was.containsKey(entry.key) || was[entry.key] != entry.value)) {
+      return true;
+    }
+    return !before.any((record) =>
+        record['record_type'] == 'check_out' &&
+        isAwaitingApprovalOfflineRecord(record) &&
+        now.containsKey(idOf(record)) &&
+        now[idOf(record)] == was[idOf(record)]);
+  }
+
+  /// Primeiro horario (timestamp) de uma saida recusada em [records], ou
+  /// null. O turno dela segue aberto no servidor e o que vem depois na fila
+  /// espera por ela.
+  static String? firstBlockedCheckOutTimestamp(
+      Iterable<Map<String, dynamic>> records) {
+    String? first;
+    for (final record in records) {
+      if (!isBlockedOfflineRecord(record) ||
+          record['record_type'] != 'check_out') {
+        continue;
+      }
+      final timestamp = record['timestamp']?.toString() ?? '';
+      if (first == null || timestamp.compareTo(first) < 0) first = timestamp;
+    }
+    return first;
+  }
+
+  /// Descarta da fila os pontos [ids] do usuario logado (ex.: a saida
+  /// recusada de um turno que foi fechado de outro jeito, no FECHAR PONTO do
+  /// horario programado). Mantida, ela seria recusada de novo ("Nao existe
+  /// turno aberto") e seguraria os pontos seguintes.
+  Future<void> discardCurrentUserOfflineRecords(Set<String> ids) async {
+    final userId = await _localUserId();
+    if (userId == null || ids.isEmpty) return;
+    final kept = (await getOfflineRecords())
+        .where((record) =>
+            record['user_id']?.toString() != userId ||
+            !ids.contains(record['id']?.toString()))
+        .toList();
+    await _replaceOfflineRecords(kept);
+  }
+
+  /// O ponto ainda esta na fila? O "Descartar" pode te-lo tirado enquanto
+  /// esta sincronizacao rodava com a copia lida no inicio; enviar assim mesmo
+  /// gravava no servidor o ponto que a pessoa mandou jogar fora.
+  Future<bool> _isStillQueued(String key) async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getStringList(_offlineRecordsKey) ?? [])
+        .any((raw) => _offlineQueueKeyOfRaw(raw) == key);
+  }
+
+  /// Marca na fila de AGORA (como _removeOfflineRecords) as batidas recusadas,
+  /// com o motivo para a tela mostrar e a hora da recusa (sync_refused_at):
+  /// igual depois de um reenvio, ele nao chegou ao servidor.
+  Future<void> _markOfflineRecordsBlocked(
+      Map<String, PunchRejectedException> reasons) async {
+    if (reasons.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    final updated = (prefs.getStringList(_offlineRecordsKey) ?? []).map((raw) {
+      final reason = reasons[_offlineQueueKeyOfRaw(raw)];
+      if (reason == null) return raw;
+      final record = jsonDecode(raw) as Map<String, dynamic>;
+      return jsonEncode({
+        ...record,
+        'sync_status': 'blocked',
+        'sync_error': reason.message,
+        'sync_awaiting_approval': reason.awaitingApproval,
+        'sync_refused_at': DateTime.now().toIso8601String(),
+      });
+    }).toList();
+    await prefs.setStringList(_offlineRecordsKey, updated);
+  }
+
+  Future<int> _syncOfflineRecords(bool retryBlocked) async {
+    // A fila e do aparelho. Ponto de outro usuario que usou este celular fica
+    // nela ate ele entrar de novo: com a sessao deste, a escrita direta falha
+    // nas regras e o backend gravaria a batida em nome de quem esta logado.
+    final userId = _auth.currentUser?.uid;
+    if (userId == null) return 0;
+    // Em ordem de horario: cada batida depende do estado que as anteriores
+    // deixam no servidor (a saida precisa da entrada; o backend confere o
+    // turno aberto no momento da batida). sort e estavel: mesmo horario
+    // fica na ordem da fila.
+    final pendingRecords = (await getOfflineRecords())
+        .where((record) => record['user_id']?.toString() == userId)
+        .toList()
+      ..sort((a, b) => (a['timestamp']?.toString() ?? '')
+          .compareTo(b['timestamp']?.toString() ?? ''));
     if (pendingRecords.isEmpty) return 0;
     final cachedUser = await getCachedCurrentUser();
-    final cachedRole = (cachedUser?['role'] ?? '').toString().toLowerCase();
-    final isIntern =
-        cachedRole.contains('intern') || cachedRole.contains('estag');
+    final profile = cachedUser?['id']?.toString() == userId
+        ? cachedUser!
+        : await getCurrentUser();
+    final role = (profile['role'] ?? '').toString().toLowerCase();
+    final isIntern = role.contains('intern') || role.contains('estag');
 
     int syncedCount = 0;
-    final failedRecords = <Map<String, dynamic>>[];
+    final syncedKeys = <String>{};
+    final blockedReasons = <String, PunchRejectedException>{};
 
+    // A primeira batida que nao entra (recusada, parada ou falha de rede)
+    // segura as seguintes na fila, pendentes. Seguir em frente mandava a
+    // saida sem a entrada: o backend recusava com "Nao existe turno aberto",
+    // a saida ficava parada para sempre e as pausas iam direto para o
+    // servidor, soltas, sem o turno delas.
     for (final record in pendingRecords) {
+      final recordId = record['id']?.toString() ?? '';
+      final key = _offlineQueueKey(record);
+      if (isBlockedOfflineRecord(record) && !retryBlocked) break;
+      if (!await _isStillQueued(key)) continue;
       try {
         final recordType = record['record_type']?.toString() ?? '';
         if (isIntern &&
@@ -779,215 +1051,121 @@ class ApiService {
             notes: record['notes']?.toString(),
             latitude: (record['latitude'] as num?)?.toDouble(),
             longitude: (record['longitude'] as num?)?.toDouble(),
+            // Mesmo id da batida original: se ela chegou ao backend antes de
+            // a rede cair, o reenvio devolve o ponto gravado em vez de
+            // duplicar (ou de recusar com "Ja existe um turno aberto").
+            clientRecordId:
+                _clientRecordIdPattern.hasMatch(recordId) ? recordId : null,
+            offline: true,
+            // FECHAR PONTO no horario programado guardado sem internet: segue
+            // como fechamento, nao como saida comum. Como saida comum, com o
+            // "Bloquear tela apos" igual ao fim do horario, ela pedia
+            // liberacao e ficava parada.
+            closeAtScheduledEnd: record['close_at_scheduled_end'] == true,
           );
           if (result['status'] == 'approval_required') {
-            throw Exception('Registro depende de liberacao do gestor.');
+            // A saida depois do limite passa com a liberacao da hora extra. A
+            // entrada fora do horario nao: a liberacao grava a propria entrada,
+            // na hora do pedido feito pela tela.
+            throw PunchRejectedException('Depende de liberacao do gestor.',
+                awaitingApproval: result['request_type'] == 'overtime');
           }
-          syncedCount++;
-          continue;
-        }
+        } else {
+          if (recordId.isEmpty) {
+            // Formato antigo, sem id: gravar duplicaria a cada tentativa. Fica
+            // na fila (o Descartar tira) sem segurar as outras.
+            debugPrint('Registro offline sem identificador.');
+            continue;
+          }
+          if (recordType == 'check_in') {
+            await _closeForgottenShiftBefore(
+                userId, record['timestamp']?.toString() ?? '');
+          }
 
-        final firestoreData = Map<String, dynamic>.from(record)
-          ..remove('id')
-          ..remove('offline')
-          ..remove('sync_status')
-          ..remove('created_at_local');
+          final firestoreData = Map<String, dynamic>.from(record)
+            ..remove('id')
+            ..remove('offline')
+            ..remove('sync_status')
+            ..remove('sync_error')
+            ..remove('sync_awaiting_approval')
+            ..remove('sync_refused_at')
+            ..remove('close_at_scheduled_end')
+            ..remove('created_at_local');
 
-        firestoreData['created_at'] = FieldValue.serverTimestamp();
-        firestoreData['synced_from_offline'] = true;
+          firestoreData['created_at'] = FieldValue.serverTimestamp();
+          firestoreData['synced_from_offline'] = true;
 
-        final recordId = record['id']?.toString();
-        if (recordId == null || recordId.isEmpty) {
-          throw Exception('Registro offline sem identificador.');
-        }
-
-        try {
-          await _db
-              .collection('time_records')
-              .doc(recordId)
-              .set(firestoreData)
-              .timeout(const Duration(seconds: 15));
-        } catch (e) {
-          // O SDK do Firestore continua tentando a escrita original em
-          // segundo plano (e, com o cache local ligado, ate depois de fechar
-          // o app). Quando ela entra antes desta, o set() vira um UPDATE, que
-          // as regras so permitem ao admin: permission-denied. O ponto ja
-          // esta no servidor; sem esta checagem ele ficava preso na fila
-          // para sempre, "aguardando internet".
-          if (!await _recordExistsOnServer(recordId)) rethrow;
-          debugPrint('Ponto offline $recordId ja estava no servidor.');
+          await _setNewTimeRecord(recordId, firestoreData);
+          await _cacheSentRecord({'id': recordId, ...firestoreData});
         }
         syncedCount++;
+        syncedKeys.add(key);
+      } on PunchRejectedException catch (e) {
+        // So os que tem id: sem ele a chave e o proprio JSON, que muda ao
+        // marcar.
+        if (recordId.isNotEmpty) blockedReasons[key] = e;
+        debugPrint('Ponto offline $recordId recusado: ${e.message}');
+        break;
       } catch (e) {
-        debugPrint('Erro ao sincronizar ponto offline ${record['id']}: $e');
-        failedRecords.add(record);
+        debugPrint('Erro ao sincronizar ponto offline $recordId: $e');
+        break;
       }
     }
 
-    await _replaceOfflineRecords(failedRecords);
+    await _removeOfflineRecords(syncedKeys);
+    await _markOfflineRecordsBlocked(blockedReasons);
     return syncedCount;
   }
 
-  // --- LÓGICA DE CÁLCULO (BASEADA NOS SCRIPTS PYTHON) ---
-
-  DateTime _roundTime(DateTime dt) {
-    int minutes = dt.minute;
-    if (minutes <= 15) return DateTime(dt.year, dt.month, dt.day, dt.hour, 0);
-    if (minutes <= 45) return DateTime(dt.year, dt.month, dt.day, dt.hour, 30);
-    return DateTime(dt.year, dt.month, dt.day, dt.hour + 1, 0);
-  }
-
-  bool _isFeriado(DateTime date) {
-    final ano = date.year;
-    final fixos = [
-      '01/01',
-      '21/04',
-      '01/05',
-      '07/09',
-      '12/10',
-      '02/11',
-      '15/11',
-      '25/12'
-    ];
-    String diaMes = DateFormat('dd/MM').format(date);
-    if (fixos.contains(diaMes)) return true;
-
-    // Páscoa e Sexta-feira Santa (Algoritmo de Meeus/Jones/Butcher)
-    int a = ano % 19;
-    int b = ano ~/ 100;
-    int c = ano % 100;
-    int d = b ~/ 4;
-    int e = b % 4;
-    int f = (b + 8) ~/ 25;
-    int g = (b - f + 1) ~/ 3;
-    int h = (19 * a + b - d - g + 15) % 30;
-    int i = c ~/ 4;
-    int k = c % 4;
-    int l = (32 + 2 * e + 2 * i - h - k) % 7;
-    int m = (a + 11 * h + 22 * l) ~/ 451;
-    int mesPascoa = (h + l - 7 * m + 114) ~/ 31;
-    int diaPascoa = ((h + l - 7 * m + 114) % 31) + 1;
-    DateTime pascoa = DateTime(ano, mesPascoa, diaPascoa);
-    DateTime sextaSanta = pascoa.subtract(const Duration(days: 2));
-
-    return date.day == sextaSanta.day && date.month == sextaSanta.month;
-  }
-
-  Map<String, double> _classifyHours(
-      DateTime start, DateTime end, String role) {
-    double normal = 0, extras = 0, extra50 = 0, extra100 = 0;
-    bool isEstagiario = role == 'intern' || role == 'estagiario';
-    bool holidayOrSunday =
-        _isFeriado(start) || start.weekday == DateTime.sunday;
-
-    DateTime current = start;
-    while (current.isBefore(end)) {
-      DateTime next = current.add(const Duration(minutes: 1));
-      int hour = current.hour;
-      double minFrac = 1 / 60.0;
-
-      if (holidayOrSunday) {
-        extra100 += minFrac;
-      } else {
-        // 100% Noturno: 22h às 05h
-        if (hour >= 22 || hour < 5) {
-          extra100 += minFrac;
-        }
-        // Sábado 05h às 22h: 50%
-        else if (start.weekday == DateTime.saturday) {
-          extra50 += minFrac;
-        }
-        // Dias Úteis
-        else {
-          if (isEstagiario) {
-            // Regra Estagiário: 13:30 às 19:30 é normal
-            double timeVal = current.hour + (current.minute / 60.0);
-            if (timeVal >= 13.5 && timeVal < 19.5) {
-              normal += minFrac;
-            } else {
-              extras += minFrac;
-            }
-          } else {
-            normal += minFrac;
-          }
-        }
-      }
-      current = next;
-    }
-    return {
-      'normal': normal,
-      'extras': extras,
-      'extra50': extra50,
-      'extra100': extra100
+  /// Antes de gravar uma entrada que estava na fila (ponto direto no
+  /// Firestore, sem a trava de turno aberto do backend): se o servidor mostra
+  /// um turno ainda aberto antes dela, fecha esse turno como saida esquecida,
+  /// 1s depois da entrada dele. Sem isso a entrada nova caia dentro do turno
+  /// velho e o dia pagava as horas entre os dois. Uma falha na leitura
+  /// propaga: a entrada fica na fila para a proxima tentativa.
+  Future<void> _closeForgottenShiftBefore(
+      String userId, String timestamp) async {
+    final at = DateTime.tryParse(timestamp);
+    if (at == null) return;
+    // Mesma janela de 14 dias da tela de ponto e do backend.
+    final snapshot = await _db
+        .collection('time_records')
+        .where('user_id', isEqualTo: userId)
+        .where('timestamp',
+            isGreaterThanOrEqualTo:
+                at.subtract(const Duration(days: 14)).toIso8601String())
+        .where('timestamp', isLessThan: timestamp)
+        .get(const GetOptions(source: Source.server))
+        .timeout(const Duration(seconds: 15));
+    final open = openShiftCheckIn(
+        snapshot.docs.map((doc) => {'id': doc.id, ...doc.data()}));
+    final openId = open?['id']?.toString() ?? '';
+    final openAt = DateTime.tryParse(open?['timestamp']?.toString() ?? '');
+    if (openId.isEmpty || openAt == null) return;
+    final forgot = {
+      'user_id': userId,
+      'record_type': 'check_out',
+      'location': 'App (saida esquecida)',
+      'notes': 'Saida esquecida (fechada na sincronizacao): o gestor precisa '
+          'lancar o horario real',
+      'timestamp': openAt.add(const Duration(seconds: 1)).toIso8601String(),
+      'latitude': null,
+      'longitude': null,
+      'created_at': FieldValue.serverTimestamp(),
     };
+    await _setNewTimeRecord('forgot_$openId', forgot);
+    await _cacheSentRecord({'id': 'forgot_$openId', ...forgot});
+    debugPrint('Turno $openId fechado como saida esquecida na sincronizacao.');
   }
 
-  String _hhmm(DateTime dt) => DateFormat('HH:mm').format(dt);
-
-  // Constroi ate 3 sessoes de trabalho (pares entrada/saida) a partir dos marcos
-  // do dia. O modelo da folha tem 3 pares C-D / E-F / G-H, e as REFEICOES sao os
-  // intervalos ENTRE as sessoes (por isso ficam descontadas do total).
-  //   inicio/fim       -> check_in / check_out (turno)
-  //   almI/almF        -> Pausa 1 (almoco)
-  //   janI/janF        -> Pausa 2 (jantar)
-  // Regras (portadas do Pontocampo.py, ajustadas ao que foi combinado):
-  //   - Pausa deixada aberta (bateu inicio, esqueceu o fim) fecha com 1 hora.
-  //   - Almoco automatico 12:00-13:00 se nao registrado e o turno cobrir a janela.
-  //   - Jantar automatico 20:00-21:00 se nao registrado e o turno cobrir a janela.
-  List<List<DateTime>> _buildWorkSessions({
-    required DateTime? inicio,
-    required DateTime? fim,
-    DateTime? almI,
-    DateTime? almF,
-    DateTime? janI,
-    DateTime? janF,
-  }) {
-    if (inicio == null || fim == null) return [];
-    if (fim.isBefore(inicio)) fim = fim.add(const Duration(days: 1));
-
-    // Fecha refeicao deixada aberta com 1 hora.
-    if (almI != null && almF == null) almF = almI.add(const Duration(hours: 1));
-    if (janI != null && janF == null) janF = janI.add(const Duration(hours: 1));
-
-    final base = DateTime(inicio.year, inicio.month, inicio.day);
-
-    // Almoco automatico 12:00-13:00.
-    if (almI == null && almF == null) {
-      final ai = base.add(const Duration(hours: 12));
-      final af = base.add(const Duration(hours: 13));
-      if (!inicio.isAfter(ai) && !fim.isBefore(af)) {
-        almI = ai;
-        almF = af;
-      }
-    }
-    // Jantar automatico 20:00-21:00.
-    if (janI == null && janF == null) {
-      final ji = base.add(const Duration(hours: 20));
-      final jf = base.add(const Duration(hours: 21));
-      if (!inicio.isAfter(ji) && !fim.isBefore(jf)) {
-        janI = ji;
-        janF = jf;
-      }
-    }
-
-    final marks = <DateTime>[inicio, fim];
-    for (final m in [almI, almF, janI, janF]) {
-      if (m != null) marks.add(m);
-    }
-    marks.sort((a, b) => a.compareTo(b));
-
-    final sessions = <List<DateTime>>[];
-    for (int i = 0; i + 1 < marks.length; i += 2) {
-      final s = marks[i];
-      final e = marks[i + 1];
-      if (e.isAfter(s)) sessions.add([s, e]);
-    }
-    // O modelo suporta no maximo 3 sessoes (3 pares de colunas).
-    return sessions.length > 3 ? sessions.sublist(0, 3) : sessions;
-  }
+  // Calculo da folha (arredondamento, feriados, turnos e classificacao das
+  // horas): utils/timesheet.dart.
 
   // --- MÉTODOS DE DADOS ---
 
+  /// [recordId]: id fixo do documento (ex.: "autoclose_<id da pausa>",
+  /// "forgot_<id da entrada>"), para a mesma batida nunca virar dois pontos.
+  /// Sem ele, um id novo. [extraFields] entra junto no ponto.
   Future<Map<String, dynamic>> createTimeRecord({
     required String recordType,
     String? location,
@@ -996,6 +1174,8 @@ class ApiService {
     String? userId,
     double? latitude,
     double? longitude,
+    String? recordId,
+    Map<String, dynamic>? extraFields,
   }) async {
     final currentUser = _auth.currentUser;
     final cachedUser = await getCachedCurrentUser();
@@ -1017,6 +1197,7 @@ class ApiService {
       'latitude': latitude,
       'longitude': longitude,
       if (userId != null && userId != currentUserId) 'created_by_admin': true,
+      ...?extraFields,
     };
 
     // Id gerado localmente ANTES de escrever. O timeout abaixo nao cancela a
@@ -1024,7 +1205,7 @@ class ApiService {
     // offline usasse outro id, o mesmo toque viraria dois registros iguais
     // (era a origem das pausas duplicadas no mesmo segundo). Com id fixo, a
     // sincronizacao offline regrava o mesmo documento.
-    final docRef = _db.collection('time_records').doc();
+    final docRef = _db.collection('time_records').doc(recordId);
 
     try {
       if (currentUser == null) {
@@ -1046,6 +1227,22 @@ class ApiService {
     } catch (e) {
       if (userId != null && userId != currentUserId) rethrow;
 
+      // Id fixo e permission-denied: as regras so deixam CRIAR, entao quase
+      // sempre e o documento que ja existe (outra tentativa, outro aparelho
+      // ou o job do backend gravou o mesmo ponto). Vale o que esta la; na
+      // fila ele apareceria como pendente sem nada para enviar.
+      if (recordId != null &&
+          e is FirebaseException &&
+          e.code == 'permission-denied') {
+        final existing = await _serverTimeRecord(recordId);
+        if (existing != null) {
+          if (targetUid == currentUserId) {
+            await _appendCachedTimeRecord(currentUserId, existing);
+          }
+          return existing;
+        }
+      }
+
       final offlineRecord = {
         'id': docRef.id,
         ...recordData,
@@ -1066,6 +1263,13 @@ class ApiService {
   /// backend (estagiario). Nao escreve direto no Firestore de proposito: a
   /// sincronizacao reenvia pelo /work-schedule/punch, que aplica as regras de
   /// horario, quando a internet voltar.
+  ///
+  /// [id]: o mesmo id ja mandado ao backend na tentativa que falhou. Se ela
+  /// chegou a gravar antes de a resposta se perder, o reenvio devolve esse
+  /// ponto em vez de criar outro.
+  ///
+  /// [closeAtScheduledEnd]: e o FECHAR PONTO no horario programado; a
+  /// sincronizacao o reenvia como fechamento.
   Future<Map<String, dynamic>> queueTimeRecordOffline({
     required String recordType,
     String? location,
@@ -1073,6 +1277,8 @@ class ApiService {
     String? timestamp,
     double? latitude,
     double? longitude,
+    String? id,
+    bool closeAtScheduledEnd = false,
   }) async {
     final cachedUser = await getCachedCurrentUser();
     final userId = _auth.currentUser?.uid ?? cachedUser?['id']?.toString();
@@ -1083,7 +1289,7 @@ class ApiService {
 
     final now = DateTime.now();
     final offlineRecord = <String, dynamic>{
-      'id': _db.collection('time_records').doc().id,
+      'id': id ?? newTimeRecordId(),
       'user_id': userId,
       'record_type': recordType,
       'location': location ?? 'App',
@@ -1091,6 +1297,7 @@ class ApiService {
       'timestamp': timestamp ?? now.toIso8601String(),
       'latitude': latitude,
       'longitude': longitude,
+      if (closeAtScheduledEnd) 'close_at_scheduled_end': true,
       'offline': true,
       'sync_status': 'pending',
       'created_at_local': now.toIso8601String(),
@@ -1104,8 +1311,17 @@ class ApiService {
   /// servidor recusando o pedido.
   static bool isNetworkFailure(Object error) {
     if (error is TimeoutException || error is http.ClientException) return true;
+    // Sem sinal, a renovacao do token (expira em 1h) falha antes de qualquer
+    // pedido HTTP: era o caso mais comum de batida offline do estagiario, e
+    // ela se perdia em vez de entrar na fila.
+    if (error is FirebaseException &&
+        (error.code == 'network-request-failed' ||
+            error.code == 'unavailable')) {
+      return true;
+    }
     final text = error.toString();
-    return text.contains('SocketException') ||
+    return text.contains('network-request-failed') ||
+        text.contains('SocketException') ||
         text.contains('Failed host lookup') ||
         text.contains('Connection refused') ||
         text.contains('Network is unreachable');
@@ -1234,13 +1450,28 @@ class ApiService {
       // continua em background depois do timeout). Como ambos usam o mesmo id,
       // ignorar os que ja vieram do Firestore evita mostrar o ponto em dobro.
       final knownIds = records.map((record) => record['id']).toSet();
-      final offlineRecords = await getOfflineRecords();
+      final offlineRecords = (await getOfflineRecords())
+          .where((record) => record['user_id'] == targetUid)
+          .toList();
+      // A recusada pelo servidor fica de fora: com ela na lista, a tela
+      // seguia mostrando o turno fechado (ou aberto) que o servidor nao tem, e
+      // a pessoa nao conseguia bater de novo nem pedir a liberacao.
+      // Depois de uma saida recusada, o turno dela segue aberto no servidor e
+      // o resto da fila espera por ela: a entrada e a saida do dia seguinte,
+      // ainda na fila, fechavam a conta na tela e o turno aberto sumia (sem
+      // tela de hora extra, sem FECHAR PONTO, sem pedir a liberacao).
+      final heldFrom = firstBlockedCheckOutTimestamp(offlineRecords);
       records.addAll(offlineRecords.where((record) =>
-          record['user_id'] == targetUid && !knownIds.contains(record['id'])));
+          !knownIds.contains(record['id']) &&
+          !isBlockedOfflineRecord(record) &&
+          (heldFrom == null ||
+              (record['timestamp']?.toString() ?? '').compareTo(heldFrom) <
+                  0)));
     }
 
-    records.sort((a, b) =>
-        (b['timestamp'] as String).compareTo(a['timestamp'] as String));
+    // Do mais novo para o mais antigo; no mesmo horario, a ordem vem do
+    // tipo (sortRecords), como no calculo do turno.
+    records = sortRecords(records).reversed.toList();
     if (startDate != null || endDate != null) {
       records = records.where((record) {
         final timestamp = record['timestamp'] as String;
@@ -1369,8 +1600,9 @@ class ApiService {
           offlineRecords.where((record) => record['user_id'] == targetUid));
     }
 
-    records.sort((a, b) =>
-        (b['timestamp'] as String).compareTo(a['timestamp'] as String));
+    // Do mais novo para o mais antigo; no mesmo horario, a ordem vem do
+    // tipo (sortRecords), como no calculo do turno.
+    records = sortRecords(records).reversed.toList();
     if (startDate != null || endDate != null) {
       records = records.where((r) {
         final ts = r['timestamp'] as String;
@@ -1404,102 +1636,40 @@ class ApiService {
       user = await getCurrentUser();
     }
 
+    // Busca um dia a mais de cada lado: o turno que comeca no ultimo dia do
+    // periodo pode fechar no dia seguinte, e o ponto da madrugada do primeiro
+    // dia pode ser de um turno da vespera (que fica no periodo anterior).
+    final fetchStart = DateTime.parse(startDate)
+        .subtract(const Duration(days: 1))
+        .toIso8601String();
+    final fetchEnd =
+        DateTime.parse(endDate).add(const Duration(days: 1)).toIso8601String();
+    final firstDay = startDate.substring(0, 10);
+    final lastDay = endDate.substring(0, 10);
     final records = await getTimeRecords(
-        startDate: startDate, endDate: endDate, userId: user['id']);
-    Map<String, List<dynamic>> grouped = {};
-    for (var r in records) {
-      final d = (r['timestamp'] as String).substring(0, 10);
-      grouped.putIfAbsent(d, () => []).add(r);
-    }
+        startDate: fetchStart, endDate: fetchEnd, userId: user['id']);
+    // Agrupa pelo dia em que o turno comecou: entrada 19:30 e saida 07:00 sao
+    // um turno so, do dia da entrada.
+    final grouped = groupRecordsByWorkDay(records)
+      ..removeWhere((day, _) =>
+          day.compareTo(firstDay) < 0 || day.compareTo(lastDay) > 0);
 
     List<Map<String, dynamic>> dailyRecords = [];
     double totalN = 0, totalE = 0, total50 = 0, total100 = 0;
 
+    final role = user['role']?.toString() ?? 'employee';
     grouped.forEach((date, dayRecords) {
-      dayRecords.sort((a, b) =>
-          (a['timestamp'] as String).compareTo(b['timestamp'] as String));
-
-      // Marcos do dia. Pausa 1 (break_*) = almoco; Pausa 2 (entry_3/exit_3) = jantar.
-      DateTime? inicio, fim, almI, almF, janI, janF;
-      for (final r in dayRecords) {
-        final ts = _roundTime(DateTime.parse(r['timestamp'] as String).toLocal());
-        switch (r['record_type']) {
-          case 'check_in':
-            inicio ??= ts;
-            break;
-          case 'check_out':
-            fim = ts; // ultimo check_out do dia
-            break;
-          case 'break_start':
-            almI ??= ts;
-            break;
-          case 'break_end':
-            almF ??= ts;
-            break;
-          case 'entry_3':
-            janI ??= ts;
-            break;
-          case 'exit_3':
-            janF ??= ts;
-            break;
-        }
-      }
-
-      final sessions = _buildWorkSessions(
-        inicio: inicio,
-        fim: fim,
-        almI: almI,
-        almF: almF,
-        janI: janI,
-        janF: janF,
-      );
-
-      double dNormal = 0, dExtras = 0, d50 = 0, d100 = 0;
-      for (final s in sessions) {
-        final c = _classifyHours(s[0], s[1], user['role'] ?? 'employee');
-        dNormal += c['normal']!;
-        dExtras += c['extras']!;
-        d50 += c['extra50']!;
-        d100 += c['extra100']!;
-      }
-
-      // Mapeia ate 3 sessoes para os 3 pares de colunas (C-D / E-F / G-H).
-      String? colCheckIn, colCheckOut;
-      String? colBreakStart, colBreakEnd, colEntry3, colExit3;
-      if (sessions.isNotEmpty) {
-        colCheckIn = _hhmm(sessions[0][0]);
-        colCheckOut = _hhmm(sessions[0][1]);
-      } else if (inicio != null) {
-        // Turno aberto (sem saida): mostra so a entrada, sem contar horas.
-        colCheckIn = _hhmm(inicio);
-      }
-      if (sessions.length >= 2) {
-        colBreakStart = _hhmm(sessions[1][0]);
-        colBreakEnd = _hhmm(sessions[1][1]);
-      }
-      if (sessions.length >= 3) {
-        colEntry3 = _hhmm(sessions[2][0]);
-        colExit3 = _hhmm(sessions[2][1]);
-      }
-
-      totalN += dNormal;
-      totalE += dExtras;
-      total50 += d50;
-      total100 += d100;
-      dailyRecords.add({
-        'date': date,
-        'check_in': colCheckIn,
-        'check_out': colCheckOut,
-        'break_start': colBreakStart,
-        'break_end': colBreakEnd,
-        'entry_3': colEntry3,
-        'exit_3': colExit3,
-        'total_hours': dNormal + dExtras + d50 + d100,
-        'regular_hours': dNormal,
-        'overtime_hours': dExtras + d50 + d100,
-        'extra_50': d50,
-        'extra_100': d100,
-      });
+      final day = computeWorkDay(date, dayRecords, role);
+      final regular = day['regular_hours'] as double;
+      final extra50 = day['extra_50'] as double;
+      final extra100 = day['extra_100'] as double;
+      totalN += regular;
+      // Extras de contrato (estagiario fora das 13:30-19:30): o que sobra das
+      // horas extras tirando as de 50% e 100%.
+      totalE += (day['overtime_hours'] as double) - extra50 - extra100;
+      total50 += extra50;
+      total100 += extra100;
+      dailyRecords.add(day);
     });
 
     dailyRecords
@@ -1674,21 +1844,95 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>> getEffectiveWorkSchedule() async {
-    final response = await http
-        .get(
-          Uri.parse('$backendUrl/work-schedule/effective'),
-          headers: await _authorizedHeaders(),
-        )
-        .timeout(const Duration(seconds: 20));
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      if (response.statusCode == 404 || response.statusCode >= 500) {
-        return _getEffectiveWorkScheduleFromFirestore();
+  /// [shiftDay]: dia em que o turno aberto comecou. O pedido de hora extra e
+  /// guardado por esse dia; num turno que virou a meia-noite, procurar por
+  /// "hoje" nao acharia a liberacao ja dada.
+  ///
+  /// Sem internet, devolve o ultimo lido neste aparelho (com from_cache):
+  /// o estado so na memoria sumia ao reabrir o app offline, e o estagiario
+  /// com a hora extra ja liberada ficava preso em "HORARIO PROGRAMADO
+  /// ENCERRADO", sem conseguir bater nem guardar a saida.
+  Future<Map<String, dynamic>> getEffectiveWorkSchedule(
+      {DateTime? shiftDay}) async {
+    final shiftDayKey =
+        shiftDay == null ? '' : DateFormat('yyyy-MM-dd').format(shiftDay);
+    try {
+      final uri = Uri.parse('$backendUrl/work-schedule/effective').replace(
+          queryParameters:
+              shiftDay == null ? null : {'shift_day': shiftDayKey});
+      final response = await http
+          .get(uri, headers: await _authorizedHeaders())
+          .timeout(const Duration(seconds: 20));
+      final Map<String, dynamic> state;
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        if (response.statusCode != 404 && response.statusCode < 500) {
+          throw Exception(_apiError(response));
+        }
+        state = await _getEffectiveWorkScheduleFromFirestore(shiftDay: shiftDay);
+      } else {
+        state = Map<String, dynamic>.from(
+            jsonDecode(utf8.decode(response.bodyBytes)) as Map);
       }
-      throw Exception(_apiError(response));
+      await _cacheWorkSchedule(shiftDayKey, state);
+      return state;
+    } catch (e) {
+      if (!isNetworkFailure(e)) rethrow;
+      final cached = await getCachedEffectiveWorkSchedule(shiftDay: shiftDay);
+      if (cached == null) rethrow;
+      return cached;
     }
-    return Map<String, dynamic>.from(
-        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
+  static const String _workScheduleCachePrefix = 'cached_work_schedule_';
+
+  Future<void> _cacheWorkSchedule(
+      String shiftDayKey, Map<String, dynamic> state) async {
+    try {
+      final uid = await _localUserId();
+      if (uid == null) return;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+          '$_workScheduleCachePrefix$uid',
+          jsonEncode({
+            'shift_day': shiftDayKey,
+            'saved_day': DateFormat('yyyy-MM-dd').format(DateTime.now()),
+            'state': _jsonSafeValue(state),
+          }));
+    } catch (e) {
+      debugPrint('Nao deu para guardar o horario no aparelho: $e');
+    }
+  }
+
+  /// Ultimo horario efetivo lido neste aparelho, ou null. O pedido de hora
+  /// extra so vale para o mesmo turno ([shiftDay], o dia em que ele
+  /// comecou) e o de entrada so no mesmo dia; os outros saem como null.
+  Future<Map<String, dynamic>?> getCachedEffectiveWorkSchedule(
+      {DateTime? shiftDay}) async {
+    try {
+      final uid = await _localUserId();
+      if (uid == null) return null;
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('$_workScheduleCachePrefix$uid');
+      if (raw == null) return null;
+      final saved = Map<String, dynamic>.from(jsonDecode(raw) as Map);
+      final state = Map<String, dynamic>.from(saved['state'] as Map);
+      final shiftDayKey =
+          shiftDay == null ? '' : DateFormat('yyyy-MM-dd').format(shiftDay);
+      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+      return {
+        ...state,
+        'overtime_request':
+            shiftDayKey.isNotEmpty && saved['shift_day'] == shiftDayKey
+                ? state['overtime_request']
+                : null,
+        'start_request':
+            saved['saved_day'] == today ? state['start_request'] : null,
+        'from_cache': true,
+      };
+    } catch (e) {
+      debugPrint('Horario guardado no aparelho ilegivel: $e');
+      return null;
+    }
   }
 
   Future<Map<String, dynamic>> createScheduleControlledPunch({
@@ -1699,7 +1943,11 @@ class ApiService {
     double? latitude,
     double? longitude,
     bool closeAtScheduledEnd = false,
+    String? clientRecordId,
+    bool offline = false,
   }) async {
+    // clientRecordId vira o id do ponto e torna o reenvio idempotente;
+    // offline = batida feita sem internet e enviada agora (vale a hora dela).
     final response = await http
         .post(
           Uri.parse('$backendUrl/work-schedule/punch'),
@@ -1715,12 +1963,14 @@ class ApiService {
             'latitude': latitude,
             'longitude': longitude,
             'close_at_scheduled_end': closeAtScheduledEnd,
+            if (clientRecordId != null) 'client_record_id': clientRecordId,
+            'offline': offline,
           }),
         )
         .timeout(const Duration(seconds: 30));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
-        return _createScheduleControlledPunchInFirestore(
+        final result = await _createScheduleControlledPunchInFirestore(
           recordType: recordType,
           timestamp: timestamp,
           location: location,
@@ -1728,12 +1978,47 @@ class ApiService {
           latitude: latitude,
           longitude: longitude,
           closeAtScheduledEnd: closeAtScheduledEnd,
+          clientRecordId: clientRecordId,
+          offline: offline,
         );
+        if (result['status'] == 'created') await _cacheSentRecord(result);
+        return result;
       }
-      throw Exception(_apiError(response));
+      // 401 e 403 (sessao ou perfil: so a autenticacao do backend devolve
+      // 403 neste endpoint), 408 e 429 podem passar na proxima tentativa; o
+      // resto dos 4xx e a regra recusando a batida.
+      if (const {401, 403, 408, 429}.contains(response.statusCode)) {
+        throw Exception(_apiError(response));
+      }
+      throw PunchRejectedException(_apiError(response));
     }
-    return Map<String, dynamic>.from(
+    final result = Map<String, dynamic>.from(
         jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+    if (result['status'] == 'created') await _cacheSentRecord(result);
+    return result;
+  }
+
+  /// Poe na copia local dos pontos um ponto que acabou de chegar ao servidor
+  /// (batida do estagiario pelo backend, fila offline sincronizada). Sem
+  /// isso, se a leitura logo depois falhasse (rede ruim; no web sempre, sem o
+  /// cache do Firestore), a tela offline nao mostrava o ponto, que ja tinha
+  /// saido da fila: "Aguardando entrada" com a entrada batida.
+  Future<void> _cacheSentRecord(Map<String, dynamic> record) async {
+    final uid = _auth.currentUser?.uid;
+    final id = record['id']?.toString() ?? '';
+    if (uid == null || id.isEmpty || record['user_id']?.toString() != uid) {
+      return;
+    }
+    final copy = Map<String, dynamic>.from(record)
+      ..remove('status')
+      ..remove('duplicate')
+      ..remove('offline')
+      ..remove('sync_status')
+      ..remove('sync_error')
+      ..remove('created_at_local')
+      // FieldValue.serverTimestamp() (ou o marcador que o backend devolve).
+      ..remove('created_at');
+    await _appendCachedTimeRecord(uid, copy);
   }
 
   Future<Map<String, dynamic>> createScheduleApprovalRequest({
@@ -1926,7 +2211,8 @@ class ApiService {
     return Map<String, dynamic>.from(_defaultInternSchedule);
   }
 
-  Future<Map<String, dynamic>> _getEffectiveWorkScheduleFromFirestore() async {
+  Future<Map<String, dynamic>> _getEffectiveWorkScheduleFromFirestore(
+      {DateTime? shiftDay}) async {
     final user = await getCurrentUser();
     final override = user['work_schedule_override'];
     final overrideEnabled =
@@ -1937,6 +2223,17 @@ class ApiService {
 
     final now = DateTime.now();
     final dayKey = DateFormat('yyyy-MM-dd').format(now);
+    // Mesma regra do backend: hora extra pelo dia em que o turno aberto
+    // comecou (ate 14 dias atras); a entrada fora do horario, pelo de hoje.
+    final today = DateTime(now.year, now.month, now.day);
+    final shiftDate = shiftDay == null
+        ? null
+        : DateTime(shiftDay.year, shiftDay.month, shiftDay.day);
+    final overtimeDayKey = shiftDate != null &&
+            !shiftDate.isAfter(today) &&
+            !shiftDate.isBefore(today.subtract(const Duration(days: 14)))
+        ? DateFormat('yyyy-MM-dd').format(shiftDate)
+        : dayKey;
     Map<String, dynamic>? overtimeRequest;
     Map<String, dynamic>? startRequest;
     try {
@@ -1946,15 +2243,18 @@ class ApiService {
           .get();
       final requests = snapshot.docs
           .map((doc) => {'id': doc.id, ...doc.data()})
-          .where((item) => item['day_key'] == dayKey)
           .toList()
         ..sort(
             (a, b) => _firestoreCreatedAt(b).compareTo(_firestoreCreatedAt(a)));
       for (final item in requests) {
-        if (item['request_type'] == 'overtime' && overtimeRequest == null) {
+        if (item['request_type'] == 'overtime' &&
+            item['day_key'] == overtimeDayKey &&
+            overtimeRequest == null) {
           overtimeRequest = item;
         }
-        if (item['request_type'] == 'start_exception' && startRequest == null) {
+        if (item['request_type'] == 'start_exception' &&
+            item['day_key'] == dayKey &&
+            startRequest == null) {
           startRequest = item;
         }
       }
@@ -1991,31 +2291,59 @@ class ApiService {
     double? latitude,
     double? longitude,
     bool closeAtScheduledEnd = false,
+    String? clientRecordId,
+    bool offline = false,
   }) async {
     final user = await getCurrentUser();
-    final state = await _getEffectiveWorkScheduleFromFirestore();
-    final schedule = Map<String, dynamic>.from(state['schedule'] as Map);
-    var attempted = DateTime.tryParse(timestamp ?? '') ?? DateTime.now();
-    // Turno aberto ha mais de 14 dias e dado quebrado; limitar a janela evita
-    // ler o historico inteiro so para detectar o turno em aberto.
-    final scanFrom =
-        DateTime.now().subtract(const Duration(days: 14)).toIso8601String();
-    final records =
-        (await getTimeRecords(userId: user['id'], startDate: scanFrom))
-            .map((item) => Map<String, dynamic>.from(item as Map))
-            .toList()
-      ..sort((a, b) =>
-          a['timestamp'].toString().compareTo(b['timestamp'].toString()));
-    Map<String, dynamic>? openShift;
-    Map<String, dynamic>? lastCheckOut;
-    for (final record in records) {
-      if (record['record_type'] == 'check_in') {
-        openShift = record;
-      } else if (record['record_type'] == 'check_out') {
-        openShift = null;
-        lastCheckOut = record;
+    // Mesmo contrato do backend: reenvio da mesma batida devolve o ponto ja
+    // gravado, sem reavaliar as regras.
+    if (clientRecordId != null) {
+      final existing = await _serverTimeRecord(clientRecordId);
+      if (existing != null) return {'status': 'created', ...existing};
+    }
+    final now = DateTime.now();
+    var attempted = DateTime.tryParse(timestamp ?? '') ?? now;
+    // Mesma janela do backend para a batida offline: no maximo 15 min no
+    // futuro (relogio adiantado) e 7 dias de atraso.
+    if (offline && !closeAtScheduledEnd) {
+      final delay = now.difference(attempted);
+      if (delay < const Duration(minutes: -15) ||
+          delay > const Duration(days: 7)) {
+        throw const PunchRejectedException(
+            'O horario da batida offline esta fora do periodo aceito.');
       }
     }
+    // Turno aberto ha mais de 14 dias e dado quebrado; limitar a janela evita
+    // ler o historico inteiro so para detectar o turno em aberto.
+    final scanFrom = (offline ? attempted : now)
+        .subtract(const Duration(days: 14))
+        .toIso8601String();
+    final serverRecords =
+        (await getTimeRecords(userId: user['id'], startDate: scanFrom))
+            .map((item) => Map<String, dynamic>.from(item as Map))
+            // So o que esta no servidor: a fila offline traz a propria batida
+            // que esta sendo sincronizada, que passaria por "ja gravada".
+            .where((record) => record['offline'] != true)
+            .toList();
+    // Batida offline: o turno aberto e o do momento dela (recordsBeforePunch,
+    // como o backend).
+    final records = offline
+        ? recordsBeforePunch(serverRecords, {
+            'user_id': user['id'],
+            'record_type': recordType,
+            'timestamp': attempted.toIso8601String(),
+          })
+        : sortRecords(serverRecords);
+    // Mesma regra do backend: a noite do lote do gestor ja vem fechada.
+    final openShift = openShiftCheckIn(records);
+    Map<String, dynamic>? lastCheckOut;
+    for (final record in records) {
+      if (record['record_type'] == 'check_out') lastCheckOut = record;
+    }
+    // Hora extra pelo dia em que o turno aberto comecou, como no backend.
+    final state = await _getEffectiveWorkScheduleFromFirestore(
+        shiftDay: DateTime.tryParse(openShift?['timestamp']?.toString() ?? ''));
+    final schedule = Map<String, dynamic>.from(state['schedule'] as Map);
 
     if (recordType == 'check_in') {
       // Este caminho so roda quando o backend falhou (timeout/5xx). A batida
@@ -2025,7 +2353,9 @@ class ApiService {
       if (_matchesAttempt(openShift, attempted)) {
         return {'status': 'created', 'duplicate': true, ...openShift!};
       }
-      if (openShift != null) throw Exception('Ja existe um turno aberto.');
+      if (openShift != null) {
+        throw const PunchRejectedException('Ja existe um turno aberto.');
+      }
       if (!isInternStartWithinSchedule(attempted, schedule)) {
         return {
           'status': 'approval_required',
@@ -2044,13 +2374,21 @@ class ApiService {
       if (openShift == null && _matchesAttempt(lastCheckOut, attempted)) {
         return {'status': 'created', 'duplicate': true, ...lastCheckOut!};
       }
-      if (openShift == null) throw Exception('Nao existe turno aberto.');
+      if (openShift == null) {
+        throw const PunchRejectedException('Nao existe turno aberto.');
+      }
       final shiftStart = DateTime.parse(openShift['timestamp'].toString());
       final scheduledEnd = _scheduleTime(shiftStart, schedule['shift_end']);
       if (closeAtScheduledEnd) {
         if (scheduledEnd.isBefore(shiftStart)) {
-          throw Exception(
+          throw const PunchRejectedException(
               'A entrada ocorreu depois do fim programado. Encerre no horario real.');
+        }
+        // Saida no futuro fecharia o turno antes da hora e pagaria minutos
+        // nao trabalhados.
+        if (scheduledEnd.isAfter(now)) {
+          throw const PunchRejectedException(
+              'Ainda nao deu o fim do horario programado. Para sair agora, use Finalizar expediente.');
         }
         attempted = scheduledEnd;
       } else {
@@ -2081,9 +2419,26 @@ class ApiService {
       'schedule_snapshot': schedule,
       'compatibility_mode': true,
       'created_at': FieldValue.serverTimestamp(),
+      if (offline) 'synced_from_offline': true,
+      if (offline)
+        'offline_delay_minutes': attempted.isAfter(now)
+            ? 0
+            : now.difference(attempted).inMinutes,
     };
-    final ref = await _db.collection('time_records').add(data);
+    final ref = _db.collection('time_records').doc(clientRecordId);
+    await ref.set(data);
     return {'status': 'created', 'id': ref.id, ...data};
+  }
+
+  /// Turno aberto do usuario pelo que esta no servidor (14 dias, como o
+  /// backend), sem a fila offline deste aparelho.
+  Future<Map<String, dynamic>?> _serverOpenShift(String userId) async {
+    final scanFrom =
+        DateTime.now().subtract(const Duration(days: 14)).toIso8601String();
+    final records = (await getTimeRecords(userId: userId, startDate: scanFrom))
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .where((record) => record['offline'] != true);
+    return openShiftCheckIn(records);
   }
 
   Future<Map<String, dynamic>> _createScheduleApprovalRequestInFirestore({
@@ -2105,23 +2460,71 @@ class ApiService {
     final user = await getCurrentUser();
     final state = await _getEffectiveWorkScheduleFromFirestore();
     final attempted = DateTime.parse(attemptedAt);
-    final dayKey = DateFormat('yyyy-MM-dd').format(attempted);
+    final openShift = await _serverOpenShift(user['id'].toString());
+    // Hora extra fica no dia em que o turno aberto comecou (o mesmo que a
+    // saida consulta), como no backend; num turno que virou a meia-noite o
+    // dia da tentativa ja e outro.
+    final shiftStart = requestType == 'overtime' && openShift != null
+        ? openShift['timestamp']?.toString()
+        : shiftStartAt;
+    final shiftStarted =
+        requestType == 'overtime' ? DateTime.tryParse(shiftStart ?? '') : null;
+    final dayKey = DateFormat('yyyy-MM-dd').format(shiftStarted ?? attempted);
     final snapshot = await _db
         .collection('work_schedule_approval_requests')
         .where('user_id', isEqualTo: user['id'])
         .get();
-    for (final doc in snapshot.docs) {
-      final data = doc.data();
-      // Inclui 'approved': um pedido ja liberado no mesmo dia torna o novo
-      // desnecessario. Sem isso, um retry criava um pedido irmao que ficava
-      // pendente pra sempre na tela do gestor.
-      if (data['request_type'] == requestType &&
-          data['day_key'] == dayKey &&
-          (data['status'] == 'pending' || data['status'] == 'approved')) {
-        return {
-          'status': 'existing',
-          'request': {'id': doc.id, ...data}
-        };
+    final candidates = snapshot.docs
+        .map((doc) => {'id': doc.id, ...doc.data()})
+        .where((data) =>
+            data['request_type'] == requestType && data['day_key'] == dayKey)
+        .toList()
+      ..sort(
+          (a, b) => _firestoreCreatedAt(b).compareTo(_firestoreCreatedAt(a)));
+    // Mesma regra do backend. Pendente do mesmo dia: o novo pedido e
+    // repeticao (retry, toque duplo) e criaria um irmao eternamente pendente;
+    // na entrada, so se for da mesma tentativa (_isStartRequestRetry). O
+    // antigo fica pendente (as regras nao deixam o estagiario muda-lo), mas a
+    // liberacao recusa o pedido que tem um mais novo no dia.
+    // Aprovado so conta enquanto vale para o turno atual: a entrada liberada
+    // se ela e o turno aberto, a hora extra enquanto o turno segue aberto.
+    // Qualquer aprovado do dia valendo dizia "ja liberada" para uma segunda
+    // entrada depois de o primeiro turno fechar, sem ponto nenhum.
+    Map<String, dynamic>? existing;
+    for (final data in candidates) {
+      if (data['status'] == 'pending' &&
+          (requestType != 'start_exception' ||
+              _isStartRequestRetry(
+                  DateTime.tryParse(data['attempted_at']?.toString() ?? ''),
+                  attempted))) {
+        existing = data;
+        break;
+      }
+    }
+    if (existing == null && openShift != null) {
+      for (final data in candidates) {
+        if (data['status'] != 'approved') continue;
+        if (requestType != 'start_exception' ||
+            data['linked_time_record_id'] == openShift['id']) {
+          existing = data;
+          break;
+        }
+      }
+    }
+    if (existing != null) return {'status': 'existing', 'request': existing};
+    // Como no backend: a hora do primeiro pedido pendente que este substitui,
+    // para o gestor ver as duas.
+    String? previousAttempt;
+    if (requestType == 'start_exception') {
+      for (final data in candidates) {
+        if (data['status'] != 'pending') continue;
+        final value = (data['previous_attempted_at'] ?? data['attempted_at'])
+                ?.toString() ??
+            '';
+        if (value.isEmpty) continue;
+        if (previousAttempt == null || value.compareTo(previousAttempt) < 0) {
+          previousAttempt = value;
+        }
       }
     }
     final data = {
@@ -2131,7 +2534,7 @@ class ApiService {
       'request_type': requestType,
       'status': 'pending',
       'attempted_at': attempted.toIso8601String(),
-      'shift_start_at': shiftStartAt,
+      'shift_start_at': shiftStart,
       'day_key': dayKey,
       'location': location ?? 'App',
       'notes': observation,
@@ -2139,6 +2542,7 @@ class ApiService {
       'longitude': longitude,
       'schedule_snapshot': state['schedule'],
       'compatibility_mode': true,
+      if (previousAttempt != null) 'previous_attempted_at': previousAttempt,
       'created_at': FieldValue.serverTimestamp(),
       'updated_at': FieldValue.serverTimestamp(),
     };
@@ -2166,6 +2570,98 @@ class ApiService {
       ..sort(
           (a, b) => _firestoreCreatedAt(b).compareTo(_firestoreCreatedAt(a)));
     return requests;
+  }
+
+  /// Idade maxima do pedido de entrada para a liberacao ainda criar o ponto
+  /// (mesma do backend, _START_APPROVAL_MAX_AGE). Mede a idade, nao a data: o
+  /// pedido das 23:55 liberado as 00:03 ainda e o mesmo turno.
+  static const Duration _startApprovalMaxAge = Duration(hours: 12);
+
+  /// Dois pedidos de entrada ate 15 min um do outro sao a mesma tentativa
+  /// repetida (mesma regra do backend, _is_start_request_retry). O pedido
+  /// das 08:00 sem resposta engolia o das 15:00, e liberado as 15:05 abria
+  /// o turno as 08:00.
+  static const Duration _startRequestRetryWindow = Duration(minutes: 15);
+
+  bool _isStartRequestRetry(DateTime? previous, DateTime attempted) =>
+      previous == null ||
+      previous.difference(attempted).abs() <= _startRequestRetryWindow;
+
+  /// Ha outro pedido de entrada do mesmo dia feito bem depois deste? Liberar
+  /// este abriria o turno na hora antiga, que o estagiario ja tinha refeito.
+  Future<bool> _hasNewerStartAttempt(
+      String requestId, Map<String, dynamic> request) async {
+    final attempted =
+        DateTime.tryParse(request['attempted_at']?.toString() ?? '');
+    if (attempted == null) return false;
+    final snapshot = await _db
+        .collection('work_schedule_approval_requests')
+        .where('user_id', isEqualTo: request['user_id'])
+        .get();
+    for (final doc in snapshot.docs) {
+      final data = doc.data();
+      if (doc.id == requestId ||
+          data['request_type'] != 'start_exception' ||
+          data['day_key'] != request['day_key'] ||
+          !const {'pending', 'approved', 'rejected'}.contains(data['status'])) {
+        continue;
+      }
+      final other = DateTime.tryParse(data['attempted_at']?.toString() ?? '');
+      if (other != null &&
+          other.isAfter(attempted) &&
+          !_isStartRequestRetry(attempted, other)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// check_in ja gravado que atende este pedido de entrada (mesma regra do
+  /// backend, _reusable_approval_check_in). Primeiro o do proprio pedido;
+  /// depois o de OUTRO pedido do mesmo dia, so se for o mesmo turno: ainda
+  /// aberto, ou este pedido foi feito antes da saida dele. Pedido feito
+  /// depois daquela saida e uma nova entrada e precisa do proprio ponto;
+  /// reaproveitar so ligava o pedido a um turno ja fechado.
+  Map<String, dynamic>? _reusableApprovalCheckIn(
+    List<Map<String, dynamic>> records,
+    String requestId,
+    Map<String, dynamic> request,
+    Map<String, dynamic>? openShift,
+  ) {
+    for (final record in records) {
+      if (record['record_type'] == 'check_in' &&
+          record['schedule_approval_request_id'] == requestId) {
+        return record;
+      }
+    }
+    final attempted =
+        DateTime.tryParse(request['attempted_at']?.toString() ?? '');
+    // Sem day_key, um valor que nenhum timestamp tem.
+    final dayKey = request['day_key']?.toString() ?? ' ';
+    for (var i = 0; i < records.length; i++) {
+      final record = records[i];
+      final linked = record['schedule_approval_request_id']?.toString() ?? '';
+      if (record['record_type'] != 'check_in' || linked.isEmpty) continue;
+      final timestamp = record['timestamp']?.toString() ?? '';
+      if (dayKey.isEmpty || !timestamp.startsWith(dayKey)) continue;
+      if (openShift != null && record['id'] == openShift['id']) return record;
+      Map<String, dynamic>? following;
+      for (final later in records.skip(i + 1)) {
+        final type = later['record_type'];
+        if (type == 'check_in' || type == 'check_out') {
+          following = later;
+          break;
+        }
+      }
+      if (following == null || following['record_type'] != 'check_out') {
+        continue;
+      }
+      final ended = DateTime.tryParse(following['timestamp']?.toString() ?? '');
+      if (attempted != null && ended != null && !attempted.isAfter(ended)) {
+        return record;
+      }
+    }
+    return null;
   }
 
   Future<void> _decideScheduleApprovalInFirestore(
@@ -2197,40 +2693,32 @@ class ApiService {
     if (approve && request['request_type'] == 'start_exception') {
       final scanFrom =
           DateTime.now().subtract(const Duration(days: 14)).toIso8601String();
-      final records =
+      final records = sortRecords(
           (await getTimeRecords(userId: request['user_id'], startDate: scanFrom))
               .map((item) => Map<String, dynamic>.from(item as Map))
-              .toList()
-        ..sort((a, b) =>
-            a['timestamp'].toString().compareTo(b['timestamp'].toString()));
-      Map<String, dynamic>? openShift;
-      for (final record in records) {
-        if (record['record_type'] == 'check_in') openShift = record;
-        if (record['record_type'] == 'check_out') openShift = null;
-      }
+              .toList());
+      // Mesma regra do backend: a noite do lote do gestor ja vem fechada.
+      final openShift = openShiftCheckIn(records);
       // Procura pelo vinculo, nao pelo turno aberto: o ponto pode ter sido
       // gravado por uma tentativa anterior e o turno ja ter sido encerrado.
-      // Vale tambem o ponto vindo de OUTRO pedido do mesmo dia (pedidos
-      // duplicados): a entrada do dia ja existe, este pedido e redundante.
-      final dayKey = request['day_key']?.toString();
-      Map<String, dynamic>? existing;
-      for (final record in records) {
-        if (record['record_type'] != 'check_in') continue;
-        final linked = record['schedule_approval_request_id'];
-        if (linked == null) continue;
-        final sameDay =
-            record['timestamp']?.toString().startsWith(dayKey ?? ' ') ==
-                true;
-        if (linked == requestId || sameDay) {
-          existing = record;
-          break;
-        }
-      }
+      final existing =
+          _reusableApprovalCheckIn(records, requestId, request, openShift);
+      final attempted =
+          DateTime.tryParse(request['attempted_at']?.toString() ?? '');
       if (existing != null) {
         // A tentativa anterior gravou o ponto mas nao concluiu a decisao (por
         // isso o pedido continuou pendente na lista). Reaproveita o ponto que
         // ja existe; criar outro duplicaria a entrada.
         linkedRecordId = existing['id']?.toString();
+      } else if (attempted != null &&
+          DateTime.now().difference(attempted) > _startApprovalMaxAge) {
+        // Liberar agora um pedido de muitas horas atras gravaria a entrada na
+        // hora dele, abrindo um turno que ja passou.
+        throw Exception('Pedido antigo: a entrada nao foi criada. Rejeite e '
+            'lance o ponto pelo lote se for o caso.');
+      } else if (await _hasNewerStartAttempt(requestId, request)) {
+        throw Exception('O estagiario pediu a entrada de novo mais tarde '
+            'neste dia: libere o pedido mais recente.');
       } else if (openShift != null) {
         throw Exception('O usuario ja possui um turno aberto.');
       } else {
@@ -2354,8 +2842,9 @@ class ApiService {
           snapshot.docs.map((doc) => {'id': doc.id, ...doc.data()}).toList();
     }
 
-    records.sort((a, b) =>
-        (b['timestamp'] as String).compareTo(a['timestamp'] as String));
+    // Do mais novo para o mais antigo; no mesmo horario, a ordem vem do
+    // tipo (sortRecords), como no calculo do turno.
+    records = sortRecords(records).reversed.toList();
     // Mantido: o fallback acima e os registros gravados sem hora exata ainda
     // precisam do recorte em memoria.
     if (startDate != null || endDate != null) {

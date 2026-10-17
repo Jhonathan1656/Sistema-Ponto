@@ -43,12 +43,12 @@ class _ExportDialogState extends State<ExportDialog> {
   DateTime _defaultPeriodEnd() =>
       DateTime(_selectedDate.year, _selectedDate.month, 28);
 
+  // Mesmo periodo do Meu Mes: 29 do mes anterior (o DateTime normaliza o
+  // "29/02" de ano nao bissexto para 01/03). Limitar ao ultimo dia do mes
+  // anterior fazia marco comecar em 28/02, dia que ja fechou em fevereiro.
   DateTime _defaultPeriodStart() {
     final end = _defaultPeriodEnd();
-    final lastDayPrev =
-        DateTime(end.year, end.month, 1).subtract(const Duration(days: 1));
-    final day = lastDayPrev.day < 29 ? lastDayPrev.day : 29;
-    return DateTime(lastDayPrev.year, lastDayPrev.month, day);
+    return DateTime(end.year, end.month - 1, 29);
   }
 
   @override
@@ -128,11 +128,13 @@ class _ExportDialogState extends State<ExportDialog> {
                   _periodStart!.year, _periodStart!.month, _periodStart!.day)
               : DateTime(_selectedDate.year, _selectedDate.month, 1))
           .toIso8601String();
+      // Fim do dia com microssegundos: o backend grava 23:59:59.123456, que
+      // na comparacao de texto fica depois de "23:59:59" e saia da folha.
       final end = (usePeriod
               ? DateTime(_periodEnd!.year, _periodEnd!.month, _periodEnd!.day,
-                  23, 59, 59)
-              : DateTime(
-                  _selectedDate.year, _selectedDate.month + 1, 0, 23, 59, 59))
+                  23, 59, 59, 999, 999)
+              : DateTime(_selectedDate.year, _selectedDate.month + 1, 0, 23,
+                  59, 59, 999, 999))
           .toIso8601String();
       final String? periodStart = usePeriod ? start : null;
       final String? periodEnd = usePeriod ? end : null;
@@ -709,8 +711,8 @@ class _ExportDialogState extends State<ExportDialog> {
         final picked = await showDatePicker(
           context: context,
           initialDate: date ?? _selectedDate,
-          firstDate: DateTime(2023, 1, 1),
-          lastDate: DateTime(2027, 12, 31),
+          firstDate: DateTime(_firstYear, 1, 1),
+          lastDate: DateTime(_lastYear, 12, 31),
           locale: const Locale('pt', 'BR'),
         );
         if (picked != null) onPick(picked);
@@ -753,12 +755,24 @@ class _ExportDialogState extends State<ExportDialog> {
     );
   }
 
+  // Anos oferecidos: de 2023 ao ano que vem (de 29/12 em diante o periodo ja
+  // e o de janeiro). Fixo em 2023..2026, em 2027 o ano atual ficava fora da
+  // lista e o DropdownButton quebrava.
+  static const int _firstYear = 2023;
+  int get _lastYear => DateTime.now().year + 1;
+
   Widget _buildYearDropdown() {
+    final selected = _selectedDate.year;
+    final years = [
+      for (var y = _firstYear; y <= _lastYear; y++) y,
+      // O valor do DropdownButton precisa estar entre os itens.
+      if (selected < _firstYear || selected > _lastYear) selected,
+    ]..sort();
     return _buildDropdown(
       label: 'Ano',
-      value: _selectedDate.year.toString(),
-      items: ['2023', '2024', '2025', '2026']
-          .map((y) => DropdownMenuItem(value: y, child: Text(y)))
+      value: selected.toString(),
+      items: years
+          .map((y) => DropdownMenuItem(value: '$y', child: Text('$y')))
           .toList(),
       onChanged: (val) {
         setState(() =>

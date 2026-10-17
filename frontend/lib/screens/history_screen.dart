@@ -28,10 +28,15 @@ class _HistoryScreenState extends State<HistoryScreen> {
     _fetchRecords();
   }
 
+  // Fim do dia com microssegundos: o backend grava 23:59:59.123456, que na
+  // comparacao de texto fica depois de "23:59:59" e sumia da lista.
+  static DateTime _endOfDay(DateTime day) =>
+      DateTime(day.year, day.month, day.day, 23, 59, 59, 999, 999);
+
   void _setInitialDates() {
     final now = DateTime.now();
     _startDate = DateTime(now.year, now.month, now.day);
-    _endDate = DateTime(now.year, now.month, now.day, 23, 59, 59);
+    _endDate = _endOfDay(now);
   }
 
   Future<void> _fetchRecords() async {
@@ -55,14 +60,14 @@ class _HistoryScreenState extends State<HistoryScreen> {
       final now = DateTime.now();
       if (type == 'diário') {
         _startDate = DateTime(now.year, now.month, now.day);
-        _endDate = DateTime(now.year, now.month, now.day, 23, 59, 59);
+        _endDate = _endOfDay(now);
       } else if (type == 'semanal') {
-        _startDate = now.subtract(Duration(days: now.weekday - 1));
-        _startDate = DateTime(_startDate.year, _startDate.month, _startDate.day);
-        _endDate = DateTime(now.year, now.month, now.day, 23, 59, 59);
+        // Segunda-feira pelo calendario, nao por 24h a menos.
+        _startDate = DateTime(now.year, now.month, now.day - (now.weekday - 1));
+        _endDate = _endOfDay(now);
       } else if (type == 'mensal') {
         _startDate = DateTime(now.year, now.month, 1);
-        _endDate = DateTime(now.year, now.month + 1, 0, 23, 59, 59);
+        _endDate = _endOfDay(DateTime(now.year, now.month + 1, 0));
       }
     });
     _fetchRecords();

@@ -32,10 +32,15 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
     _fetchInitialData();
   }
 
+  // Fim do dia com microssegundos: o backend grava 23:59:59.123456, que na
+  // comparacao de texto fica depois de "23:59:59" e sumia da lista.
+  static DateTime _endOfDay(DateTime day) =>
+      DateTime(day.year, day.month, day.day, 23, 59, 59, 999, 999);
+
   void _setInitialDates() {
     final now = DateTime.now();
     _startDate = DateTime(now.year, now.month, now.day);
-    _endDate = DateTime(now.year, now.month, now.day, 23, 59, 59);
+    _endDate = _endOfDay(now);
   }
 
   Future<void> _fetchInitialData() async {
@@ -70,16 +75,40 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
       final now = DateTime.now();
       if (type == 'diário') {
         _startDate = DateTime(now.year, now.month, now.day);
-        _endDate = DateTime(now.year, now.month, now.day, 23, 59, 59);
+        _endDate = _endOfDay(now);
       } else if (type == 'semanal') {
-        _startDate = now.subtract(Duration(days: now.weekday - 1));
-        _startDate =
-            DateTime(_startDate.year, _startDate.month, _startDate.day);
-        _endDate = DateTime(now.year, now.month, now.day, 23, 59, 59);
+        // Segunda-feira pelo calendario, nao por 24h a menos.
+        _startDate = DateTime(now.year, now.month, now.day - (now.weekday - 1));
+        _endDate = _endOfDay(now);
       } else if (type == 'mensal') {
         _startDate = DateTime(now.year, now.month, 1);
-        _endDate = DateTime(now.year, now.month + 1, 0, 23, 59, 59);
+        _endDate = _endOfDay(DateTime(now.year, now.month + 1, 0));
       }
+    });
+    _fetchRecords();
+  }
+
+  /// Periodo livre. So com dia/semana/mes do calendario, a vespera ficava
+  /// fora de alcance numa segunda-feira dia 1, e a saida esquecida (gravada
+  /// no dia da entrada) ou a entrada do turno da noite nao apareciam para
+  /// corrigir; o fechamento 29 a 28 tambem nao cabia em nenhum filtro.
+  Future<void> _pickPeriod() async {
+    final now = DateTime.now();
+    final picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      // O lote do gestor aceita datas ate um ano a frente.
+      lastDate: DateTime(now.year + 1, 12, 31),
+      initialDateRange: DateTimeRange(
+        start: DateTime(_startDate.year, _startDate.month, _startDate.day),
+        end: DateTime(_endDate.year, _endDate.month, _endDate.day),
+      ),
+    );
+    if (picked == null) return;
+    setState(() {
+      _filterType = 'período';
+      _startDate = picked.start;
+      _endDate = _endOfDay(picked.end);
     });
     _fetchRecords();
   }
@@ -350,18 +379,32 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
             ),
           ),
           const SizedBox(width: 12),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Text(DateFormat('dd/MM').format(_startDate),
-                  style: const TextStyle(
-                      fontWeight: FontWeight.bold, fontSize: 12)),
-              const Text('até',
-                  style: TextStyle(color: Colors.grey, fontSize: 10)),
-              Text(DateFormat('dd/MM').format(_endDate),
-                  style: const TextStyle(
-                      fontWeight: FontWeight.bold, fontSize: 12)),
-            ],
+          InkWell(
+            onTap: _pickPeriod,
+            borderRadius: BorderRadius.circular(8),
+            child: Padding(
+              padding: const EdgeInsets.all(4),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Text(DateFormat('dd/MM').format(_startDate),
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 12)),
+                      const Text('até',
+                          style: TextStyle(color: Colors.grey, fontSize: 10)),
+                      Text(DateFormat('dd/MM').format(_endDate),
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 12)),
+                    ],
+                  ),
+                  const SizedBox(width: 6),
+                  const Icon(Icons.date_range, color: wineColor, size: 18),
+                ],
+              ),
+            ),
           ),
         ],
       ),

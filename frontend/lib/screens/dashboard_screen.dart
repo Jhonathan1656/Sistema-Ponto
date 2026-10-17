@@ -2,7 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'dart:async';
+import 'dart:math' as math;
 import '../services/api_service.dart';
+import '../utils/shift_records.dart';
+import '../utils/timesheet.dart';
 import 'monthly_dashboard_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
@@ -21,7 +24,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
   List<dynamic> _weeklyRecords = [];
   double _weeklyTotalHours = 0;
   DateTime _timelineDate = DateTime.now();
+  // A linha do tempo acompanha o dia de hoje ate o usuario escolher outra
+  // data. Com o painel aberto na virada do dia, ela ficava presa em ontem.
+  bool _timelineFollowsToday = true;
   List<int> _hourlyActivity = List.filled(24, 0);
+  // Pontos da vespera do dia da linha do tempo, para o turno que atravessa
+  // a meia-noite. Dia passado quase nao muda e o painel atualiza a cada 30 s:
+  // le uma vez por usuario e dia (puxar a tela para baixo le de novo).
+  String? _previousDayKey;
+  List<dynamic> _previousDayRecords = const [];
+  // Ponto do dia que comeca sem entrada e que a vespera lida nao explica
+  // (dayStartWithoutShift): a vespera mudou depois de lida (a noite lancada
+  // no lote do gestor grava a madrugada no dia seguinte). Pede uma leitura
+  // nova, uma vez por ponto.
+  String? _previousDayCheckedStart;
   Timer? _timer;
   DateTime _now = DateTime.now();
 
@@ -69,104 +85,209 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
-  Future<void> _fetchDashboardData() async {
+  /// Ultimo instante do dia. Com microssegundos: o backend grava
+  /// 23:59:59.123456, que na comparacao de texto fica depois de "23:59:59".
+  static DateTime _endOfDay(DateTime day) =>
+      DateTime(day.year, day.month, day.day, 23, 59, 59, 999, 999);
+
+  Future<void> _fetchDashboardData({bool refreshPreviousDay = false}) async {
     if (_selectedUser == null) return;
     try {
       final now = DateTime.now();
+      if (_timelineFollowsToday) _timelineDate = now;
+      final userId = _selectedUser!['id'];
+      final day =
+          DateTime(_timelineDate.year, _timelineDate.month, _timelineDate.day);
 
-      final startDay =
-          DateTime(_timelineDate.year, _timelineDate.month, _timelineDate.day)
-              .toIso8601String();
-      final endDay = DateTime(_timelineDate.year, _timelineDate.month,
-              _timelineDate.day, 23, 59, 59)
-          .toIso8601String();
-
-      final startToday =
-          DateTime(now.year, now.month, now.day).toIso8601String();
-      final endToday =
-          DateTime(now.year, now.month, now.day, 23, 59, 59).toIso8601String();
-
-      final todayData = await _apiService.exportTimesheet(
-          startDate: startToday,
-          endDate: endToday,
-          userId: _selectedUser!['id']);
-      final startWeek = now.subtract(Duration(days: now.weekday - 1));
-      final startWeekStr =
-          DateTime(startWeek.year, startWeek.month, startWeek.day)
-              .toIso8601String();
+      // A semana ja traz o dia de hoje, agrupado como na folha (pelo dia da
+      // entrada): uma exportacao so a cada 30 s em vez de duas.
+      final startWeek =
+          DateTime(now.year, now.month, now.day - (now.weekday - 1));
       final weekData = await _apiService.exportTimesheet(
-          startDate: startWeekStr,
-          endDate: endToday,
-          userId: _selectedUser!['id']);
+          startDate: startWeek.toIso8601String(),
+          endDate: _endOfDay(now).toIso8601String(),
+          userId: userId);
+      final weekRecords = List<dynamic>.from(weekData['daily_records'] as List);
+      final todayKey = DateFormat('yyyy-MM-dd').format(now);
 
       final rawRecords = await _apiService.getTimeRecords(
-          startDate: startDay, endDate: endDay, userId: _selectedUser!['id']);
+          startDate: day.toIso8601String(),
+          endDate: _endOfDay(day).toIso8601String(),
+          userId: userId);
+      final previousDay = await _loadPreviousDayRecords(
+          userId, day, rawRecords, refreshPreviousDay);
 
+      // Troca de funcionario no meio da leitura: descarta o resultado velho.
+      if (!mounted || _selectedUser?['id'] != userId) return;
       setState(() {
-        _dailyRecords = todayData['daily_records'];
-        _weeklyRecords = weekData['daily_records'];
+        _dailyRecords =
+            weekRecords.where((r) => r['date'] == todayKey).toList();
+        _weeklyRecords = weekRecords;
         _weeklyTotalHours =
             double.tryParse(weekData['summary']['total_hours']) ?? 0.0;
-        _calculateHourlyActivityDetail(rawRecords);
+        _hourlyActivity =
+            _hourlyActivityFor(day, now, previousDay, rawRecords);
       });
     } catch (e) {
       debugPrint('Erro dashboard: $e');
     }
   }
 
-  void _calculateHourlyActivityDetail(List<dynamic> rawRecords) {
-    _hourlyActivity = List.filled(24, 0);
-    final now = DateTime.now();
-    bool isToday = _timelineDate.year == now.year &&
-        _timelineDate.month == now.month &&
-        _timelineDate.day == now.day;
+  Future<List<dynamic>> _loadPreviousDayRecords(dynamic userId, DateTime day,
+      List<dynamic> dayRecords, bool force) async {
+    final previous = DateTime(day.year, day.month, day.day - 1);
+    final key = '$userId|${DateFormat('yyyy-MM-dd').format(previous)}';
+    String? startWithoutShift(List<dynamic> previousDay) {
+      final start = dayStartWithoutShift(previousDay, dayRecords);
+      return start == null ? null : '${start['id'] ?? start['timestamp']}';
+    }
 
-    rawRecords.sort((a, b) =>
-        (a['timestamp'] as String).compareTo(b['timestamp'] as String));
+    if (!force && key == _previousDayKey) {
+      final start = startWithoutShift(_previousDayRecords);
+      if (start == null || start == _previousDayCheckedStart) {
+        return _previousDayRecords;
+      }
+    }
+    final records = await _apiService.getTimeRecords(
+        startDate: previous.toIso8601String(),
+        endDate: _endOfDay(previous).toIso8601String(),
+        userId: userId);
+    _previousDayKey = key;
+    _previousDayRecords = records;
+    // O que nem a vespera nova explica nao pede outra leitura.
+    _previousDayCheckedStart = startWithoutShift(records);
+    return records;
+  }
 
-    DateTime? lastEntry;
-    DateTime? lastBreakStart;
+  /// Ocupacao de cada hora do dia [day] na linha do tempo: 0 nada,
+  /// 1 trabalho, 2 pausa, 3 hora atual. Entra o turno que vinha aberto da
+  /// vespera ([previousDay]) e, num dia passado, o que ficou aberto na
+  /// meia-noite (vai ate 24:00). So com os pontos do proprio dia, o turno
+  /// 19:30-07:00 nao aparecia em nenhum dos dois dias. Cada hora fica com o
+  /// que ocupou mais tempo dela.
+  List<int> _hourlyActivityFor(DateTime day, DateTime now,
+      List<dynamic> previousDay, List<dynamic> dayRecords) {
+    final dayStart = DateTime(day.year, day.month, day.day);
+    final dayEnd = DateTime(day.year, day.month, day.day + 1);
+    final workSeconds = List<int>.filled(24, 0);
+    final pauseSeconds = List<int>.filled(24, 0);
 
-    for (var r in rawRecords) {
-      final DateTime ts = DateTime.parse(r['timestamp']).toLocal();
-      final int h = ts.hour;
-      if (h >= 24) continue;
-
-      String type = r['record_type'];
-
-      if (type == 'check_in' || type == 'break_end' || type == 'entry_3') {
-        lastEntry = ts;
-        if (lastBreakStart != null) {
-          for (int i = lastBreakStart.hour; i < h; i++) {
-            if (i < 24) _hourlyActivity[i] = 2;
-          }
-          lastBreakStart = null;
-        }
-      } else if (type == 'break_start' ||
-          type == 'exit_3' ||
-          type == 'check_out') {
-        if (lastEntry != null) {
-          for (int i = lastEntry.hour; i < h; i++) {
-            if (i < 24) _hourlyActivity[i] = 1;
-          }
-          if (type != 'check_out') lastBreakStart = ts;
-          lastEntry = null;
-        }
+    void paint(DateTime from, DateTime to, bool pause) {
+      var cursor = from.isBefore(dayStart) ? dayStart : from;
+      final end = to.isAfter(dayEnd) ? dayEnd : to;
+      while (cursor.isBefore(end)) {
+        final nextHour =
+            DateTime(cursor.year, cursor.month, cursor.day, cursor.hour + 1);
+        final sliceEnd = nextHour.isBefore(end) ? nextHour : end;
+        (pause ? pauseSeconds : workSeconds)[cursor.hour] +=
+            sliceEnd.difference(cursor).inSeconds;
+        cursor = sliceEnd;
       }
     }
 
-    if (isToday) {
-      if (lastEntry != null) {
-        for (int i = lastEntry.hour; i <= now.hour; i++) {
-          if (i < 24) _hourlyActivity[i] = 1;
-        }
-      } else if (lastBreakStart != null) {
-        for (int i = lastBreakStart.hour; i <= now.hour; i++) {
-          if (i < 24) _hourlyActivity[i] = 2;
-        }
-      }
-      if (now.hour < 24) _hourlyActivity[now.hour] = 3;
+    DateTime? shiftStart;
+    DateTime? segmentStart;
+    var paused = false;
+    var resumedByAutomaticEnd = false;
+
+    // Desenha o trecho aberto ate [at]. Passadas [maxShiftSpan] da entrada
+    // e saida esquecida, nao turno: o trecho para ali.
+    void closeSegment(DateTime at, {bool? pause}) {
+      final start = shiftStart;
+      final from = segmentStart;
+      if (start == null || from == null) return;
+      final limit = start.add(maxShiftSpan);
+      paint(from, at.isAfter(limit) ? limit : at, pause ?? paused);
     }
+
+    for (final (at, record) in _timelineMarks([...previousDay, ...dayRecords])) {
+      switch (record['record_type']) {
+        case 'check_in':
+          closeSegment(at);
+          shiftStart = at;
+          segmentStart = at;
+          paused = false;
+          resumedByAutomaticEnd = false;
+        case 'break_start':
+        case 'entry_3':
+          if (shiftStart == null || paused) break;
+          closeSegment(at);
+          segmentStart = at;
+          paused = true;
+          resumedByAutomaticEnd = false;
+        case 'break_end':
+        case 'exit_3':
+          if (shiftStart == null) break;
+          final automatic = isAutomaticBreakEnd(record);
+          if (paused) {
+            closeSegment(at);
+          } else if (resumedByAutomaticEnd && !automatic) {
+            // Fim real depois do automatico na mesma pausa (ponto offline
+            // que sincronizou tarde): a pausa vai ate o real, como na folha.
+            closeSegment(at, pause: true);
+          } else {
+            break;
+          }
+          segmentStart = at;
+          paused = false;
+          resumedByAutomaticEnd = automatic;
+        case 'check_out':
+          closeSegment(at);
+          shiftStart = null;
+          segmentStart = null;
+          paused = false;
+          resumedByAutomaticEnd = false;
+      }
+    }
+    // Turno ainda aberto: hoje vai ate agora; num dia passado, ate 24:00.
+    if (shiftStart != null) closeSegment(now.isBefore(dayEnd) ? now : dayEnd);
+
+    final activity = List<int>.generate(24, (hour) {
+      if (workSeconds[hour] == 0 && pauseSeconds[hour] == 0) return 0;
+      return pauseSeconds[hour] > workSeconds[hour] ? 2 : 1;
+    });
+    if (!now.isBefore(dayStart) && now.isBefore(dayEnd)) {
+      activity[now.hour] = 3;
+    }
+    return activity;
+  }
+
+  /// Pontos em ordem, cada um na hora em que de fato aconteceu. O lote
+  /// antigo do gestor gravava o turno da noite inteiro na data escolhida
+  /// (saida 07:00 antes da entrada 19:30): a saida e as pausas da madrugada
+  /// desse turno (allManualNightMorning, so pontos de isLegacyBatchRecord)
+  /// sao da manha seguinte, como no calculo da folha. O lote novo ja grava a
+  /// data real e entra como esta.
+  List<(DateTime, Map<String, dynamic>)> _timelineMarks(
+      Iterable<dynamic> records) {
+    final ordered = sortRecords([
+      for (final raw in records) Map<String, dynamic>.from(raw as Map),
+    ]
+        .where((record) =>
+            DateTime.tryParse(record['timestamp']?.toString() ?? '') != null)
+        .toList());
+    final nextMorning = allManualNightMorning(ordered);
+    final marks = <(DateTime, Map<String, dynamic>)>[];
+    for (var i = 0; i < ordered.length; i++) {
+      var at = DateTime.parse(ordered[i]['timestamp'].toString()).toLocal();
+      if (nextMorning.contains(i)) {
+        at = DateTime(at.year, at.month, at.day + 1, at.hour, at.minute,
+            at.second, at.millisecond, at.microsecond);
+      }
+      marks.add((at, ordered[i]));
+    }
+    // Na ordem da folha (chronologicalOrder), com a manha da noite do lote
+    // antigo no dia seguinte: no mesmo horario a ordem vem do tipo (a saida
+    // antes da entrada do turno seguinte, o fim da pausa antes da saida), e o
+    // ponto do lote fica no lugar dele no minuto da batida do app. Pela hora
+    // crua, a Entrada 07:00 do lote vinha antes da Saida 07:00:14 da noite.
+    final order = chronologicalOrder([
+      for (var i = 0; i < marks.length; i++)
+        nextMorning.contains(i)
+            ? {...marks[i].$2, 'timestamp': marks[i].$1.toIso8601String()}
+            : marks[i].$2,
+    ]);
+    return [for (final i in order) marks[i]];
   }
 
   @override
@@ -177,7 +298,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       body: _isLoading
           ? const Center(child: CircularProgressIndicator(color: wineColor))
           : RefreshIndicator(
-              onRefresh: _fetchDashboardData,
+              onRefresh: () => _fetchDashboardData(refreshPreviousDay: true),
               color: wineColor,
               child: SingleChildScrollView(
                 physics: const AlwaysScrollableScrollPhysics(),
@@ -447,7 +568,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     lastDate: DateTime.now(),
                   );
                   if (picked != null) {
-                    setState(() => _timelineDate = picked);
+                    setState(() {
+                      _timelineDate = picked;
+                      _timelineFollowsToday =
+                          DateUtils.isSameDay(picked, DateTime.now());
+                    });
                     _fetchDashboardData();
                   }
                 },
@@ -549,7 +674,39 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
+  /// Horas de cada dia da semana (seg a dom) pelo total do dia, que ja
+  /// desconta as pausas e soma no dia da entrada o turno que passou da
+  /// meia-noite. A conta antiga (hora da saida menos hora da entrada da
+  /// primeira sessao) dava 1h para 19:30-07:00, nada para 22:00-06:00 e so a
+  /// manha num dia com almoco.
+  List<double> _weekdayHours() {
+    final now = DateTime.now();
+    final monday = DateTime(now.year, now.month, now.day - (now.weekday - 1));
+    return List.generate(7, (index) {
+      final key = DateFormat('yyyy-MM-dd')
+          .format(DateTime(monday.year, monday.month, monday.day + index));
+      for (final record in _weeklyRecords) {
+        if (record is Map && record['date'] == key) {
+          final hours = record['total_hours'];
+          return hours is num ? hours.toDouble() : 0.0;
+        }
+      }
+      return 0.0;
+    });
+  }
+
+  String _barLabel(double hours) {
+    final minutes = (hours * 60).round();
+    if (minutes <= 0) return '';
+    final m = minutes % 60;
+    return '${minutes ~/ 60}h${m > 0 ? m.toString().padLeft(2, '0') : ''}';
+  }
+
   Widget _buildWeeklyTimelineChart() {
+    final weekHours = _weekdayHours();
+    // Turno de 12h ou mais (noite) nao cabia no eixo fixo de 12h.
+    final maxY =
+        math.max(12.0, (weekHours.reduce(math.max) + 1).ceilToDouble());
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -570,32 +727,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
             height: 100,
             child: BarChart(
               BarChartData(
-                maxY: 12,
+                maxY: maxY,
                 barGroups: List.generate(7, (index) {
-                  DateTime date = DateTime.now().subtract(
-                      Duration(days: DateTime.now().weekday - 1 - index));
-                  String dateKey = DateFormat('yyyy-MM-dd').format(date);
-
-                  final Map<String, dynamic>? record =
-                      _weeklyRecords.cast<Map<String, dynamic>?>().firstWhere(
-                            (r) => r?['date'] == dateKey,
-                            orElse: () => null,
-                          );
-
-                  double grossHours = 0;
-                  if (record != null &&
-                      record['check_in'] != null &&
-                      record['check_out'] != null) {
-                    int startH = int.parse(record['check_in'].split(':')[0]);
-                    int endH = int.parse(record['check_out'].split(':')[0]);
-                    grossHours = (endH - startH).toDouble();
-                  }
-
+                  final hours = weekHours[index];
                   return BarChartGroupData(
                     x: index,
                     barRods: [
                       BarChartRodData(
-                        toY: grossHours > 0 ? grossHours : 0.1,
+                        toY: hours > 0 ? hours : 0.1,
                         color: wineColor.withOpacity(0.8),
                         width: 10,
                         borderRadius: BorderRadius.circular(2),
@@ -655,7 +794,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     tooltipMargin: 4,
                     getTooltipItem: (group, groupIndex, rod, rodIndex) {
                       return BarTooltipItem(
-                        rod.toY > 0.1 ? '${rod.toY.toInt()}h' : '',
+                        _barLabel(weekHours[group.x]),
                         TextStyle(
                             color:
                                 Theme.of(context).textTheme.bodyMedium?.color,
